@@ -1,0 +1,21 @@
+services:
+  meshview:
+    build: .
+    ports:
+      - "3000:3001"
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+      - SERIAL_AUTO_DISCOVER=true
+    # --- Dynamic USB access ---
+    # Mount /dev so the container sees devices as they appear/disappear.
+    # cgroup rules grant access to USB serial devices (major 188 = ttyUSB, 166 = ttyACM)
+    # without needing --privileged.
+    volumes:
+      - /dev:/dev
+      - /run/udev:/run/udev:ro
+    device_cgroup_rules:
+      - "c 188:* rmw"   # /dev/ttyUSB*
+      - "c 166:* rmw"   # /dev/ttyACM*
+    restart: unless-stopped

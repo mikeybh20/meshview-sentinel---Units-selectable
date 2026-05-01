@@ -1,0 +1,8 @@
+{
+  "name": "MeshView Sentinel",
+  "description": "Advanced Meshtastic node monitoring dashboard with live tracking, message route analysis, and telemetry analytics.",
+  "requestFramePermissions": [
+    "geolocation"
+  ],
+  "majorCapabilities": []
+}

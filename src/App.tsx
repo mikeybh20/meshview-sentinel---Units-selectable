@@ -1,0 +1,578 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import React from 'react';
+import { 
+  LayoutDashboard, 
+  Map as MapIcon, 
+  MessageSquare, 
+  Settings, 
+  Activity, 
+  Signal, 
+  History, 
+  Star,
+  Search,
+  Plus,
+  FileDown,
+  FileUp,
+  Globe,
+  TrendingUp,
+} from 'lucide-react';
+import { motion, AnimatePresence } from 'motion/react';
+
+import { simulator } from './services/meshtasticSimulator';
+import { Node, Message, RadioEvent, Group, WidgetConfig, UnitSystem } from './types';
+import { cn } from './lib/utils';
+import { TopologyView } from './components/TopologyView';
+import { NodeSettingsModal } from './components/NodeSettingsModal';
+import { ExportModal } from './components/ExportModal';
+import { ImportModal } from './components/ImportModal';
+import { DashboardDesigner } from './components/DashboardDesigner';
+import { RecipeView } from './components/RecipeView';
+import { AIAssistant } from './components/AIAssistant';
+
+import { NavItem } from './components/ui/NavItem';
+import { GroupItem } from './components/ui/GroupItem';
+import { DashboardView } from './components/views/DashboardView';
+import { MapView } from './components/views/MapView';
+import { MessagesView } from './components/views/MessagesView';
+import { LogsView } from './components/views/LogsView';
+import { MatrixView } from './components/views/MatrixView';
+import { RouteIntelView } from './components/views/RouteIntelView';
+
+export default function App() {
+  const [nodes, setNodes] = React.useState<Node[]>([]);
+  const [messages, setMessages] = React.useState<Message[]>([]);
+  const [events, setEvents] = React.useState<RadioEvent[]>([]);
+  const [activeTab, setActiveTab] = React.useState<'dashboard' | 'map' | 'messages' | 'logs' | 'matrix' | 'topology' | 'recipe' | 'routes'>('dashboard');
+  const [selectedNodeId, setSelectedNodeId] = React.useState<string | null>(null);
+  const [configuringNodeId, setConfiguringNodeId] = React.useState<string | null>(null);
+  const [showExportModal, setShowExportModal] = React.useState(false);
+  const [showImportModal, setShowImportModal] = React.useState(false);
+  const [isEditingDashboard, setIsEditingDashboard] = React.useState(false);
+  const [dashboardWidgets, setDashboardWidgets] = React.useState<WidgetConfig[]>([
+    { id: 'w1', type: 'STATS', visible: true, order: 0, width: 'full' },
+    { id: 'w2', type: 'NODE_LIST', visible: true, order: 1, width: 'large' },
+    { id: 'w3', type: 'NODE_DETAILS', visible: true, order: 2, width: 'small' },
+    { id: 'w4', type: 'MESSAGES', visible: true, order: 3, width: 'medium' },
+    { id: 'w5', type: 'MAP', visible: true, order: 4, width: 'medium' },
+    { id: 'w6', type: 'SENSOR_DATA', visible: true, order: 5, width: 'large' },
+  ]);
+  const [traceMessageId, setTraceMessageId] = React.useState<string | null>(null);
+  const [activeChatId, setActiveChatId] = React.useState<string>('global'); // 'global' or a nodeId
+  const [searchQuery, setSearchQuery] = React.useState('');
+  const [draftMessage, setDraftMessage] = React.useState('');
+  
+  // Grouping State
+  const [groups, setGroups] = React.useState<Group[]>([
+    { id: 'g1', name: 'Field Team', color: '#10b981' },
+    { id: 'g2', name: 'Logistics', color: '#f59e0b' }
+  ]);
+  const [selectedGroupId, setSelectedGroupId] = React.useState<string | 'all' | 'favorites'>('all');
+  const [isAddingGroup, setIsAddingGroup] = React.useState(false);
+  const [newGroupName, setNewGroupName] = React.useState('');
+  const [unitSystem, setUnitSystem] = React.useState<UnitSystem>('METRIC');
+
+  React.useEffect(() => {
+    return simulator.subscribe((n, m, e) => {
+      setNodes(n);
+      setMessages(m);
+      setEvents(e);
+    });
+  }, []);
+
+  const activeChatPartner = React.useMemo(() => 
+    nodes.find(n => n.id === activeChatId),
+    [nodes, activeChatId]
+  );
+
+  const filteredMessages = React.useMemo(() => {
+    if (activeChatId === 'global') {
+      return messages.filter(m => m.channel === 'LongFast' || m.to === 'broadcast');
+    }
+    return messages.filter(m => 
+      (m.from === activeChatId && m.to === '!abcdef01') || 
+      (m.from === '!abcdef01' && m.to === activeChatId)
+    );
+  }, [messages, activeChatId]);
+
+  const handleSendMessage = () => {
+    if (!draftMessage.trim()) return;
+    setDraftMessage('');
+  };
+
+  const selectedNode = React.useMemo(() => 
+    nodes.find(n => n.id === selectedNodeId), 
+    [nodes, selectedNodeId]
+  );
+
+  const filteredNodes = React.useMemo(() => {
+    let result = nodes;
+    if (selectedGroupId === 'favorites') {
+      result = result.filter(n => n.favorite);
+    } else if (selectedGroupId !== 'all') {
+      result = result.filter(n => n.groupId === selectedGroupId);
+    }
+    
+    return result.filter(n => 
+      n.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      n.id.toLowerCase().includes(searchQuery.toLowerCase())
+    );
+  }, [nodes, searchQuery, selectedGroupId]);
+
+  const stats = React.useMemo(() => ({
+    total: nodes.length,
+    online: nodes.filter(n => n.online).length,
+    offline: nodes.filter(n => !n.online).length,
+    favorites: nodes.filter(n => n.favorite).length
+  }), [nodes]);
+
+  const handleCreateGroup = () => {
+    if (!newGroupName.trim()) return;
+    const newGroup: Group = {
+      id: Math.random().toString(36).substr(2, 9),
+      name: newGroupName,
+      color: `hsl(${Math.random() * 360}, 70%, 50%)`
+    };
+    setGroups([...groups, newGroup]);
+    setNewGroupName('');
+    setIsAddingGroup(false);
+  };
+
+  const assignNodeToGroup = (nodeId: string, groupId?: string) => {
+    setNodes(prev => prev.map(n => n.id === nodeId ? { ...n, groupId } : n));
+  };
+
+  // Matrix Stats Calculation
+  const matrixData = React.useMemo(() => {
+    const list = nodes.map(n => ({ id: n.id, name: n.shortName }));
+    const matrix: Record<string, Record<string, { count: number, success: number }>> = {};
+    
+    list.forEach(from => {
+      matrix[from.id] = {};
+      list.forEach(to => {
+        const pairingMessages = messages.filter(m => m.from === from.id && m.to === to.id);
+        matrix[from.id][to.id] = {
+          count: pairingMessages.length,
+          success: pairingMessages.length > 0 ? 100 : 0 // Simplified for demo
+        };
+      });
+    });
+
+    return { nodes: list, matrix };
+  }, [nodes, messages]);
+
+  return (
+    <div className="flex h-screen bg-brand-bg font-sans overflow-hidden">
+      {/* Sidebar */}
+      <aside className="w-16 md:w-64 border-r border-brand-line flex flex-col items-center md:items-stretch bg-brand-bg/50 backdrop-blur-md z-50">
+        <div className="p-4 flex items-center gap-3 border-b border-brand-line h-16">
+          <div className="w-8 h-8 rounded bg-brand-accent flex items-center justify-center">
+            <Activity className="text-black w-5 h-5" />
+          </div>
+          <h1 className="text-lg font-bold hidden md:block tracking-tighter">MESHVIEW SENTINEL</h1>
+        </div>
+
+        <nav className="flex-1 p-2 space-y-1 mt-4 overflow-y-auto">
+          <NavItem 
+            active={activeTab === 'dashboard'} 
+            onClick={() => setActiveTab('dashboard')}
+            icon={<LayoutDashboard size={20} />}
+            label="Dashboard"
+          />
+          <NavItem 
+            active={activeTab === 'map'} 
+            onClick={() => setActiveTab('map')}
+            icon={<MapIcon size={20} />}
+            label="Map Network"
+          />
+          <NavItem 
+            active={activeTab === 'messages'} 
+            onClick={() => setActiveTab('messages')}
+            icon={<MessageSquare size={20} />}
+            label="Messages"
+          />
+          <NavItem 
+            active={activeTab === 'logs'} 
+            onClick={() => setActiveTab('logs')}
+            icon={<History size={20} />}
+            label="Event Logs"
+          />
+          <NavItem 
+            active={activeTab === 'matrix'} 
+            onClick={() => setActiveTab('matrix')}
+            icon={<Signal size={20} />}
+            label="Comm Matrix"
+          />
+          <NavItem 
+            active={activeTab === 'topology'} 
+            onClick={() => setActiveTab('topology')}
+            icon={<Activity size={20} />}
+            label="Topology"
+          />
+          <NavItem 
+            active={activeTab === 'routes'} 
+            onClick={() => setActiveTab('routes')}
+            icon={<TrendingUp size={20} />}
+            label="Route Intel"
+          />
+          <NavItem 
+            active={activeTab === 'recipe'} 
+            onClick={() => setActiveTab('recipe')}
+            icon={<FileDown size={20} />}
+            label="Recipe Guide"
+          />
+          
+          <div className="mt-auto pt-4 border-t border-brand-line space-y-1">
+            <button 
+              onClick={() => setUnitSystem(prev => prev === 'METRIC' ? 'IMPERIAL' : 'METRIC')}
+              className="w-full h-10 flex items-center justify-center md:justify-start gap-3 px-3 rounded-lg text-brand-muted hover:bg-brand-line/10 hover:text-brand-accent transition-all group"
+            >
+              <Globe size={20} className="group-hover:text-brand-accent transition-colors flex-shrink-0" />
+              <div className="hidden md:flex flex-col items-start overflow-hidden">
+                <span className="text-[10px] font-bold uppercase tracking-widest leading-none">{unitSystem}</span>
+                <span className="text-[8px] uppercase text-brand-muted truncate leading-none mt-1">Units System</span>
+              </div>
+            </button>
+            <button 
+              onClick={() => setShowExportModal(true)}
+              className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-brand-muted hover:bg-brand-line hover:text-white transition-all group"
+            >
+              <FileDown size={20} className="group-hover:text-brand-accent transition-colors" />
+              <span className="text-sm font-bold tracking-tight uppercase hidden md:block">Export Data</span>
+            </button>
+            <button 
+              onClick={() => setShowImportModal(true)}
+              className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-brand-muted hover:bg-brand-line hover:text-white transition-all group"
+            >
+              <FileUp size={20} className="group-hover:text-brand-accent transition-colors" />
+              <span className="text-sm font-bold tracking-tight uppercase hidden md:block">Import Data</span>
+            </button>
+          </div>
+
+          <div className="pt-4 mt-4 border-t border-brand-line hidden md:block">
+            <div className="px-3 mb-2 flex items-center justify-between">
+              <span className="text-[10px] font-bold text-brand-muted uppercase tracking-widest">Node Groups</span>
+              <button 
+                onClick={() => setIsAddingGroup(true)}
+                className="p-1 hover:text-brand-accent transition-colors"
+                title="Create Group"
+              >
+                <Plus size={14} />
+              </button>
+            </div>
+            
+            <div className="space-y-1">
+              <GroupItem 
+                active={selectedGroupId === 'all'} 
+                onClick={() => setSelectedGroupId('all')}
+                label="All Nodes"
+                count={nodes.length}
+              />
+              <GroupItem 
+                active={selectedGroupId === 'favorites'} 
+                onClick={() => setSelectedGroupId('favorites')}
+                label="Favorites"
+                icon={<Star size={12} className="text-brand-warning" />}
+                count={stats.favorites}
+              />
+              {groups.map(group => (
+                <GroupItem 
+                  key={group.id}
+                  active={selectedGroupId === group.id}
+                  onClick={() => setSelectedGroupId(group.id)}
+                  label={group.name}
+                  color={group.color}
+                  count={nodes.filter(n => n.groupId === group.id).length}
+                />
+              ))}
+            </div>
+          </div>
+        </nav>
+
+        <div className="p-4 border-t border-brand-line space-y-4">
+          <div className="hidden md:block">
+            <p className="text-[10px] text-brand-muted uppercase font-bold tracking-widest mb-2">SYSTEM STATUS</p>
+            <div className="flex items-center gap-2 mb-2">
+              <div className="w-2 h-2 rounded-full bg-brand-accent animate-pulse" />
+              <span className="mono-text text-brand-accent uppercase">Link Active</span>
+            </div>
+          </div>
+          <button className="w-full h-10 rounded border border-brand-line hover:bg-brand-line transition-colors flex items-center justify-center gap-2">
+            <Settings size={18} />
+            <span className="hidden md:inline text-sm">Settings</span>
+          </button>
+        </div>
+      </aside>
+
+      {/* Main Content */}
+      <main className="flex-1 flex flex-col relative overflow-hidden">
+        {/* Header */}
+        <header className="h-16 border-b border-brand-line flex items-center justify-between px-6 bg-brand-bg/80 backdrop-blur-sm z-40">
+          <div className="flex items-center gap-6">
+            <div className="flex items-baseline gap-2">
+              <span className="text-2xl font-light">{activeTab.toUpperCase()}</span>
+              <span className="text-xs text-brand-muted mono-text tracking-widest hidden sm:inline">v2.4.0-STABLE</span>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-4">
+            <div className="relative hidden sm:block">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-brand-muted" size={16} />
+              <input 
+                type="text" 
+                placeholder="Filter nodes..." 
+                className="bg-brand-line/50 border border-brand-line rounded-full py-1.5 pl-10 pr-4 text-sm focus:outline-none focus:border-brand-accent transition-colors w-64"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+              />
+            </div>
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-brand-line/30 border border-brand-line">
+              <Signal size={14} className="text-brand-accent" />
+              <span className="text-xs font-medium mono-text">MQTT: ONLINE</span>
+            </div>
+          </div>
+        </header>
+
+        {/* View Layout */}
+        <div className="flex-1 relative overflow-hidden">
+          {/* Modal for adding group */}
+          <AnimatePresence>
+            {isAddingGroup && (
+              <motion.div 
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                className="absolute inset-0 bg-brand-bg/80 backdrop-blur-md z-[100] flex items-center justify-center p-6"
+              >
+                <div className="technical-panel w-full max-w-sm p-6 space-y-4">
+                  <h3 className="text-lg font-bold tracking-tight">Create New Group</h3>
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-bold uppercase tracking-widest text-brand-muted">Group Name</label>
+                    <input 
+                      type="text" 
+                      value={newGroupName}
+                      onChange={(e) => setNewGroupName(e.target.value)}
+                      placeholder="e.g. West Relay Team"
+                      className="w-full bg-brand-line border border-brand-line rounded px-3 py-2 text-sm focus:outline-none focus:border-brand-accent"
+                      autoFocus
+                    />
+                  </div>
+                  <div className="flex gap-2 justify-end">
+                    <button 
+                      onClick={() => setIsAddingGroup(false)}
+                      className="px-4 py-2 text-sm hover:text-brand-accent transition-colors"
+                    >
+                      Cancel
+                    </button>
+                    <button 
+                      onClick={handleCreateGroup}
+                      className="bg-brand-accent text-black px-4 py-2 rounded text-sm font-bold hover:brightness-110"
+                    >
+                      Create
+                    </button>
+                  </div>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          <AnimatePresence mode="wait">
+            {activeTab === 'dashboard' && (
+              <motion.div 
+                key="dashboard"
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -10 }}
+                className="p-6 h-full overflow-y-auto"
+              >
+                <DashboardView
+                  nodes={nodes}
+                  messages={messages}
+                  filteredNodes={filteredNodes}
+                  selectedNode={selectedNode}
+                  selectedNodeId={selectedNodeId}
+                  setSelectedNodeId={setSelectedNodeId}
+                  setConfiguringNodeId={setConfiguringNodeId}
+                  setIsEditingDashboard={setIsEditingDashboard}
+                  dashboardWidgets={dashboardWidgets}
+                  stats={stats}
+                  unitSystem={unitSystem}
+                />
+              </motion.div>
+            )}
+
+            {activeTab === 'map' && (
+              <motion.div 
+                key="map"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                className="h-full relative"
+              >
+                <MapView
+                  nodes={nodes}
+                  messages={messages}
+                  groups={groups}
+                  traceMessageId={traceMessageId}
+                  setTraceMessageId={setTraceMessageId}
+                  setSelectedNodeId={setSelectedNodeId}
+                />
+              </motion.div>
+            )}
+
+            {activeTab === 'messages' && (
+              <motion.div 
+                key="messages"
+                initial={{ opacity: 0, x: 20 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: -20 }}
+                className="p-6 h-full grid grid-cols-1 md:grid-cols-12 gap-6 overflow-hidden"
+              >
+                <MessagesView
+                  nodes={nodes}
+                  messages={messages}
+                  filteredMessages={filteredMessages}
+                  activeChatId={activeChatId}
+                  setActiveChatId={setActiveChatId}
+                  activeChatPartner={activeChatPartner}
+                  traceMessageId={traceMessageId}
+                  setTraceMessageId={setTraceMessageId}
+                  setActiveTab={setActiveTab}
+                  draftMessage={draftMessage}
+                  setDraftMessage={setDraftMessage}
+                  handleSendMessage={handleSendMessage}
+                />
+              </motion.div>
+            )}
+
+            {activeTab === 'matrix' && (
+              <motion.div 
+                key="matrix"
+                initial={{ opacity: 0, scale: 0.95 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.95 }}
+                className="p-6 h-full flex flex-col gap-6"
+              >
+                <MatrixView matrixData={matrixData} />
+              </motion.div>
+            )}
+
+            {activeTab === 'topology' && (
+              <motion.div 
+                key="topology"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                className="p-6 h-full flex flex-col"
+              >
+                  <div className="flex items-center justify-between mb-4">
+                    <div>
+                      <h2 className="text-xl font-bold tracking-tight">NETWORK TOPOLOGY</h2>
+                      <p className="text-xs text-brand-muted mono-text uppercase">Force-Directed Graph Visualization</p>
+                    </div>
+                    <div className="flex gap-2">
+                       <div className="technical-panel px-3 py-1 flex items-center gap-2">
+                          <Activity size={12} className="text-brand-accent" />
+                          <span className="text-[10px] mono-text">{nodes.length} NODES DISCOVERED</span>
+                       </div>
+                    </div>
+                  </div>
+                  <div className="flex-1 min-h-0">
+                    <TopologyView nodes={nodes} onNodeSelect={(id) => {
+                      setSelectedNodeId(id);
+                    }} />
+                  </div>
+              </motion.div>
+            )}
+
+            {activeTab === 'routes' && (
+              <motion.div 
+                key="routes"
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -10 }}
+                className="p-6 h-full overflow-hidden"
+              >
+                <RouteIntelView nodes={nodes} />
+              </motion.div>
+            )}
+
+            {activeTab === 'recipe' && (
+              <motion.div 
+                key="recipe"
+                initial={{ opacity: 0, y: 20 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -20 }}
+                className="p-6 h-full overflow-hidden"
+              >
+                <RecipeView />
+              </motion.div>
+            )}
+
+            {activeTab === 'logs' && (
+              <motion.div 
+                key="logs"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                className="p-6 h-full overflow-hidden flex flex-col"
+              >
+                <LogsView events={events} />
+              </motion.div>
+            )}
+
+          </AnimatePresence>
+        </div>
+
+        <AnimatePresence>
+          {configuringNodeId && nodes.find(n => n.id === configuringNodeId) && (
+            <NodeSettingsModal 
+              node={nodes.find(n => n.id === configuringNodeId)!} 
+              onClose={() => setConfiguringNodeId(null)} 
+            />
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence>
+          {showExportModal && (
+            <ExportModal 
+              nodes={nodes}
+              messages={messages}
+              events={events}
+              onClose={() => setShowExportModal(false)}
+            />
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence>
+          {showImportModal && (
+            <ImportModal 
+              nodes={nodes}
+              onClose={() => setShowImportModal(false)}
+            />
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence>
+          {isEditingDashboard && (
+            <DashboardDesigner 
+              widgets={dashboardWidgets}
+              onUpdate={setDashboardWidgets}
+              onClose={() => setIsEditingDashboard(false)}
+            />
+          )}
+        </AnimatePresence>
+
+        <AIAssistant 
+          nodes={nodes}
+          messages={messages}
+          events={events}
+        />
+      </main>
+    </div>
+  );
+}
+
