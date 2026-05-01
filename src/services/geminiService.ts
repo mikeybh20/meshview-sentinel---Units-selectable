@@ -21,7 +21,7 @@ Keep your answers technical but accessible, in the style of a radio operator.
 Use technical terms like SNR, RSSI, Hops, and Peripheral Bridge when appropriate.`;
 
     try {
-      const response = await fetch(`${API_BASE}/api/gemini`, {
+      const response = await fetch(`${API_BASE}/api/ai/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt, systemInstruction }),

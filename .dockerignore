@@ -4,3 +4,4 @@ dist
 *.md
 *.docx
 .env
+.ai-config.json

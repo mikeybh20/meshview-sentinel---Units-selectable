@@ -15,7 +15,11 @@ services:
     volumes:
       - /dev:/dev
       - /run/udev:/run/udev:ro
+      - meshview-data:/app/data
     device_cgroup_rules:
       - "c 188:* rmw"   # /dev/ttyUSB*
       - "c 166:* rmw"   # /dev/ttyACM*
     restart: unless-stopped
+
+volumes:
+  meshview-data:

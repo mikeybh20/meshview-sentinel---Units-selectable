@@ -32,6 +32,7 @@ import { ImportModal } from './components/ImportModal';
 import { DashboardDesigner } from './components/DashboardDesigner';
 import { RecipeView } from './components/RecipeView';
 import { AIAssistant } from './components/AIAssistant';
+import { AISettingsModal } from './components/AISettingsModal';
 
 import { NavItem } from './components/ui/NavItem';
 import { GroupItem } from './components/ui/GroupItem';
@@ -51,6 +52,7 @@ export default function App() {
   const [configuringNodeId, setConfiguringNodeId] = React.useState<string | null>(null);
   const [showExportModal, setShowExportModal] = React.useState(false);
   const [showImportModal, setShowImportModal] = React.useState(false);
+  const [showAISettings, setShowAISettings] = React.useState(false);
   const [isEditingDashboard, setIsEditingDashboard] = React.useState(false);
   const [dashboardWidgets, setDashboardWidgets] = React.useState<WidgetConfig[]>([
     { id: 'w1', type: 'STATS', visible: true, order: 0, width: 'full' },
@@ -249,6 +251,13 @@ export default function App() {
             >
               <FileUp size={20} className="group-hover:text-brand-accent transition-colors" />
               <span className="text-sm font-bold tracking-tight uppercase hidden md:block">Import Data</span>
+            </button>
+            <button 
+              onClick={() => setShowAISettings(true)}
+              className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-brand-muted hover:bg-brand-line hover:text-white transition-all group"
+            >
+              <Settings size={20} className="group-hover:text-brand-accent transition-colors" />
+              <span className="text-sm font-bold tracking-tight uppercase hidden md:block">AI Settings</span>
             </button>
           </div>
 
@@ -563,6 +572,12 @@ export default function App() {
               onUpdate={setDashboardWidgets}
               onClose={() => setIsEditingDashboard(false)}
             />
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence>
+          {showAISettings && (
+            <AISettingsModal onClose={() => setShowAISettings(false)} />
           )}
         </AnimatePresence>
 
