@@ -256,13 +256,18 @@ if (existsSync(distPath)) {
 }
 
 // --- Start serial discovery + auto-connect mesh bridge ---
+let bridgeConnecting = false;
 async function connectBridge(port: string) {
+  if (bridgeConnecting || meshBridge.connected) return;
+  bridgeConnecting = true;
   console.log(`[API] LoRa device found at ${port} — connecting mesh bridge...`);
   try {
     await meshBridge.connect(port);
     console.log(`[API] Mesh bridge connected to ${port}`);
   } catch (err: any) {
     console.error(`[API] Failed to connect mesh bridge:`, err.message);
+  } finally {
+    bridgeConnecting = false;
   }
 }
 
