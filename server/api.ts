@@ -6,6 +6,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { serialDiscovery } from './serialDiscovery.js';
+import { meshBridge } from './meshtasticSerial.js';
 
 dotenv.config();
 
@@ -174,7 +175,66 @@ app.post('/api/gemini', (req, res) => {
   app.handle(req, res);
 });
 
-// --- Serial device status API ---
+// =============================================
+// Mesh Radio API (real hardware data)
+// =============================================
+
+// Status: is the radio connected?
+app.get('/api/mesh/status', (_req, res) => {
+  const device = serialDiscovery.getDevice();
+  return res.json({
+    radioConnected: meshBridge.connected,
+    serialDevice: device ? {
+      port: device.port,
+      vendor: device.vendor,
+      product: device.product,
+      isLoRa: device.isLoRa,
+    } : null,
+    nodeCount: meshBridge.getNodes().length,
+    messageCount: meshBridge.getMessages().length,
+  });
+});
+
+// All mesh nodes seen by the radio
+app.get('/api/mesh/nodes', (_req, res) => {
+  return res.json(meshBridge.getNodes());
+});
+
+// All messages received by the radio
+app.get('/api/mesh/messages', (_req, res) => {
+  return res.json(meshBridge.getMessages());
+});
+
+// Event log
+app.get('/api/mesh/events', (_req, res) => {
+  return res.json(meshBridge.getEvents());
+});
+
+// Full snapshot (nodes + messages + events in one call)
+app.get('/api/mesh/snapshot', (_req, res) => {
+  return res.json({
+    nodes: meshBridge.getNodes(),
+    messages: meshBridge.getMessages(),
+    events: meshBridge.getEvents(),
+    radioConnected: meshBridge.connected,
+  });
+});
+
+// Send a text message through the radio
+app.post('/api/mesh/send', async (req, res) => {
+  const { text, to, channel } = req.body;
+  if (!text) return res.status(400).json({ error: 'Missing text' });
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+
+  try {
+    await meshBridge.sendMessage(text, to || '!ffffffff', channel || 0);
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Legacy serial status (backwards compat)
 app.get('/api/serial/status', (_req, res) => {
   const device = serialDiscovery.getDevice();
   return res.json({
@@ -195,14 +255,25 @@ if (existsSync(distPath)) {
   });
 }
 
-// --- Start serial discovery if enabled ---
+// --- Start serial discovery + auto-connect mesh bridge ---
 if (process.env.SERIAL_AUTO_DISCOVER === 'true') {
   serialDiscovery.start();
-  serialDiscovery.on('connected', (device) => {
-    console.log(`[API] LoRa radio connected at ${device.port}`);
+  serialDiscovery.on('connected', async (device) => {
+    console.log(`[API] LoRa device found at ${device.port} — connecting mesh bridge...`);
+    try {
+      await meshBridge.connect(device.port);
+      console.log(`[API] Mesh bridge connected to ${device.port}`);
+    } catch (err: any) {
+      console.error(`[API] Failed to connect mesh bridge:`, err.message);
+    }
   });
-  serialDiscovery.on('disconnected', () => {
-    console.log('[API] LoRa radio disconnected — will keep scanning');
+  serialDiscovery.on('disconnected', async () => {
+    console.log('[API] LoRa device disconnected — mesh bridge will auto-retry');
+  });
+} else if (process.env.SERIAL_PORT) {
+  // Manual port override
+  meshBridge.connect(process.env.SERIAL_PORT).catch((err) => {
+    console.error(`[API] Failed to connect to ${process.env.SERIAL_PORT}:`, err.message);
   });
 }
 

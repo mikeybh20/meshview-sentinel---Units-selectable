@@ -19,10 +19,12 @@ import {
   FileUp,
   Globe,
   TrendingUp,
+  Radio,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
 import { simulator } from './services/meshtasticSimulator';
+import { meshDataService, DataSource } from './services/meshDataService';
 import { Node, Message, RadioEvent, Group, WidgetConfig, UnitSystem } from './types';
 import { cn } from './lib/utils';
 import { TopologyView } from './components/TopologyView';
@@ -76,14 +78,47 @@ export default function App() {
   const [isAddingGroup, setIsAddingGroup] = React.useState(false);
   const [newGroupName, setNewGroupName] = React.useState('');
   const [unitSystem, setUnitSystem] = React.useState<UnitSystem>('METRIC');
+  const [dataSource, setDataSource] = React.useState<DataSource>('simulator');
+  const [radioConnected, setRadioConnected] = React.useState(false);
 
+  // Check if a real radio is available on mount
   React.useEffect(() => {
-    return simulator.subscribe((n, m, e) => {
-      setNodes(n);
-      setMessages(m);
-      setEvents(e);
-    });
+    fetch('/api/mesh/status')
+      .then(r => r.json())
+      .then(status => {
+        if (status.radioConnected) {
+          setRadioConnected(true);
+          setDataSource('live');
+        }
+      })
+      .catch(() => { /* server not running, stay on simulator */ });
   }, []);
+
+  // Subscribe to the active data source
+  React.useEffect(() => {
+    if (dataSource === 'live') {
+      meshDataService.start();
+      const unsub = meshDataService.subscribe((n, m, e) => {
+        setNodes(n);
+        setMessages(m);
+        setEvents(e);
+      });
+      const unsubStatus = meshDataService.onStatus((status) => {
+        setRadioConnected(status?.radioConnected ?? false);
+      });
+      return () => {
+        unsub();
+        unsubStatus();
+        meshDataService.stop();
+      };
+    } else {
+      return simulator.subscribe((n, m, e) => {
+        setNodes(n);
+        setMessages(m);
+        setEvents(e);
+      });
+    }
+  }, [dataSource]);
 
   const activeChatPartner = React.useMemo(() => 
     nodes.find(n => n.id === activeChatId),
@@ -228,6 +263,34 @@ export default function App() {
           />
           
           <div className="mt-auto pt-4 border-t border-brand-line space-y-1">
+            <button 
+              onClick={() => setDataSource(prev => prev === 'simulator' ? 'live' : 'simulator')}
+              className={cn(
+                "w-full h-10 flex items-center justify-center md:justify-start gap-3 px-3 rounded-lg transition-all group",
+                dataSource === 'live' 
+                  ? "text-emerald-400 bg-emerald-500/10 hover:bg-emerald-500/20" 
+                  : "text-brand-muted hover:bg-brand-line/10 hover:text-brand-accent"
+              )}
+            >
+              <Radio size={20} className={cn(
+                "flex-shrink-0 transition-colors",
+                dataSource === 'live' ? "text-emerald-400" : "group-hover:text-brand-accent",
+                radioConnected && dataSource === 'live' && "animate-pulse"
+              )} />
+              <div className="hidden md:flex flex-col items-start overflow-hidden">
+                <span className="text-[10px] font-bold uppercase tracking-widest leading-none">
+                  {dataSource === 'live' ? 'LIVE RADIO' : 'SIMULATOR'}
+                </span>
+                <span className={cn(
+                  "text-[8px] uppercase truncate leading-none mt-1",
+                  dataSource === 'live' && radioConnected ? "text-emerald-400" : "text-brand-muted"
+                )}>
+                  {dataSource === 'live' 
+                    ? (radioConnected ? 'Connected' : 'Waiting for radio...') 
+                    : 'Demo Data'}
+                </span>
+              </div>
+            </button>
             <button 
               onClick={() => setUnitSystem(prev => prev === 'METRIC' ? 'IMPERIAL' : 'METRIC')}
               className="w-full h-10 flex items-center justify-center md:justify-start gap-3 px-3 rounded-lg text-brand-muted hover:bg-brand-line/10 hover:text-brand-accent transition-all group"
