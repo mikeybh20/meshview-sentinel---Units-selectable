@@ -14,6 +14,7 @@ services:
     # without needing --privileged.
     volumes:
       - /dev:/dev
+      - /sys:/sys:ro
       - /run/udev:/run/udev:ro
       - meshview-data:/app/data
     device_cgroup_rules:

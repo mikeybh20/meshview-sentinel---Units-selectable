@@ -256,25 +256,32 @@ if (existsSync(distPath)) {
 }
 
 // --- Start serial discovery + auto-connect mesh bridge ---
+async function connectBridge(port: string) {
+  console.log(`[API] LoRa device found at ${port} — connecting mesh bridge...`);
+  try {
+    await meshBridge.connect(port);
+    console.log(`[API] Mesh bridge connected to ${port}`);
+  } catch (err: any) {
+    console.error(`[API] Failed to connect mesh bridge:`, err.message);
+  }
+}
+
 if (process.env.SERIAL_AUTO_DISCOVER === 'true') {
-  serialDiscovery.start();
-  serialDiscovery.on('connected', async (device) => {
-    console.log(`[API] LoRa device found at ${device.port} — connecting mesh bridge...`);
-    try {
-      await meshBridge.connect(device.port);
-      console.log(`[API] Mesh bridge connected to ${device.port}`);
-    } catch (err: any) {
-      console.error(`[API] Failed to connect mesh bridge:`, err.message);
-    }
-  });
+  // Register listeners BEFORE start() to avoid missing the immediate poll event
+  serialDiscovery.on('connected', (device) => { connectBridge(device.port); });
   serialDiscovery.on('disconnected', async () => {
     console.log('[API] LoRa device disconnected — mesh bridge will auto-retry');
   });
+  serialDiscovery.start();
+
+  // If the first poll already found a device before listeners fired, connect now
+  const alreadyFound = serialDiscovery.getDevice();
+  if (alreadyFound && !meshBridge.connected) {
+    connectBridge(alreadyFound.port);
+  }
 } else if (process.env.SERIAL_PORT) {
   // Manual port override
-  meshBridge.connect(process.env.SERIAL_PORT).catch((err) => {
-    console.error(`[API] Failed to connect to ${process.env.SERIAL_PORT}:`, err.message);
-  });
+  connectBridge(process.env.SERIAL_PORT);
 }
 
 const PORT = process.env.API_PORT || 3001;
