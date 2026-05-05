@@ -95,15 +95,16 @@ export function DashboardView({
               )}
 
               {widget.type === 'NODE_LIST' && (
-                <div className="technical-panel h-full">
-                  <div className="p-4 border-b border-brand-line flex items-center justify-between">
+                <div className="technical-panel h-full flex flex-col min-h-0 max-h-[70vh]">
+                  <div className="p-4 border-b border-brand-line flex items-center justify-between flex-shrink-0">
                     <h3 className="font-bold flex items-center gap-2 text-xs uppercase tracking-widest text-brand-muted">
                       Active Network Peers
+                      <span className="text-brand-muted/60 mono-text">({filteredNodes.length})</span>
                     </h3>
                   </div>
-                  <div className="overflow-x-auto">
+                  <div className="flex-1 min-h-0 overflow-y-auto overflow-x-auto">
                     <table className="w-full text-left">
-                      <thead>
+                      <thead className="sticky top-0 z-10 bg-brand-bg">
                         <tr className="border-b border-brand-line bg-brand-line/20">
                           <th className="px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-brand-muted">Status</th>
                           <th className="px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-brand-muted">Node ID</th>

@@ -7,6 +7,7 @@ import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { serialDiscovery } from './serialDiscovery.js';
 import { meshBridge } from './meshtasticSerial.js';
+import { meshDb } from './database.js';
 
 dotenv.config();
 
@@ -216,8 +217,45 @@ app.get('/api/mesh/snapshot', (_req, res) => {
     nodes: meshBridge.getNodes(),
     messages: meshBridge.getMessages(),
     events: meshBridge.getEvents(),
+    channels: meshBridge.getChannels(),
     radioConnected: meshBridge.connected,
   });
+});
+
+// Database stats (counts of persisted rows)
+app.get('/api/mesh/db/stats', (_req, res) => {
+  try {
+    return res.json(meshDb().stats());
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Telemetry history for one node
+app.get('/api/mesh/nodes/:id/telemetry', (req, res) => {
+  const limit = Math.min(parseInt(String(req.query.limit ?? '200'), 10) || 200, 2000);
+  try {
+    return res.json(meshDb().getTelemetryHistory(req.params.id, limit));
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Channel configuration
+app.get('/api/mesh/channels', (_req, res) => {
+  return res.json(meshBridge.getChannels());
+});
+
+app.post('/api/mesh/channels', async (req, res) => {
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  const channels = req.body?.channels;
+  if (!Array.isArray(channels)) return res.status(400).json({ error: 'Body must be { channels: [...] }' });
+  try {
+    await meshBridge.setChannels(channels);
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 // Send a text message through the radio
@@ -227,11 +265,39 @@ app.post('/api/mesh/send', async (req, res) => {
   if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
 
   try {
-    await meshBridge.sendMessage(text, to || '!ffffffff', channel || 0);
-    return res.json({ ok: true });
+    const messageId = await meshBridge.sendMessage(text, to || '!ffffffff', channel ?? 0);
+    return res.json({ ok: true, messageId });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
   }
+});
+
+// Server-Sent Events stream for real-time ACK/status updates
+const sseClients = new Set<(data: string) => void>();
+
+meshBridge.on('ackUpdate', (msgId: string, status: string, errorCode: number) => {
+  const payload = `data: ${JSON.stringify({ msgId, status, errorCode: errorCode ?? 0 })}\n\n`;
+  for (const send of sseClients) {
+    try { send(payload); } catch { /* client gone */ }
+  }
+});
+
+app.get('/api/mesh/events', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const send = (data: string) => res.write(data);
+  sseClients.add(send);
+
+  // Keep-alive ping every 25 s
+  const ka = setInterval(() => { try { res.write(': ping\n\n'); } catch { clearInterval(ka); } }, 25_000);
+
+  req.on('close', () => {
+    clearInterval(ka);
+    sseClients.delete(send);
+  });
 });
 
 // Legacy serial status (backwards compat)

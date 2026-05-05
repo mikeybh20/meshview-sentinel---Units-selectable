@@ -15,6 +15,10 @@ interface MapViewProps {
   setSelectedNodeId: (id: string) => void;
 }
 
+// Maryland, home base
+const FALLBACK_CENTER: [number, number] = [39.0, -76.7];
+const FALLBACK_ZOOM = 9;
+
 export function MapView({
   nodes,
   messages,
@@ -23,12 +27,53 @@ export function MapView({
   setTraceMessageId,
   setSelectedNodeId,
 }: MapViewProps) {
+  const positioned = nodes.filter(n => n.position);
+
+  // Derive center/zoom from node positions; re-center when the first position arrives
+  const derivedCenter = React.useMemo<[number, number]>(() => {
+    if (positioned.length === 0) return FALLBACK_CENTER;
+    const lats = positioned.map(n => n.position!.lat);
+    const lngs = positioned.map(n => n.position!.lng);
+    return [
+      (Math.min(...lats) + Math.max(...lats)) / 2,
+      (Math.min(...lngs) + Math.max(...lngs)) / 2,
+    ];
+  }, [positioned.length]); // only recompute when count changes (new node arrives)
+
+  const derivedZoom = React.useMemo(() => {
+    if (positioned.length === 0) return FALLBACK_ZOOM;
+    if (positioned.length === 1) return 13;
+    // Rough zoom based on lat/lng span
+    const lats = positioned.map(n => n.position!.lat);
+    const lngs = positioned.map(n => n.position!.lng);
+    const span = Math.max(Math.max(...lats) - Math.min(...lats), Math.max(...lngs) - Math.min(...lngs));
+    if (span < 0.05) return 13;
+    if (span < 0.2)  return 11;
+    if (span < 1)    return 9;
+    if (span < 5)    return 7;
+    return 5;
+  }, [positioned.length]);
+
+  const [center, setCenter] = React.useState<[number, number]>(derivedCenter);
+  const [zoom, setZoom] = React.useState(derivedZoom);
+
+  // Snap to derived center the first time real positions arrive
+  const hasSnapped = React.useRef(false);
+  React.useEffect(() => {
+    if (!hasSnapped.current && positioned.length > 0) {
+      hasSnapped.current = true;
+      setCenter(derivedCenter);
+      setZoom(derivedZoom);
+    }
+  }, [derivedCenter, derivedZoom, positioned.length]);
+
   return (
     <div className="h-full relative">
       <div className="absolute inset-4 technical-panel z-0">
-        <Map 
-          defaultCenter={[45.523062, -122.676482]} 
-          defaultZoom={12}
+        <Map
+          center={center}
+          zoom={zoom}
+          onBoundsChanged={({ center: c, zoom: z }) => { setCenter(c); setZoom(z); }}
           dprs={[1, 2]}
         >
           <ZoomControl />

@@ -6,3 +6,7 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Persistent radio state (SQLite + AI config)
+data/
+

@@ -5,7 +5,7 @@
  * interface identical to the simulator, so the app can switch between
  * real hardware and simulated data seamlessly.
  */
-import { Node, Message, RadioEvent } from '../types';
+import { Node, Message, RadioEvent, Channel } from '../types';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
@@ -15,6 +15,7 @@ interface MeshSnapshot {
   nodes: Node[];
   messages: Message[];
   events: RadioEvent[];
+  channels?: Channel[];
   radioConnected: boolean;
 }
 
@@ -30,24 +31,31 @@ interface MeshStatus {
   messageCount: number;
 }
 
+export type AckStatus = 'sending' | 'sent' | 'acked' | 'error';
+
 export class MeshDataService {
   private listeners: ((nodes: Node[], messages: Message[], events: RadioEvent[]) => void)[] = [];
+  private channelListeners: ((channels: Channel[]) => void)[] = [];
   private statusListeners: ((status: MeshStatus | null) => void)[] = [];
+  private ackListeners: ((msgId: string, status: AckStatus, errorCode: number) => void)[] = [];
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private statusTimer: ReturnType<typeof setInterval> | null = null;
+  private eventSource: EventSource | null = null;
   private lastStatus: MeshStatus | null = null;
+  private lastChannels: Channel[] = [];
   private pollMs: number;
 
   constructor(pollMs = 3000) {
     this.pollMs = pollMs;
   }
 
-  /** Start polling the server for live mesh data */
+  /** Start polling the server for live mesh data and open the SSE stream */
   start() {
     this.poll(); // immediate first fetch
     this.pollTimer = setInterval(() => this.poll(), this.pollMs);
     this.pollStatus();
     this.statusTimer = setInterval(() => this.pollStatus(), 5000);
+    this.connectEvents();
   }
 
   stop() {
@@ -58,6 +66,34 @@ export class MeshDataService {
     if (this.statusTimer) {
       clearInterval(this.statusTimer);
       this.statusTimer = null;
+    }
+    if (this.eventSource) {
+      this.eventSource.close();
+      this.eventSource = null;
+    }
+  }
+
+  /** Subscribe to real-time ACK/status updates for sent messages */
+  onAckUpdate(cb: (msgId: string, status: AckStatus, errorCode: number) => void) {
+    this.ackListeners.push(cb);
+    return () => { this.ackListeners = this.ackListeners.filter(l => l !== cb); };
+  }
+
+  private connectEvents() {
+    if (this.eventSource) return;
+    try {
+      this.eventSource = new EventSource(`${API_BASE}/api/mesh/events`);
+      this.eventSource.onmessage = (e) => {
+        try {
+          const { msgId, status, errorCode } = JSON.parse(e.data);
+          this.ackListeners.forEach(l => l(msgId, status as AckStatus, errorCode ?? 0));
+        } catch { /* malformed event */ }
+      };
+      this.eventSource.onerror = () => {
+        // Browser will auto-reconnect; no action needed
+      };
+    } catch {
+      // EventSource not available (e.g. test env) — polling fallback is fine
     }
   }
 
@@ -82,17 +118,53 @@ export class MeshDataService {
     return this.lastStatus;
   }
 
-  /** Send a message through the real radio */
-  async sendMessage(text: string, to = '!ffffffff', channel = 0): Promise<boolean> {
+  /** Send a message through the real radio. Returns the server-assigned messageId on success. */
+  async sendMessage(text: string, to = '!ffffffff', channel = 0): Promise<{ ok: boolean; messageId?: string }> {
     try {
       const res = await fetch(`${API_BASE}/api/mesh/send`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text, to, channel }),
       });
-      return res.ok;
+      if (!res.ok) return { ok: false };
+      const body = await res.json();
+      // Immediately refresh so the optimistic message shows up in state
+      await this.poll();
+      return { ok: true, messageId: body.messageId };
     } catch {
-      return false;
+      return { ok: false };
+    }
+  }
+
+  /** Subscribe to channel list updates (replays the last known list immediately). */
+  onChannels(callback: (channels: Channel[]) => void) {
+    this.channelListeners.push(callback);
+    callback(this.lastChannels);
+    return () => {
+      this.channelListeners = this.channelListeners.filter(l => l !== callback);
+    };
+  }
+
+  getChannels(): Channel[] {
+    return [...this.lastChannels];
+  }
+
+  /** Persist a full channel list to the radio. Server fills any missing slots
+   *  as DISABLED, then commits and re-reads from the radio. */
+  async saveChannels(channels: Channel[]): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/channels`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ channels }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
     }
   }
 
@@ -112,6 +184,11 @@ export class MeshDataService {
       }));
 
       this.listeners.forEach(l => l(nodes, data.messages, data.events));
+
+      if (data.channels) {
+        this.lastChannels = data.channels;
+        this.channelListeners.forEach(l => l(data.channels!));
+      }
     } catch {
       // Server unreachable — skip this tick
     }

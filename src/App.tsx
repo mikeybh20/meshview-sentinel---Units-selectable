@@ -25,10 +25,11 @@ import { motion, AnimatePresence } from 'motion/react';
 
 import { simulator } from './services/meshtasticSimulator';
 import { meshDataService, DataSource } from './services/meshDataService';
-import { Node, Message, RadioEvent, Group, WidgetConfig, UnitSystem } from './types';
+import { Node, Message, RadioEvent, Group, WidgetConfig, UnitSystem, Channel } from './types';
 import { cn } from './lib/utils';
 import { TopologyView } from './components/TopologyView';
 import { NodeSettingsModal } from './components/NodeSettingsModal';
+import { ChannelsModal } from './components/ChannelsModal';
 import { ExportModal } from './components/ExportModal';
 import { ImportModal } from './components/ImportModal';
 import { DashboardDesigner } from './components/DashboardDesigner';
@@ -65,9 +66,13 @@ export default function App() {
     { id: 'w6', type: 'SENSOR_DATA', visible: true, order: 5, width: 'large' },
   ]);
   const [traceMessageId, setTraceMessageId] = React.useState<string | null>(null);
-  const [activeChatId, setActiveChatId] = React.useState<string>('global'); // 'global' or a nodeId
+  const [activeChatId, setActiveChatId] = React.useState<string>('chan:0'); // 'chan:N' or a nodeId
+  const [channels, setChannels] = React.useState<Channel[]>([]);
+  const [showChannelsModal, setShowChannelsModal] = React.useState(false);
   const [searchQuery, setSearchQuery] = React.useState('');
   const [draftMessage, setDraftMessage] = React.useState('');
+  // ACK status overlay: messageId → status (overrides whatever the poll returns)
+  const [ackStatuses, setAckStatuses] = React.useState<Record<string, { status: string; errorCode: number }>>({});
   
   // Grouping State
   const [groups, setGroups] = React.useState<Group[]>([
@@ -106,12 +111,23 @@ export default function App() {
       const unsubStatus = meshDataService.onStatus((status) => {
         setRadioConnected(status?.radioConnected ?? false);
       });
+      const unsubChannels = meshDataService.onChannels((list) => {
+        setChannels(list);
+      });
+      const unsubAck = meshDataService.onAckUpdate((msgId, status, errorCode) => {
+        setAckStatuses(prev => ({ ...prev, [msgId]: { status, errorCode } }));
+      });
       return () => {
         unsub();
         unsubStatus();
+        unsubChannels();
+        unsubAck();
         meshDataService.stop();
       };
     } else {
+      // Simulator has no channel concept — clear so the UI shows the synthetic
+      // "LongFast" fallback in MessagesView.
+      setChannels([]);
       return simulator.subscribe((n, m, e) => {
         setNodes(n);
         setMessages(m);
@@ -125,19 +141,53 @@ export default function App() {
     [nodes, activeChatId]
   );
 
-  const filteredMessages = React.useMemo(() => {
-    if (activeChatId === 'global') {
-      return messages.filter(m => m.channel === 'LongFast' || m.to === 'broadcast');
+  const activeChannel = React.useMemo<Channel | undefined>(() => {
+    if (!activeChatId.startsWith('chan:')) return undefined;
+    const idx = parseInt(activeChatId.slice(5), 10);
+    const found = channels.find(c => c.index === idx);
+    if (found) return found;
+    // Fallback synthetic primary so simulator/empty state still works.
+    if (idx === 0) {
+      return { index: 0, name: '', role: 'PRIMARY', pskBase64: '', uplinkEnabled: true, downlinkEnabled: true };
     }
-    return messages.filter(m => 
-      (m.from === activeChatId && m.to === '!abcdef01') || 
-      (m.from === '!abcdef01' && m.to === activeChatId)
-    );
-  }, [messages, activeChatId]);
+    return undefined;
+  }, [activeChatId, channels]);
 
-  const handleSendMessage = () => {
-    if (!draftMessage.trim()) return;
-    setDraftMessage('');
+  const filteredMessages = React.useMemo(() => {
+    const applyAck = (m: Message): Message => {
+      const ack = ackStatuses[m.id];
+      return ack ? { ...m, status: ack.status as Message['status'], errorCode: ack.errorCode } : m;
+    };
+
+    if (activeChannel) {
+      const label = activeChannel.name || (activeChannel.role === 'PRIMARY' ? 'LongFast' : `Channel ${activeChannel.index}`);
+      return messages
+        .filter(m =>
+          m.channel === label ||
+          (activeChannel.role === 'PRIMARY' && (m.channel === 'LongFast' || m.channel === 'Broadcast')) ||
+          m.channel === `Channel ${activeChannel.index}`
+        )
+        .map(applyAck);
+    }
+    return messages
+      .filter(m =>
+        (m.from === activeChatId && m.to !== '!ffffffff') ||
+        (m.to === activeChatId)
+      )
+      .map(applyAck);
+  }, [messages, activeChatId, activeChannel, ackStatuses]);
+
+  const handleSendMessage = async (overrideText?: string) => {
+    const text = overrideText ?? draftMessage;
+    if (!text.trim()) return;
+    if (dataSource === 'live') {
+      const channelIndex = activeChannel?.index ?? 0;
+      const to = activeChannel ? '!ffffffff' : activeChatId;
+      if (!overrideText) setDraftMessage('');
+      await meshDataService.sendMessage(text, to, channelIndex);
+    } else {
+      setDraftMessage('');
+    }
   };
 
   const selectedNode = React.useMemo(() => 
@@ -506,16 +556,19 @@ export default function App() {
                 <MessagesView
                   nodes={nodes}
                   messages={messages}
+                  channels={channels}
                   filteredMessages={filteredMessages}
                   activeChatId={activeChatId}
                   setActiveChatId={setActiveChatId}
                   activeChatPartner={activeChatPartner}
+                  activeChannel={activeChannel}
                   traceMessageId={traceMessageId}
                   setTraceMessageId={setTraceMessageId}
                   setActiveTab={setActiveTab}
                   draftMessage={draftMessage}
                   setDraftMessage={setDraftMessage}
                   handleSendMessage={handleSendMessage}
+                  onManageChannels={() => setShowChannelsModal(true)}
                 />
               </motion.div>
             )}
@@ -641,6 +694,12 @@ export default function App() {
         <AnimatePresence>
           {showAISettings && (
             <AISettingsModal onClose={() => setShowAISettings(false)} />
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence>
+          {showChannelsModal && (
+            <ChannelsModal onClose={() => setShowChannelsModal(false)} />
           )}
         </AnimatePresence>
 

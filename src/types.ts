@@ -18,6 +18,17 @@ export interface NodeSettings {
   modemPreset: 'LONG_FAST' | 'LONG_SLOW' | 'MEDIUM_FAST' | 'SHORT_FAST';
 }
 
+export type ChannelRole = 'DISABLED' | 'PRIMARY' | 'SECONDARY';
+
+export interface Channel {
+  index: number;            // 0-7
+  name: string;             // empty for default LongFast on primary
+  role: ChannelRole;
+  pskBase64: string;        // raw PSK as base64 ('' = none, 'AQ==' single-byte = default)
+  uplinkEnabled: boolean;
+  downlinkEnabled: boolean;
+}
+
 export interface SensorData {
   temperature?: number;
   humidity?: number;
@@ -64,6 +75,8 @@ export interface Group {
   color: string;
 }
 
+export type MessageStatus = 'sending' | 'sent' | 'acked' | 'error';
+
 export interface Message {
   id: string;
   from: string;
@@ -73,6 +86,9 @@ export interface Message {
   channel: string;
   hopLimit: number;
   hops: string[]; // List of node IDs it hopped through
+  status?: MessageStatus;
+  errorCode?: number; // Meshtastic routing error code (0 = none)
+  isOwn?: boolean;   // true when sent by the local radio
 }
 
 export interface RadioEvent {
