@@ -24,8 +24,13 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 
 import { simulator } from './services/meshtasticSimulator';
-import { meshDataService, DataSource } from './services/meshDataService';
-import { Node, Message, RadioEvent, Group, WidgetConfig, UnitSystem, Channel } from './types';
+import { meshDataService, DataSource, TransportInfo } from './services/meshDataService';
+import { SettingsModal } from './components/SettingsModal';
+import { IncomingContactToast } from './components/IncomingContactToast';
+import { useMeshNotifications } from './hooks/useMeshNotifications';
+import { parseDeepLinkFromHash, clearHash, DeepLink } from './lib/deepLink';
+import { useBlockList } from './hooks/useBlockList';
+import { Node, Message, RadioEvent, Group, WidgetConfig, UnitSystem, Channel, Waypoint, TraceResult, NeighborInfoSnapshot, StoreForwardRouter } from './types';
 import { cn } from './lib/utils';
 import { TopologyView } from './components/TopologyView';
 import { NodeSettingsModal } from './components/NodeSettingsModal';
@@ -35,7 +40,6 @@ import { ImportModal } from './components/ImportModal';
 import { DashboardDesigner } from './components/DashboardDesigner';
 import { RecipeView } from './components/RecipeView';
 import { AIAssistant } from './components/AIAssistant';
-import { AISettingsModal } from './components/AISettingsModal';
 
 import { NavItem } from './components/ui/NavItem';
 import { GroupItem } from './components/ui/GroupItem';
@@ -55,7 +59,8 @@ export default function App() {
   const [configuringNodeId, setConfiguringNodeId] = React.useState<string | null>(null);
   const [showExportModal, setShowExportModal] = React.useState(false);
   const [showImportModal, setShowImportModal] = React.useState(false);
-  const [showAISettings, setShowAISettings] = React.useState(false);
+  const [showSettings, setShowSettings] = React.useState(false);
+  const blockList = useBlockList();
   const [isEditingDashboard, setIsEditingDashboard] = React.useState(false);
   const [dashboardWidgets, setDashboardWidgets] = React.useState<WidgetConfig[]>([
     { id: 'w1', type: 'STATS', visible: true, order: 0, width: 'full' },
@@ -66,6 +71,11 @@ export default function App() {
     { id: 'w6', type: 'SENSOR_DATA', visible: true, order: 5, width: 'large' },
   ]);
   const [traceMessageId, setTraceMessageId] = React.useState<string | null>(null);
+  const [waypoints, setWaypoints] = React.useState<Waypoint[]>([]);
+  const [traces, setTraces] = React.useState<TraceResult[]>([]);
+  const [neighborInfo, setNeighborInfo] = React.useState<NeighborInfoSnapshot[]>([]);
+  const [sfRouters, setSfRouters] = React.useState<StoreForwardRouter[]>([]);
+  const [localNodeId, setLocalNodeId] = React.useState<string | null>(null);
   const [activeChatId, setActiveChatId] = React.useState<string>('chan:0'); // 'chan:N' or a nodeId
   const [channels, setChannels] = React.useState<Channel[]>([]);
   const [showChannelsModal, setShowChannelsModal] = React.useState(false);
@@ -85,6 +95,15 @@ export default function App() {
   const [unitSystem, setUnitSystem] = React.useState<UnitSystem>('METRIC');
   const [dataSource, setDataSource] = React.useState<DataSource>('simulator');
   const [radioConnected, setRadioConnected] = React.useState(false);
+  const [transport, setTransport] = React.useState<TransportInfo | null>(null);
+  const [notificationsEnabled, setNotificationsEnabled] = React.useState<boolean>(() => {
+    try { return localStorage.getItem('mesh.notificationsEnabled') !== 'false'; }
+    catch { return true; }
+  });
+  const [notificationPermission, setNotificationPermission] = React.useState<NotificationPermission | 'unsupported'>(() => {
+    if (typeof Notification === 'undefined') return 'unsupported';
+    return Notification.permission;
+  });
 
   // Check if a real radio is available on mount
   React.useEffect(() => {
@@ -110,6 +129,7 @@ export default function App() {
       });
       const unsubStatus = meshDataService.onStatus((status) => {
         setRadioConnected(status?.radioConnected ?? false);
+        setTransport(status?.transport ?? null);
       });
       const unsubChannels = meshDataService.onChannels((list) => {
         setChannels(list);
@@ -117,22 +137,36 @@ export default function App() {
       const unsubAck = meshDataService.onAckUpdate((msgId, status, errorCode) => {
         setAckStatuses(prev => ({ ...prev, [msgId]: { status, errorCode } }));
       });
+      const unsubWaypoints = meshDataService.onWaypoints((list) => {
+        setWaypoints(list);
+        setLocalNodeId(meshDataService.getLocalNodeId());
+      });
+      const unsubTraces = meshDataService.onTraces((list) => setTraces(list));
+      const unsubNeighbors = meshDataService.onNeighborInfo((list) => setNeighborInfo(list));
+      const unsubSfRouters = meshDataService.onStoreForwardRouters((list) => setSfRouters(list));
       return () => {
         unsub();
         unsubStatus();
         unsubChannels();
         unsubAck();
+        unsubWaypoints();
+        unsubTraces();
+        unsubNeighbors();
+        unsubSfRouters();
         meshDataService.stop();
       };
     } else {
       // Simulator has no channel concept — clear so the UI shows the synthetic
       // "LongFast" fallback in MessagesView.
       setChannels([]);
-      return simulator.subscribe((n, m, e) => {
+      setLocalNodeId(simulator.getLocalNodeId());
+      const unsub = simulator.subscribe((n, m, e) => {
         setNodes(n);
         setMessages(m);
         setEvents(e);
       });
+      const unsubWp = simulator.onWaypoints((list) => setWaypoints(list));
+      return () => { unsub(); unsubWp(); };
     }
   }, [dataSource]);
 
@@ -167,6 +201,7 @@ export default function App() {
           (activeChannel.role === 'PRIMARY' && (m.channel === 'LongFast' || m.channel === 'Broadcast')) ||
           m.channel === `Channel ${activeChannel.index}`
         )
+        .filter(m => !blockList.isBlocked(m.from))
         .map(applyAck);
     }
     return messages
@@ -174,26 +209,75 @@ export default function App() {
         (m.from === activeChatId && m.to !== '!ffffffff') ||
         (m.to === activeChatId)
       )
+      .filter(m => !blockList.isBlocked(m.from))
       .map(applyAck);
-  }, [messages, activeChatId, activeChannel, ackStatuses]);
+  }, [messages, activeChatId, activeChannel, ackStatuses, blockList]);
 
-  const handleSendMessage = async (overrideText?: string) => {
+  const handleSendMessage = async (
+    overrideText?: string,
+    opts?: { replyTo?: number; isReaction?: boolean },
+  ) => {
     const text = overrideText ?? draftMessage;
     if (!text.trim()) return;
     if (dataSource === 'live') {
       const channelIndex = activeChannel?.index ?? 0;
       const to = activeChannel ? '!ffffffff' : activeChatId;
       if (!overrideText) setDraftMessage('');
-      await meshDataService.sendMessage(text, to, channelIndex);
+      await meshDataService.sendMessage(text, to, channelIndex, opts);
     } else {
       setDraftMessage('');
     }
   };
 
-  const selectedNode = React.useMemo(() => 
-    nodes.find(n => n.id === selectedNodeId), 
+  const selectedNode = React.useMemo(() =>
+    nodes.find(n => n.id === selectedNodeId),
     [nodes, selectedNodeId]
   );
+
+  useMeshNotifications({
+    nodes,
+    messages,
+    events,
+    localNodeId,
+    activeChatId,
+    enabled: notificationsEnabled && notificationPermission === 'granted',
+  });
+
+  // Notification click → switch tab + chat
+  React.useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (detail?.nodeId) {
+        setActiveChatId(detail.nodeId);
+        setActiveTab('messages');
+      }
+    };
+    window.addEventListener('mesh:openChat', handler);
+    return () => window.removeEventListener('mesh:openChat', handler);
+  }, []);
+
+  // Deep links: a URL hash like '#v/<base64>' opens the contact-import toast,
+  // and '#chat=!hex' or '#chat=chan:N' jumps to that chat. We re-check on
+  // hashchange so links work even after the app is already loaded.
+  const [incomingContact, setIncomingContact] = React.useState<Extract<DeepLink, { type: 'contact' }> | null>(null);
+
+  React.useEffect(() => {
+    const handle = () => {
+      const link = parseDeepLinkFromHash(window.location.hash);
+      if (!link) return;
+      if (link.type === 'contact') {
+        setIncomingContact(link);
+        clearHash();
+      } else if (link.type === 'chat') {
+        setActiveChatId(link.chatId);
+        setActiveTab('messages');
+        clearHash();
+      }
+    };
+    handle();
+    window.addEventListener('hashchange', handle);
+    return () => window.removeEventListener('hashchange', handle);
+  }, []);
 
   const filteredNodes = React.useMemo(() => {
     let result = nodes;
@@ -329,48 +413,25 @@ export default function App() {
               )} />
               <div className="hidden md:flex flex-col items-start overflow-hidden">
                 <span className="text-[10px] font-bold uppercase tracking-widest leading-none">
-                  {dataSource === 'live' ? 'LIVE RADIO' : 'SIMULATOR'}
+                  {dataSource === 'live'
+                    ? (radioConnected && transport?.mode === 'tcp' ? 'TCP RADIO'
+                      : radioConnected && transport?.mode === 'serial' ? 'SERIAL RADIO'
+                      : 'LIVE RADIO')
+                    : 'SIMULATOR'}
                 </span>
                 <span className={cn(
                   "text-[8px] uppercase truncate leading-none mt-1",
                   dataSource === 'live' && radioConnected ? "text-emerald-400" : "text-brand-muted"
                 )}>
-                  {dataSource === 'live' 
-                    ? (radioConnected ? 'Connected' : 'Waiting for radio...') 
+                  {dataSource === 'live'
+                    ? (radioConnected
+                        ? (transport?.mode === 'tcp' && transport.tcp ? `${transport.tcp.host}:${transport.tcp.port}`
+                          : transport?.mode === 'serial' && transport.serial ? transport.serial.port
+                          : 'Connected')
+                        : 'Waiting for radio...')
                     : 'Demo Data'}
                 </span>
               </div>
-            </button>
-            <button 
-              onClick={() => setUnitSystem(prev => prev === 'METRIC' ? 'IMPERIAL' : 'METRIC')}
-              className="w-full h-10 flex items-center justify-center md:justify-start gap-3 px-3 rounded-lg text-brand-muted hover:bg-brand-line/10 hover:text-brand-accent transition-all group"
-            >
-              <Globe size={20} className="group-hover:text-brand-accent transition-colors flex-shrink-0" />
-              <div className="hidden md:flex flex-col items-start overflow-hidden">
-                <span className="text-[10px] font-bold uppercase tracking-widest leading-none">{unitSystem}</span>
-                <span className="text-[8px] uppercase text-brand-muted truncate leading-none mt-1">Units System</span>
-              </div>
-            </button>
-            <button 
-              onClick={() => setShowExportModal(true)}
-              className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-brand-muted hover:bg-brand-line hover:text-white transition-all group"
-            >
-              <FileDown size={20} className="group-hover:text-brand-accent transition-colors" />
-              <span className="text-sm font-bold tracking-tight uppercase hidden md:block">Export Data</span>
-            </button>
-            <button 
-              onClick={() => setShowImportModal(true)}
-              className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-brand-muted hover:bg-brand-line hover:text-white transition-all group"
-            >
-              <FileUp size={20} className="group-hover:text-brand-accent transition-colors" />
-              <span className="text-sm font-bold tracking-tight uppercase hidden md:block">Import Data</span>
-            </button>
-            <button 
-              onClick={() => setShowAISettings(true)}
-              className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-brand-muted hover:bg-brand-line hover:text-white transition-all group"
-            >
-              <Settings size={20} className="group-hover:text-brand-accent transition-colors" />
-              <span className="text-sm font-bold tracking-tight uppercase hidden md:block">AI Settings</span>
             </button>
           </div>
 
@@ -422,7 +483,11 @@ export default function App() {
               <span className="mono-text text-brand-accent uppercase">Link Active</span>
             </div>
           </div>
-          <button className="w-full h-10 rounded border border-brand-line hover:bg-brand-line transition-colors flex items-center justify-center gap-2">
+          <button
+            onClick={() => setShowSettings(true)}
+            className="w-full h-10 rounded border border-brand-line hover:bg-brand-line hover:text-brand-accent transition-colors flex items-center justify-center gap-2"
+            title="Open settings"
+          >
             <Settings size={18} />
             <span className="hidden md:inline text-sm">Settings</span>
           </button>
@@ -541,6 +606,44 @@ export default function App() {
                   traceMessageId={traceMessageId}
                   setTraceMessageId={setTraceMessageId}
                   setSelectedNodeId={setSelectedNodeId}
+                  unitSystem={unitSystem}
+                  waypoints={waypoints}
+                  traces={traces}
+                  neighborInfo={neighborInfo}
+                  storeForwardRouters={sfRouters}
+                  localNodeId={localNodeId}
+                  dataSource={dataSource}
+                  onTraceroute={async (nodeId) => {
+                    if (dataSource !== 'live') return { ok: false, error: 'Switch to live radio to run traceroute' };
+                    return await meshDataService.sendTraceroute(nodeId);
+                  }}
+                  blockedNodeIds={blockList.blocked}
+                  onBlockNode={blockList.block}
+                  onUnblockNode={blockList.unblock}
+                  onRequestStoreForwardHistory={async (routerId, minutes) => {
+                    if (dataSource !== 'live') return { ok: false, error: 'Switch to live radio to request history' };
+                    return await meshDataService.requestStoreForwardHistory(routerId, minutes);
+                  }}
+                  onSaveWaypoint={async (input) => {
+                    if (dataSource === 'live') {
+                      const r = await meshDataService.saveWaypoint(input);
+                      if (!r.ok) console.error('saveWaypoint failed:', r.error);
+                    } else {
+                      simulator.saveWaypoint(input);
+                    }
+                  }}
+                  onDeleteWaypoint={async (id) => {
+                    if (dataSource === 'live') {
+                      const r = await meshDataService.deleteWaypoint(id);
+                      if (!r.ok) console.error('deleteWaypoint failed:', r.error);
+                    } else {
+                      simulator.deleteWaypoint(id);
+                    }
+                  }}
+                  onDirectMessage={(nodeId) => {
+                    setActiveChatId(nodeId);
+                    setActiveTab('messages');
+                  }}
                 />
               </motion.div>
             )}
@@ -569,6 +672,8 @@ export default function App() {
                   setDraftMessage={setDraftMessage}
                   handleSendMessage={handleSendMessage}
                   onManageChannels={() => setShowChannelsModal(true)}
+                  localNodeId={localNodeId}
+                  blockedNodeIds={blockList.blocked}
                 />
               </motion.div>
             )}
@@ -692,8 +797,24 @@ export default function App() {
         </AnimatePresence>
 
         <AnimatePresence>
-          {showAISettings && (
-            <AISettingsModal onClose={() => setShowAISettings(false)} />
+          {showSettings && (
+            <SettingsModal
+              onClose={() => setShowSettings(false)}
+              transport={transport}
+              radioConnected={radioConnected}
+              onTcpConnected={() => setDataSource('live')}
+              notificationsEnabled={notificationsEnabled}
+              setNotificationsEnabled={setNotificationsEnabled}
+              notificationPermission={notificationPermission}
+              setNotificationPermission={setNotificationPermission}
+              unitSystem={unitSystem}
+              setUnitSystem={setUnitSystem}
+              onOpenExport={() => setShowExportModal(true)}
+              onOpenImport={() => setShowImportModal(true)}
+              blockedNodeIds={blockList.blocked}
+              nodes={nodes}
+              onUnblockNode={blockList.unblock}
+            />
           )}
         </AnimatePresence>
 
@@ -702,6 +823,13 @@ export default function App() {
             <ChannelsModal onClose={() => setShowChannelsModal(false)} />
           )}
         </AnimatePresence>
+
+        <IncomingContactToast
+          contact={incomingContact}
+          alreadyKnown={!!(incomingContact && nodes.some(n => n.id === incomingContact.nodeId))}
+          onDismiss={() => setIncomingContact(null)}
+          onOpenChat={(nodeId) => { setActiveChatId(nodeId); setActiveTab('messages'); }}
+        />
 
         <AIAssistant 
           nodes={nodes}

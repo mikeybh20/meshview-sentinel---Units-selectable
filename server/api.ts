@@ -185,6 +185,7 @@ app.get('/api/mesh/status', (_req, res) => {
   const device = serialDiscovery.getDevice();
   return res.json({
     radioConnected: meshBridge.connected,
+    transport: meshBridge.getTransport(),
     serialDevice: device ? {
       port: device.port,
       vendor: device.vendor,
@@ -196,6 +197,58 @@ app.get('/api/mesh/status', (_req, res) => {
   });
 });
 
+// --- TCP transport: connect / disconnect ---
+const TCP_CONFIG_PATH = join(dataDir, 'tcp-endpoint.json');
+
+interface TcpEndpointConfig { host: string; port: number; }
+
+function loadTcpEndpoint(): TcpEndpointConfig | null {
+  try {
+    if (existsSync(TCP_CONFIG_PATH)) {
+      const saved = JSON.parse(readFileSync(TCP_CONFIG_PATH, 'utf-8'));
+      if (typeof saved.host === 'string' && typeof saved.port === 'number') return saved;
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+function saveTcpEndpoint(ep: TcpEndpointConfig | null) {
+  try {
+    if (ep) writeFileSync(TCP_CONFIG_PATH, JSON.stringify(ep, null, 2), 'utf-8');
+    else if (existsSync(TCP_CONFIG_PATH)) writeFileSync(TCP_CONFIG_PATH, '', 'utf-8');
+  } catch (err: any) {
+    console.error('[API] saveTcpEndpoint failed:', err.message);
+  }
+}
+
+app.post('/api/mesh/connect/tcp', async (req, res) => {
+  const { host, port } = req.body ?? {};
+  if (typeof host !== 'string' || !host.trim()) {
+    return res.status(400).json({ error: 'host is required' });
+  }
+  const portNum = Number.isFinite(port) ? Math.floor(port) : 4403;
+  if (portNum < 1 || portNum > 65535) {
+    return res.status(400).json({ error: 'port out of range' });
+  }
+  try {
+    await meshBridge.connectTcp(host.trim(), portNum);
+    saveTcpEndpoint({ host: host.trim(), port: portNum });
+    return res.json({ ok: true, transport: meshBridge.getTransport() });
+  } catch (err: any) {
+    return res.status(502).json({ error: err.message || 'connect failed' });
+  }
+});
+
+app.post('/api/mesh/disconnect', async (_req, res) => {
+  try {
+    await meshBridge.disconnect();
+    saveTcpEndpoint(null);
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // All mesh nodes seen by the radio
 app.get('/api/mesh/nodes', (_req, res) => {
   return res.json(meshBridge.getNodes());
@@ -204,6 +257,18 @@ app.get('/api/mesh/nodes', (_req, res) => {
 // All messages received by the radio
 app.get('/api/mesh/messages', (_req, res) => {
   return res.json(meshBridge.getMessages());
+});
+
+// Full-text search across all persisted messages
+app.get('/api/mesh/messages/search', (req, res) => {
+  const q = String(req.query.q ?? '').trim();
+  const limit = Math.min(parseInt(String(req.query.limit ?? '50'), 10) || 50, 200);
+  if (!q) return res.json([]);
+  try {
+    return res.json(meshDb().searchMessages(q, limit));
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 // Event log
@@ -218,8 +283,138 @@ app.get('/api/mesh/snapshot', (_req, res) => {
     messages: meshBridge.getMessages(),
     events: meshBridge.getEvents(),
     channels: meshBridge.getChannels(),
+    waypoints: meshBridge.getWaypoints(),
+    traces: meshBridge.getTraces(),
+    neighborInfo: meshBridge.getNeighborInfo(),
+    storeForwardRouters: meshBridge.getStoreForwardRouters(),
     radioConnected: meshBridge.connected,
+    localNodeId: meshBridge.getLocalNodeId(),
   });
+});
+
+app.get('/api/mesh/neighbor-info', (_req, res) => {
+  return res.json(meshBridge.getNeighborInfo());
+});
+
+// Store & Forward: list routers, request history replay
+app.get('/api/mesh/store-forward', (_req, res) => {
+  return res.json(meshBridge.getStoreForwardRouters());
+});
+
+app.post('/api/mesh/store-forward/request-history', async (req, res) => {
+  const { to, windowMinutes, channel } = req.body ?? {};
+  if (typeof to !== 'string' || !to.startsWith('!')) {
+    return res.status(400).json({ error: 'to must be a !hex node id' });
+  }
+  const minutes = typeof windowMinutes === 'number' ? windowMinutes : 60;
+  if (!Number.isFinite(minutes) || minutes <= 0 || minutes > 1440) {
+    return res.status(400).json({ error: 'windowMinutes must be between 1 and 1440' });
+  }
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.requestStoreForwardHistory(to, minutes, typeof channel === 'number' ? channel : 0);
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Waypoints: list / create-update / delete
+app.get('/api/mesh/waypoints', (_req, res) => {
+  return res.json(meshBridge.getWaypoints());
+});
+
+app.post('/api/mesh/waypoints', (req, res) => {
+  const { id, lat, lng, name, description, icon, expire, lockedToSelf, channel } = req.body ?? {};
+  if (typeof lat !== 'number' || typeof lng !== 'number') {
+    return res.status(400).json({ error: 'lat and lng must be numbers' });
+  }
+  try {
+    const wp = meshBridge.sendWaypoint(
+      { id, lat, lng, name, description, icon, expire, lockedToSelf },
+      typeof channel === 'number' ? channel : 0,
+    );
+    return res.json({ ok: true, waypoint: wp });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/mesh/waypoints/:id', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isFinite(id) || id <= 0) {
+    return res.status(400).json({ error: 'invalid waypoint id' });
+  }
+  try {
+    const ok = meshBridge.deleteWaypoint(id);
+    return res.json({ ok });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Traceroute: kick off a request, get the requestId back. The actual response
+// arrives asynchronously and is broadcast via SSE + included in /snapshot.
+app.post('/api/mesh/traceroute', async (req, res) => {
+  const { to, channel } = req.body ?? {};
+  if (typeof to !== 'string' || !to.startsWith('!')) {
+    return res.status(400).json({ error: 'to must be a !hex node id' });
+  }
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    const r = await meshBridge.sendTraceroute(to, typeof channel === 'number' ? channel : 0);
+    return res.json({ ok: true, requestId: r.requestId });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/mesh/traces', (_req, res) => {
+  return res.json(meshBridge.getTraces());
+});
+
+// --- Event-log retention (how long to keep entries in the event stream) ---
+const RETENTION_CONFIG_PATH = join(dataDir, 'log-retention.json');
+const ALLOWED_RETENTION_HOURS = [6, 24, 36, 48, 72];
+
+function loadRetention(): number {
+  try {
+    if (existsSync(RETENTION_CONFIG_PATH)) {
+      const saved = JSON.parse(readFileSync(RETENTION_CONFIG_PATH, 'utf-8'));
+      if (typeof saved.hours === 'number' && ALLOWED_RETENTION_HOURS.includes(saved.hours)) {
+        return saved.hours;
+      }
+    }
+  } catch { /* fall through */ }
+  return 24; // default
+}
+
+function saveRetention(hours: number) {
+  try { writeFileSync(RETENTION_CONFIG_PATH, JSON.stringify({ hours }, null, 2), 'utf-8'); }
+  catch (err: any) { console.error('[API] saveRetention failed:', err.message); }
+}
+
+// Apply persisted retention on boot.
+try { meshBridge.setEventRetention(loadRetention()); } catch (err: any) {
+  console.error('[API] could not apply persisted retention:', err.message);
+}
+
+app.get('/api/mesh/log-retention', (_req, res) => {
+  return res.json({ hours: meshBridge.getEventRetention(), allowed: ALLOWED_RETENTION_HOURS });
+});
+
+app.post('/api/mesh/log-retention', (req, res) => {
+  const { hours } = req.body ?? {};
+  if (typeof hours !== 'number' || !ALLOWED_RETENTION_HOURS.includes(hours)) {
+    return res.status(400).json({ error: `hours must be one of ${ALLOWED_RETENTION_HOURS.join(', ')}` });
+  }
+  try {
+    meshBridge.setEventRetention(hours);
+    saveRetention(hours);
+    return res.json({ ok: true, hours });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 // Database stats (counts of persisted rows)
@@ -258,14 +453,17 @@ app.post('/api/mesh/channels', async (req, res) => {
   }
 });
 
-// Send a text message through the radio
+// Send a text message through the radio (also handles replies and reactions)
 app.post('/api/mesh/send', async (req, res) => {
-  const { text, to, channel } = req.body;
+  const { text, to, channel, replyTo, isReaction } = req.body;
   if (!text) return res.status(400).json({ error: 'Missing text' });
   if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
 
   try {
-    const messageId = await meshBridge.sendMessage(text, to || '!ffffffff', channel ?? 0);
+    const messageId = await meshBridge.sendMessage(text, to || '!ffffffff', channel ?? 0, {
+      replyTo: typeof replyTo === 'number' ? replyTo : undefined,
+      isReaction: !!isReaction,
+    });
     return res.json({ ok: true, messageId });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
@@ -276,13 +474,29 @@ app.post('/api/mesh/send', async (req, res) => {
 const sseClients = new Set<(data: string) => void>();
 
 meshBridge.on('ackUpdate', (msgId: string, status: string, errorCode: number) => {
-  const payload = `data: ${JSON.stringify({ msgId, status, errorCode: errorCode ?? 0 })}\n\n`;
+  const payload = `event: ack\ndata: ${JSON.stringify({ msgId, status, errorCode: errorCode ?? 0 })}\n\n`;
   for (const send of sseClients) {
     try { send(payload); } catch { /* client gone */ }
   }
 });
 
-app.get('/api/mesh/events', (req, res) => {
+meshBridge.on('traceUpdate', (trace: any) => {
+  const payload = `event: trace\ndata: ${JSON.stringify(trace)}\n\n`;
+  for (const send of sseClients) {
+    try { send(payload); } catch { /* client gone */ }
+  }
+});
+
+// Waypoint changes fan out to every connected client so a drop-pin on one
+// browser tab appears instantly on every other open tab.
+meshBridge.on('waypointsChanged', () => {
+  const payload = `event: waypoints\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`;
+  for (const send of sseClients) {
+    try { send(payload); } catch { /* client gone */ }
+  }
+});
+
+app.get('/api/mesh/stream', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
@@ -353,6 +567,15 @@ if (process.env.SERIAL_AUTO_DISCOVER === 'true') {
 } else if (process.env.SERIAL_PORT) {
   // Manual port override
   connectBridge(process.env.SERIAL_PORT);
+} else {
+  // No serial config — try the last saved TCP endpoint, if any.
+  const saved = loadTcpEndpoint();
+  if (saved) {
+    console.log(`[API] Reconnecting saved TCP endpoint ${saved.host}:${saved.port}`);
+    meshBridge.connectTcp(saved.host, saved.port).catch(err =>
+      console.warn(`[API] Saved TCP endpoint reconnect failed: ${err.message}`)
+    );
+  }
 }
 
 const PORT = process.env.API_PORT || 3001;

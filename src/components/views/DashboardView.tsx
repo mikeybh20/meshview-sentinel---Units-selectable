@@ -20,6 +20,76 @@ import { StatCard } from '../ui/StatCard';
 import { TelemetryItem } from '../ui/TelemetryItem';
 import { SensorWidget } from '../SensorWidget';
 
+// Maryland home base — same fallback as the main MapView so a fresh DB with
+// no positioned nodes lands on the operator's actual region instead of the
+// previously-hardcoded Portland coordinates.
+const FALLBACK_CENTER: [number, number] = [39.0, -76.7];
+const FALLBACK_ZOOM = 9;
+
+function DashboardMapWidget({ nodes }: { nodes: Node[] }) {
+  const positioned = nodes.filter(n => n.position);
+
+  const derivedCenter = React.useMemo<[number, number]>(() => {
+    if (positioned.length === 0) return FALLBACK_CENTER;
+    const lats = positioned.map(n => n.position!.lat);
+    const lngs = positioned.map(n => n.position!.lng);
+    return [
+      (Math.min(...lats) + Math.max(...lats)) / 2,
+      (Math.min(...lngs) + Math.max(...lngs)) / 2,
+    ];
+  }, [positioned.length]);
+
+  const derivedZoom = React.useMemo(() => {
+    if (positioned.length === 0) return FALLBACK_ZOOM;
+    if (positioned.length === 1) return 12;
+    const lats = positioned.map(n => n.position!.lat);
+    const lngs = positioned.map(n => n.position!.lng);
+    const span = Math.max(Math.max(...lats) - Math.min(...lats), Math.max(...lngs) - Math.min(...lngs));
+    if (span < 0.05) return 12;
+    if (span < 0.2)  return 10;
+    if (span < 1)    return 9;
+    if (span < 5)    return 7;
+    return 5;
+  }, [positioned.length]);
+
+  // Use a remount key so the map re-centers when the first real position arrives.
+  // Without this, pigeon-maps holds the previous defaultCenter forever.
+  const [center, setCenter] = React.useState(derivedCenter);
+  const [zoom, setZoom] = React.useState(derivedZoom);
+  const hasSnapped = React.useRef(false);
+  React.useEffect(() => {
+    if (!hasSnapped.current && positioned.length > 0) {
+      hasSnapped.current = true;
+      setCenter(derivedCenter);
+      setZoom(derivedZoom);
+    }
+  }, [derivedCenter, derivedZoom, positioned.length]);
+
+  return (
+    <div className="technical-panel h-[360px] overflow-hidden relative">
+      <div className="absolute inset-0 z-0">
+        <Map
+          center={center}
+          zoom={zoom}
+          onBoundsChanged={({ center: c, zoom: z }) => { setCenter(c); setZoom(z); }}
+        >
+          {positioned.map(node => (
+            <Marker
+              key={node.id}
+              width={20}
+              anchor={[node.position!.lat, node.position!.lng]}
+              color="var(--color-brand-accent)"
+            />
+          ))}
+        </Map>
+      </div>
+      <div className="absolute top-2 left-2 px-2 py-1 bg-brand-bg/80 backdrop-blur-md rounded text-[10px] font-bold uppercase tracking-widest border border-brand-line">
+        Mesh Coverage
+      </div>
+    </div>
+  );
+}
+
 interface DashboardViewProps {
   nodes: Node[];
   messages: Message[];
@@ -131,6 +201,11 @@ export function DashboardView({
                             <td className="px-4 py-4 data-value text-xs">{node.id}</td>
                             <td className="px-4 py-4">
                               <div className="flex items-center gap-2">
+                                {node.shortName && (
+                                  <span className="text-[10px] font-bold mono-text text-brand-accent bg-brand-accent/10 border border-brand-accent/30 px-1.5 py-0.5 rounded flex-shrink-0">
+                                    {node.shortName}
+                                  </span>
+                                )}
                                 <span className="font-medium">{node.name}</span>
                                 {node.favorite && <Star size={12} className="fill-brand-warning text-brand-warning" />}
                                 {node.sensors && <Activity size={12} className="text-brand-accent animate-pulse" />}
@@ -151,13 +226,20 @@ export function DashboardView({
                 <div className="technical-panel p-4 h-full">
                   {selectedNode ? (
                     <div className="space-y-6">
-                      <div className="flex items-start justify-between">
-                        <div>
-                          <h2 className="text-xl font-bold tracking-tighter">{selectedNode.name}</h2>
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            {selectedNode.shortName && (
+                              <span className="text-xs font-bold mono-text text-brand-accent bg-brand-accent/10 border border-brand-accent/30 px-2 py-1 rounded flex-shrink-0">
+                                {selectedNode.shortName}
+                              </span>
+                            )}
+                            <h2 className="text-xl font-bold tracking-tighter truncate">{selectedNode.name}</h2>
+                          </div>
                           <p className="mono-text text-brand-muted uppercase mt-1">{selectedNode.id}</p>
                         </div>
-                        <div className="flex flex-col items-end gap-2">
-                           <button 
+                        <div className="flex flex-col items-end gap-2 flex-shrink-0">
+                           <button
                             onClick={() => setConfiguringNodeId(selectedNode.id)}
                             className="p-2 bg-brand-line hover:bg-brand-accent hover:text-black rounded-lg transition-all"
                           >
@@ -230,23 +312,7 @@ export function DashboardView({
               )}
 
               {widget.type === 'MAP' && (
-                <div className="technical-panel h-[360px] overflow-hidden relative">
-                  <div className="absolute inset-0 z-0">
-                     <Map defaultCenter={[45.523062, -122.676482]} defaultZoom={10}>
-                        {nodes.filter(n => n.position).map(node => (
-                          <Marker 
-                            key={node.id}
-                            width={20}
-                            anchor={[node.position!.lat, node.position!.lng]} 
-                            color="var(--color-brand-accent)"
-                          />
-                        ))}
-                     </Map>
-                  </div>
-                  <div className="absolute top-2 left-2 px-2 py-1 bg-brand-bg/80 backdrop-blur-md rounded text-[10px] font-bold uppercase tracking-widest border border-brand-line">
-                    Mesh Coverage
-                  </div>
-                </div>
+                <DashboardMapWidget nodes={nodes} />
               )}
 
               {widget.type === 'SENSOR_DATA' && (

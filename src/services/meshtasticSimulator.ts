@@ -1,4 +1,4 @@
-import { Node, Message, RadioEvent, UptimeRecord, RouteRecord } from '../types';
+import { Node, Message, RadioEvent, UptimeRecord, RouteRecord, Waypoint } from '../types';
 
 const INITIAL_NODES: Node[] = [
   {
@@ -101,7 +101,9 @@ export class MeshtasticSimulator {
   private events: RadioEvent[] = [];
   private uptimeHistory: UptimeRecord[] = [];
   private routeHistory: RouteRecord[] = [];
+  private waypoints: Waypoint[] = [];
   private listeners: ((nodes: Node[], messages: Message[], events: RadioEvent[]) => void)[] = [];
+  private waypointListeners: ((waypoints: Waypoint[]) => void)[] = [];
 
   constructor() {
     // Seed initial uptime records for nodes that start online
@@ -316,6 +318,69 @@ export class MeshtasticSimulator {
 
   private notify() {
     this.listeners.forEach(l => l([...this.nodes], [...this.messages], [...this.events]));
+  }
+
+  // ---- Waypoints (in-memory only; lost on reload) ----
+
+  public getWaypoints(): Waypoint[] {
+    const nowSec = Math.floor(Date.now() / 1000);
+    return this.waypoints.filter(w => w.expire === 0 || w.expire > nowSec);
+  }
+
+  public onWaypoints(cb: (waypoints: Waypoint[]) => void) {
+    this.waypointListeners.push(cb);
+    cb(this.getWaypoints());
+    return () => {
+      this.waypointListeners = this.waypointListeners.filter(l => l !== cb);
+    };
+  }
+
+  public saveWaypoint(input: {
+    id?: number;
+    lat: number;
+    lng: number;
+    name?: string;
+    description?: string;
+    icon?: number;
+    expire?: number;
+    lockedToSelf?: boolean;
+  }): Waypoint {
+    const localId = '!abcdef01';
+    const id = input.id && input.id > 0 ? input.id : (Math.floor(Math.random() * 0x7fffffff) | 0) >>> 0;
+    const wp: Waypoint = {
+      id,
+      lat: input.lat,
+      lng: input.lng,
+      name: input.name ?? '',
+      description: input.description ?? '',
+      icon: input.icon ?? 0,
+      expire: input.expire ?? 0,
+      lockedTo: input.lockedToSelf ? 0xabcdef01 : 0,
+      createdBy: localId,
+      lastSeen: Date.now(),
+    };
+    const idx = this.waypoints.findIndex(w => w.id === id);
+    if (idx >= 0) this.waypoints[idx] = wp;
+    else this.waypoints.push(wp);
+    this.notifyWaypoints();
+    return wp;
+  }
+
+  public deleteWaypoint(id: number): boolean {
+    const before = this.waypoints.length;
+    this.waypoints = this.waypoints.filter(w => w.id !== id);
+    if (this.waypoints.length === before) return false;
+    this.notifyWaypoints();
+    return true;
+  }
+
+  public getLocalNodeId(): string {
+    return '!abcdef01';
+  }
+
+  private notifyWaypoints() {
+    const cur = this.getWaypoints();
+    this.waypointListeners.forEach(l => l([...cur]));
   }
 }
 

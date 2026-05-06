@@ -186,23 +186,31 @@ export function ChannelsModal({ onClose }: ChannelsModalProps) {
                 />
               </div>
 
-              <div className="flex gap-4 text-xs">
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={ch.uplinkEnabled}
-                    onChange={e => updateChannel(ch.index, { uplinkEnabled: e.target.checked })}
-                  />
-                  Uplink
-                </label>
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={ch.downlinkEnabled}
-                    onChange={e => updateChannel(ch.index, { downlinkEnabled: e.target.checked })}
-                  />
-                  Downlink
-                </label>
+              <div className="flex flex-col gap-1">
+                <p className="text-[9px] uppercase font-bold tracking-widest text-brand-muted">MQTT Bridge</p>
+                <div className="flex gap-4 text-xs">
+                  <label className="flex items-center gap-2 cursor-pointer" title="Forward this channel's traffic from the radio to your MQTT broker">
+                    <input
+                      type="checkbox"
+                      checked={ch.uplinkEnabled}
+                      onChange={e => updateChannel(ch.index, { uplinkEnabled: e.target.checked })}
+                    />
+                    Uplink (radio → MQTT)
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer" title="Inject MQTT traffic onto this LoRa channel">
+                    <input
+                      type="checkbox"
+                      checked={ch.downlinkEnabled}
+                      onChange={e => updateChannel(ch.index, { downlinkEnabled: e.target.checked })}
+                    />
+                    Downlink (MQTT → radio)
+                  </label>
+                </div>
+                {(ch.uplinkEnabled || ch.downlinkEnabled) && (
+                  <p className="text-[9px] text-emerald-400 mono-text uppercase mt-0.5">
+                    Active: {ch.uplinkEnabled ? '↑' : '·'}{ch.downlinkEnabled ? '↓' : '·'}
+                  </p>
+                )}
               </div>
             </div>
           ))}

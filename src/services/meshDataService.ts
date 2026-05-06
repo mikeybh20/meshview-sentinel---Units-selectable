@@ -5,7 +5,7 @@
  * interface identical to the simulator, so the app can switch between
  * real hardware and simulated data seamlessly.
  */
-import { Node, Message, RadioEvent, Channel } from '../types';
+import { Node, Message, RadioEvent, Channel, Waypoint, TraceResult, NeighborInfoSnapshot, StoreForwardRouter } from '../types';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
@@ -16,11 +16,23 @@ interface MeshSnapshot {
   messages: Message[];
   events: RadioEvent[];
   channels?: Channel[];
+  waypoints?: Waypoint[];
+  traces?: TraceResult[];
+  neighborInfo?: NeighborInfoSnapshot[];
+  storeForwardRouters?: StoreForwardRouter[];
   radioConnected: boolean;
+  localNodeId?: string | null;
+}
+
+export interface TransportInfo {
+  mode: 'serial' | 'tcp' | null;
+  serial?: { port: string };
+  tcp?: { host: string; port: number };
 }
 
 interface MeshStatus {
   radioConnected: boolean;
+  transport?: TransportInfo;
   serialDevice: {
     port: string;
     vendor: string;
@@ -36,13 +48,23 @@ export type AckStatus = 'sending' | 'sent' | 'acked' | 'error';
 export class MeshDataService {
   private listeners: ((nodes: Node[], messages: Message[], events: RadioEvent[]) => void)[] = [];
   private channelListeners: ((channels: Channel[]) => void)[] = [];
+  private waypointListeners: ((waypoints: Waypoint[]) => void)[] = [];
+  private neighborInfoListeners: ((info: NeighborInfoSnapshot[]) => void)[] = [];
+  private lastNeighborInfo: NeighborInfoSnapshot[] = [];
+  private sfRouterListeners: ((routers: StoreForwardRouter[]) => void)[] = [];
+  private lastSfRouters: StoreForwardRouter[] = [];
   private statusListeners: ((status: MeshStatus | null) => void)[] = [];
   private ackListeners: ((msgId: string, status: AckStatus, errorCode: number) => void)[] = [];
+  private traceListeners: ((trace: TraceResult) => void)[] = [];
+  private traceSnapshotListeners: ((traces: TraceResult[]) => void)[] = [];
+  private lastTraces: TraceResult[] = [];
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private statusTimer: ReturnType<typeof setInterval> | null = null;
   private eventSource: EventSource | null = null;
   private lastStatus: MeshStatus | null = null;
   private lastChannels: Channel[] = [];
+  private lastWaypoints: Waypoint[] = [];
+  private lastLocalNodeId: string | null = null;
   private pollMs: number;
 
   constructor(pollMs = 3000) {
@@ -82,13 +104,34 @@ export class MeshDataService {
   private connectEvents() {
     if (this.eventSource) return;
     try {
-      this.eventSource = new EventSource(`${API_BASE}/api/mesh/events`);
-      this.eventSource.onmessage = (e) => {
+      this.eventSource = new EventSource(`${API_BASE}/api/mesh/stream`);
+
+      this.eventSource.addEventListener('ack', (e: MessageEvent) => {
         try {
           const { msgId, status, errorCode } = JSON.parse(e.data);
           this.ackListeners.forEach(l => l(msgId, status as AckStatus, errorCode ?? 0));
-        } catch { /* malformed event */ }
-      };
+        } catch { /* malformed */ }
+      });
+
+      this.eventSource.addEventListener('trace', (e: MessageEvent) => {
+        try {
+          const trace = JSON.parse(e.data) as TraceResult;
+          this.traceListeners.forEach(l => l(trace));
+          // Merge into snapshot
+          const idx = this.lastTraces.findIndex(t => t.id === trace.id);
+          if (idx >= 0) this.lastTraces[idx] = trace;
+          else this.lastTraces.unshift(trace);
+          this.traceSnapshotListeners.forEach(l => l([...this.lastTraces]));
+        } catch { /* malformed */ }
+      });
+
+      // Waypoint changes: server tells us "something changed" — re-poll
+      // immediately so the new state hits the UI without waiting for the
+      // next 3-second interval.
+      this.eventSource.addEventListener('waypoints', () => {
+        void this.poll();
+      });
+
       this.eventSource.onerror = () => {
         // Browser will auto-reconnect; no action needed
       };
@@ -119,12 +162,17 @@ export class MeshDataService {
   }
 
   /** Send a message through the real radio. Returns the server-assigned messageId on success. */
-  async sendMessage(text: string, to = '!ffffffff', channel = 0): Promise<{ ok: boolean; messageId?: string }> {
+  async sendMessage(
+    text: string,
+    to = '!ffffffff',
+    channel = 0,
+    opts: { replyTo?: number; isReaction?: boolean } = {},
+  ): Promise<{ ok: boolean; messageId?: string }> {
     try {
       const res = await fetch(`${API_BASE}/api/mesh/send`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, to, channel }),
+        body: JSON.stringify({ text, to, channel, replyTo: opts.replyTo, isReaction: opts.isReaction }),
       });
       if (!res.ok) return { ok: false };
       const body = await res.json();
@@ -147,6 +195,190 @@ export class MeshDataService {
 
   getChannels(): Channel[] {
     return [...this.lastChannels];
+  }
+
+  /** Subscribe to waypoint updates (replays the last known list immediately). */
+  onWaypoints(callback: (waypoints: Waypoint[]) => void) {
+    this.waypointListeners.push(callback);
+    callback(this.lastWaypoints);
+    return () => {
+      this.waypointListeners = this.waypointListeners.filter(l => l !== callback);
+    };
+  }
+
+  getWaypoints(): Waypoint[] {
+    return [...this.lastWaypoints];
+  }
+
+  getLocalNodeId(): string | null {
+    return this.lastLocalNodeId;
+  }
+
+  /** Create or edit a waypoint via the radio. */
+  async saveWaypoint(input: {
+    id?: number;
+    lat: number;
+    lng: number;
+    name?: string;
+    description?: string;
+    icon?: number;
+    expire?: number;
+    lockedToSelf?: boolean;
+    channel?: number;
+  }): Promise<{ ok: boolean; waypoint?: Waypoint; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/waypoints`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(input),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      const body = await res.json();
+      // Optimistically refresh
+      await this.poll();
+      return { ok: true, waypoint: body.waypoint };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Subscribe to NeighborInfo snapshots (replays last known list immediately). */
+  onNeighborInfo(callback: (info: NeighborInfoSnapshot[]) => void) {
+    this.neighborInfoListeners.push(callback);
+    callback(this.lastNeighborInfo);
+    return () => { this.neighborInfoListeners = this.neighborInfoListeners.filter(l => l !== callback); };
+  }
+
+  getNeighborInfo(): NeighborInfoSnapshot[] {
+    return [...this.lastNeighborInfo];
+  }
+
+  /** Subscribe to known Store & Forward routers (replays the last known list immediately). */
+  onStoreForwardRouters(callback: (routers: StoreForwardRouter[]) => void) {
+    this.sfRouterListeners.push(callback);
+    callback(this.lastSfRouters);
+    return () => { this.sfRouterListeners = this.sfRouterListeners.filter(l => l !== callback); };
+  }
+
+  getStoreForwardRouters(): StoreForwardRouter[] {
+    return [...this.lastSfRouters];
+  }
+
+  /** Ask a Store & Forward router to replay the last `windowMinutes` of traffic. */
+  async requestStoreForwardHistory(routerId: string, windowMinutes: number = 60, channel: number = 0): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/store-forward/request-history`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ to: routerId, windowMinutes, channel }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Full-text search across all persisted messages (server-side SQLite FTS5). */
+  async searchMessages(query: string, limit: number = 50): Promise<Message[]> {
+    if (!query.trim()) return [];
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/messages/search?q=${encodeURIComponent(query)}&limit=${limit}`);
+      if (!res.ok) return [];
+      return await res.json();
+    } catch {
+      return [];
+    }
+  }
+
+  /** Subscribe to live trace updates. Each call receives a single TraceResult. */
+  onTraceUpdate(callback: (trace: TraceResult) => void) {
+    this.traceListeners.push(callback);
+    return () => { this.traceListeners = this.traceListeners.filter(l => l !== callback); };
+  }
+
+  /** Subscribe to the snapshot of all traces. Replays the last known list immediately. */
+  onTraces(callback: (traces: TraceResult[]) => void) {
+    this.traceSnapshotListeners.push(callback);
+    callback(this.lastTraces);
+    return () => { this.traceSnapshotListeners = this.traceSnapshotListeners.filter(l => l !== callback); };
+  }
+
+  getTraces(): TraceResult[] {
+    return [...this.lastTraces];
+  }
+
+  /** Kick off a traceroute. Resolves with the requestId; result arrives via SSE 'trace' events. */
+  async sendTraceroute(to: string, channel: number = 0): Promise<{ ok: boolean; requestId?: string; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/traceroute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ to, channel }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      const body = await res.json();
+      return { ok: true, requestId: body.requestId };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Tell the server to open a TCP connection to a Meshtastic radio. */
+  async connectTcp(host: string, port: number = 4403): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/connect/tcp`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ host, port }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Disconnect the server's bridge from any radio (serial or TCP). */
+  async disconnect(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/disconnect`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  async deleteWaypoint(id: number): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/waypoints/${id}`, {
+        method: 'DELETE',
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      await this.poll();
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
   }
 
   /** Persist a full channel list to the radio. Server fills any missing slots
@@ -188,6 +420,30 @@ export class MeshDataService {
       if (data.channels) {
         this.lastChannels = data.channels;
         this.channelListeners.forEach(l => l(data.channels!));
+      }
+
+      if (data.waypoints) {
+        this.lastWaypoints = data.waypoints;
+        this.waypointListeners.forEach(l => l(data.waypoints!));
+      }
+
+      if (data.traces) {
+        this.lastTraces = data.traces;
+        this.traceSnapshotListeners.forEach(l => l(data.traces!));
+      }
+
+      if (data.neighborInfo) {
+        this.lastNeighborInfo = data.neighborInfo;
+        this.neighborInfoListeners.forEach(l => l(data.neighborInfo!));
+      }
+
+      if (data.storeForwardRouters) {
+        this.lastSfRouters = data.storeForwardRouters;
+        this.sfRouterListeners.forEach(l => l(data.storeForwardRouters!));
+      }
+
+      if (data.localNodeId !== undefined) {
+        this.lastLocalNodeId = data.localNodeId;
       }
     } catch {
       // Server unreachable — skip this tick

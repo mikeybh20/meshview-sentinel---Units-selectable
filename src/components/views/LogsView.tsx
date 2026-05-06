@@ -7,18 +7,74 @@ interface LogsViewProps {
   events: RadioEvent[];
 }
 
+const RETENTION_OPTIONS = [6, 24, 36, 48, 72] as const;
+const API_BASE = import.meta.env.VITE_API_URL || '';
+
 export function LogsView({ events }: LogsViewProps) {
+  const [retentionHours, setRetentionHours] = React.useState<number>(24);
+  const [retentionLoaded, setRetentionLoaded] = React.useState(false);
+  const [retentionError, setRetentionError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    fetch(`${API_BASE}/api/mesh/log-retention`)
+      .then(r => r.ok ? r.json() : null)
+      .then(body => {
+        if (body && typeof body.hours === 'number') setRetentionHours(body.hours);
+        setRetentionLoaded(true);
+      })
+      .catch(() => setRetentionLoaded(true)); // server may not be running (simulator mode); fall back to 24
+  }, []);
+
+  const handleRetentionChange = async (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const next = parseInt(e.target.value, 10);
+    setRetentionError(null);
+    setRetentionHours(next); // optimistic
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/log-retention`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hours: next }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        setRetentionError(body.error || `HTTP ${res.status}`);
+      }
+    } catch (err: any) {
+      setRetentionError(err.message || 'Network error');
+    }
+  };
+
   return (
     <div className="technical-panel flex-1 flex flex-col">
       <div className="p-4 border-b border-brand-line flex items-center justify-between sticky top-0 bg-brand-bg z-10">
         <h3 className="font-bold flex items-center gap-2 text-xs uppercase tracking-widest text-brand-muted">
           Packet & Event Stream
         </h3>
-        <div className="flex gap-2">
+        <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5">
+            <label className="text-[10px] uppercase font-bold text-brand-muted tracking-widest" title="How long to keep events in the log">
+              Keep
+            </label>
+            <select
+              value={retentionHours}
+              onChange={handleRetentionChange}
+              disabled={!retentionLoaded}
+              className="bg-brand-line text-[10px] mono-text rounded px-2 py-1 border border-transparent hover:border-brand-muted/30 focus:outline-none focus:border-brand-accent/50 disabled:opacity-50"
+            >
+              {RETENTION_OPTIONS.map(h => (
+                <option key={h} value={h}>{h}h</option>
+              ))}
+            </select>
+          </div>
           <button className="px-3 py-1 bg-brand-line text-[10px] rounded hover:bg-brand-muted/20 transition-colors uppercase font-bold tracking-tighter">Export CSV</button>
           <button className="px-3 py-1 bg-brand-line text-[10px] rounded hover:bg-brand-muted/20 transition-colors uppercase font-bold tracking-tighter">Clear Console</button>
         </div>
       </div>
+      {retentionError && (
+        <div className="px-4 py-1 text-[10px] text-red-400 bg-red-500/10 border-b border-red-500/20">
+          Retention update failed: {retentionError}
+        </div>
+      )}
       <div className="flex-1 overflow-y-auto font-mono text-[11px] p-2 space-y-0.5 bg-black/40">
          {events.map(event => (
            <div key={event.id} className="group hover:bg-brand-line/30 flex gap-4 px-2 py-1 rounded transition-colors">
