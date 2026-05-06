@@ -587,6 +587,15 @@ export default function App() {
                   dashboardWidgets={dashboardWidgets}
                   stats={stats}
                   unitSystem={unitSystem}
+                  onToggleFavorite={(nodeId, favorite) => {
+                    if (dataSource === 'live') {
+                      meshDataService.setFavorite(nodeId, favorite).then(r => {
+                        if (!r.ok) console.error('setFavorite failed:', r.error);
+                      });
+                    } else {
+                      simulator.setFavorite(nodeId, favorite);
+                    }
+                  }}
                 />
               </motion.div>
             )}
@@ -623,6 +632,14 @@ export default function App() {
                   onRequestStoreForwardHistory={async (routerId, minutes) => {
                     if (dataSource !== 'live') return { ok: false, error: 'Switch to live radio to request history' };
                     return await meshDataService.requestStoreForwardHistory(routerId, minutes);
+                  }}
+                  onToggleFavorite={async (nodeId, favorite) => {
+                    if (dataSource === 'live') {
+                      const r = await meshDataService.setFavorite(nodeId, favorite);
+                      if (!r.ok) console.error('setFavorite failed:', r.error);
+                    } else {
+                      simulator.setFavorite(nodeId, favorite);
+                    }
                   }}
                   onSaveWaypoint={async (input) => {
                     if (dataSource === 'live') {
@@ -711,9 +728,14 @@ export default function App() {
                     </div>
                   </div>
                   <div className="flex-1 min-h-0">
-                    <TopologyView nodes={nodes} onNodeSelect={(id) => {
-                      setSelectedNodeId(id);
-                    }} />
+                    <TopologyView
+                      nodes={nodes}
+                      neighborInfo={neighborInfo}
+                      localNodeId={localNodeId}
+                      canConfigureRadio={dataSource === 'live' && radioConnected}
+                      onConfigureNeighborInfo={(opts) => meshDataService.setNeighborInfoConfig(opts)}
+                      onNodeSelect={(id) => { setSelectedNodeId(id); }}
+                    />
                   </div>
               </motion.div>
             )}

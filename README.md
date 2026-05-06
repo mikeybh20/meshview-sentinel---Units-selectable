@@ -10,34 +10,36 @@ A web-based dashboard, control center, and diagnostic tool for [Meshtastic](http
 
 ### Mesh awareness
 - **Live node directory** with online/offline status, telemetry (RSSI, SNR, battery, sensors), short-name labels, position source (GPS vs fixed), and PKC public keys
-- **Map view** with labeled markers (Meshtastic-style short-name circles), signal-quality links, message trace overlays, and right-click waypoint drops
-- **Topology** and **Route Intelligence** views with relay statistics
+- **Map view** with Meshtastic-style labeled markers (short-name rendered inside each circle, color-coded by status/favorite), signal-quality links, message trace overlays, and right-click waypoint drops
+- **Topology** view with edges built from real `NeighborInfo` observations (with home-base-radial fallback), force-directed layout, focus-neighborhood mode, and one-click NeighborInfo module enable/disable on the local radio
+- **Route Intelligence** view with relay statistics
 - **Comm Matrix** heatmap and **Event Log** stream
 
 ### Messaging
 - Channels and direct messages with per-message ack/error status, hop visualization, and message retry
 - **Replies** and **emoji reactions** (Meshtastic `Data.reply_id` / `Data.emoji` protocol)
-- **@mentions** with notifications
+- **@mentions** parsed by short-name and node ID, click-to-jump-to-chat, with notifications
 - **Read status** with unread badges per chat
 - **Full-text search** (SQLite FTS5) across all persisted messages
 
-### Radio modules
+### Radio modules (with admin write where supported)
+- **NeighborInfo** — surface each node's directly-observed neighbors with SNR; **enable/disable on the local radio** with one click from the topology view (admin write via `set_module_config`)
 - **Traceroute** — request a path to any node, see hop-by-hop SNR
-- **NeighborInfo** — surface each node's directly-observed neighbors with SNR
-- **Store & Forward** — detect router nodes and request replay of missed traffic
-- **Range Test** logging
+- **Store & Forward** — automatic detection of router nodes via heartbeats, surface their stats, and **request replay** of the last 15 min – 24 hr of missed traffic from any router
+- **Range Test** packet logging
 - **Waypoints** — drop, edit, and broadcast `WAYPOINT_APP` packets with emoji icons and expiration
 
 ### Operator features
-- **TCP transport** alongside serial (firmware 2.7.4+)
+- **TCP transport** alongside serial (firmware 2.7.4+); persists last endpoint and auto-reconnects on server restart
+- **Favorite nodes** with a single click from the popup, dashboard list, or detail panel — favorites get amber rings on the map and topology graph
 - **QR contact sharing** producing `meshtastic.org/v/#` URLs compatible with mobile clients
-- **Deep linking** for incoming contact and chat URLs
-- **Block list** for hiding noisy nodes
+- **Deep linking** for incoming contact (`#v/`) and chat (`#chat=`) URLs
+- **Block list** for hiding noisy nodes (purely local UI filter)
 - **Browser notifications** for DMs, mentions, and lost favorites
-- **Configurable event log retention** (6h / 24h / 36h / 48h / 72h)
+- **Configurable event log retention** (6 h / 24 h / 36 h / 48 h / 72 h)
 - **CSV import/export** of messages, events, and telemetry
 - **AI assistant** (Anthropic Claude or Google Gemini) with full mesh context
-- **Multi-client live sync** — open the dashboard in multiple tabs/browsers, share state
+- **Multi-client live sync** — open the dashboard in multiple tabs/browsers, state is shared via SQLite + SSE
 
 ---
 
@@ -102,6 +104,12 @@ Meshtastic® is a registered trademark of Meshtastic LLC. This project is not af
 
 ---
 
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) for the current list of features that are partially implemented, deferred, or could use polish — including notes on what's been validated against real radio hardware vs what still needs field testing.
+
+---
+
 ## Contributing
 
 Issues and pull requests welcome. Before submitting:
@@ -114,4 +122,6 @@ Issues and pull requests welcome. Before submitting:
 
 - The [Meshtastic](https://meshtastic.org/) project for the firmware, protocol, and ecosystem
 - [pigeon-maps](https://pigeon-maps.js.org/) for a tiny dependency-free map component
+- [emoji-picker-react](https://github.com/ealush/emoji-picker-react) for the waypoint and reaction emoji picker
+- [qrcode.react](https://github.com/zpao/qrcode.react) for contact-sharing QR code rendering
 - The Meshtastic community for documentation and protocol guidance

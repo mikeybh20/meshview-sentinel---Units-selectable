@@ -1,23 +1,46 @@
 import React from 'react';
 import * as d3 from 'd3';
-import { Node as MeshNode } from '../types';
+import { Node as MeshNode, NeighborInfoSnapshot } from '../types';
 import { cn } from '../lib/utils';
 import { Search } from 'lucide-react';
 
 interface Node extends d3.SimulationNodeDatum {
   id: string;
-  name: string;
+  label: string;     // short name for the in-circle label
+  fullName: string;  // long name for the label below
   online: boolean;
   isHomeBase: boolean;
+  favorite: boolean;
 }
 
 interface Link extends d3.SimulationLinkDatum<Node> {
-  source: string;
-  target: string;
-  rssi: number;
+  source: string | Node;
+  target: string | Node;
+  /** SNR for NeighborInfo edges (dB), RSSI for fallback edges (dBm). */
+  signal: number;
+  /** 'neighbor' = direct-link observation; 'inferred' = home-base-radial guess. */
+  kind: 'neighbor' | 'inferred';
 }
 
-export function TopologyView({ nodes, onNodeSelect }: { nodes: MeshNode[], onNodeSelect: (id: string) => void }) {
+interface TopologyViewProps {
+  nodes: MeshNode[];
+  neighborInfo?: NeighborInfoSnapshot[];
+  localNodeId?: string | null;
+  /** Whether a real radio is connected (vs simulator). Controls availability of admin actions. */
+  canConfigureRadio?: boolean;
+  /** Configure the NeighborInfo module on the local radio. Returns success/error. */
+  onConfigureNeighborInfo?: (opts: { enabled: boolean; intervalSecs?: number }) => Promise<{ ok: boolean; error?: string }>;
+  onNodeSelect: (id: string) => void;
+}
+
+export function TopologyView({
+  nodes,
+  neighborInfo = [],
+  localNodeId,
+  canConfigureRadio = false,
+  onConfigureNeighborInfo,
+  onNodeSelect,
+}: TopologyViewProps) {
   const svgRef = React.useRef<SVGSVGElement>(null);
   const zoomBehaviorRef = React.useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null);
   const linkSelRef = React.useRef<d3.Selection<SVGLineElement, Link, SVGGElement, unknown> | null>(null);
@@ -28,55 +51,104 @@ export function TopologyView({ nodes, onNodeSelect }: { nodes: MeshNode[], onNod
   const [isFocusMode, setIsFocusMode] = React.useState(false);
   const [searchQuery, setSearchQuery] = React.useState('');
   const [searchResults, setSearchResults] = React.useState<MeshNode[]>([]);
+  const [niBusy, setNiBusy] = React.useState(false);
+  const [niResult, setNiResult] = React.useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
+
+  // Use the real local node as home base — falls back to the simulator's
+  // hardcoded id only when no live radio is connected.
+  const homeBaseId = localNodeId || '!abcdef01';
 
   // Keep the callback ref fresh without destabilising the D3 effect
   React.useLayoutEffect(() => {
     onNodeSelectRef.current = onNodeSelect;
   });
 
-  // Stable topology key — only rebuild D3 when node IDs or online status change
-  const topologyKey = React.useMemo(() =>
-    nodes.map(n => `${n.id}:${n.online ? '1' : '0'}`).sort().join('|'),
-    [nodes]
-  );
+  // Stable topology key — only rebuild D3 when the structural shape changes.
+  // Critically, focusedNodeId is NOT in here: clicks must not tear down the
+  // simulation, otherwise all node positions get recomputed and the focus
+  // zoom can't find the just-clicked node.
+  const topologyKey = React.useMemo(() => {
+    const nodeKey = nodes.map(n => `${n.id}:${n.online ? '1' : '0'}`).sort().join('|');
+    const neighborKey = neighborInfo.map(ni =>
+      `${ni.fromNodeId}>${ni.neighbors.map(x => x.nodeId).sort().join(',')}`
+    ).sort().join('|');
+    return `${nodeKey}#${neighborKey}#${homeBaseId}#${isFocusMode ? '1' : '0'}#${isFocusMode ? focusedNodeId ?? '' : ''}`;
+  }, [nodes, neighborInfo, homeBaseId, isFocusMode, focusedNodeId]);
 
   const graphData = React.useMemo(() => {
     let activeNodes = nodes;
 
-    if (isFocusMode && focusedNodeId) {
-      const neighbors = new Set<string>();
-      neighbors.add(focusedNodeId);
-      const homeBase = nodes.find(n => n.id === '!abcdef01');
-      if (focusedNodeId === '!abcdef01') {
-        nodes.forEach(n => n.online && neighbors.add(n.id));
-      } else if (homeBase) {
-        neighbors.add(homeBase.id);
+    // Build edges first so we can use them for focus-mode neighbor expansion.
+    // Primary edges come from NeighborInfo (real direct-link observations);
+    // fall back to a home-base-radial graph when no NeighborInfo data exists.
+    const edges: Link[] = [];
+    const seenEdge = new Set<string>(); // canonical "min|max" key to dedupe both directions
+
+    for (const ni of neighborInfo) {
+      for (const nb of ni.neighbors) {
+        const a = ni.fromNodeId;
+        const b = nb.nodeId;
+        if (a === b) continue;
+        const key = a < b ? `${a}|${b}` : `${b}|${a}`;
+        if (seenEdge.has(key)) continue;
+        seenEdge.add(key);
+        edges.push({ source: a, target: b, signal: nb.snr, kind: 'neighbor' });
       }
-      activeNodes = nodes.filter(n => neighbors.has(n.id));
     }
+
+    // If we have NO real edges, fall back to inferred radial from home base.
+    // This keeps the graph non-empty during the warm-up period before
+    // NeighborInfo packets have circulated.
+    if (edges.length === 0) {
+      const homeBase = nodes.find(n => n.id === homeBaseId);
+      if (homeBase) {
+        for (const node of nodes) {
+          if (node.id === homeBase.id) continue;
+          if (!node.online) continue;
+          edges.push({
+            source: node.id,
+            target: homeBase.id,
+            signal: node.telemetry?.rssi ?? -100,
+            kind: 'inferred',
+          });
+        }
+      }
+    }
+
+    // Focus mode: limit nodes to the focused node + its direct neighbors per the
+    // edge set. (Previously this was hardcoded to "everything online if home base is focused".)
+    if (isFocusMode && focusedNodeId) {
+      const keep = new Set<string>([focusedNodeId]);
+      for (const e of edges) {
+        const s = typeof e.source === 'string' ? e.source : e.source.id;
+        const t = typeof e.target === 'string' ? e.target : e.target.id;
+        if (s === focusedNodeId) keep.add(t);
+        if (t === focusedNodeId) keep.add(s);
+      }
+      activeNodes = nodes.filter(n => keep.has(n.id));
+    }
+
+    const activeIds = new Set(activeNodes.map(n => n.id));
+    const filteredEdges = edges.filter(e => {
+      const s = typeof e.source === 'string' ? e.source : e.source.id;
+      const t = typeof e.target === 'string' ? e.target : e.target.id;
+      return activeIds.has(s) && activeIds.has(t);
+    });
 
     const d3Nodes: Node[] = activeNodes.map(n => ({
       id: n.id,
-      name: n.name,
+      label: n.shortName || n.id.slice(-4).toUpperCase(),
+      fullName: n.name || n.id,
       online: n.online,
-      isHomeBase: n.id === '!abcdef01'
+      isHomeBase: n.id === homeBaseId,
+      favorite: n.favorite,
     }));
 
-    const links: Link[] = [];
-    const homeBase = activeNodes.find(n => n.id === '!abcdef01');
-    if (homeBase) {
-      activeNodes.forEach(node => {
-        if (node.id !== homeBase.id && node.online) {
-          links.push({ source: node.id, target: homeBase.id, rssi: node.telemetry?.rssi || -100 });
-        }
-      });
-    }
+    return { nodes: d3Nodes, links: filteredEdges };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [topologyKey]);
 
-    return { nodes: d3Nodes, links };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [topologyKey, focusedNodeId, isFocusMode]);
-
-  // Rebuild D3 only when topology changes — NOT when onNodeSelect reference changes
+  // Build/rebuild D3 only when the underlying topology changes.
   React.useEffect(() => {
     if (!svgRef.current) return;
 
@@ -96,36 +168,64 @@ export function TopologyView({ nodes, onNodeSelect }: { nodes: MeshNode[], onNod
     zoomBehaviorRef.current = zoom;
 
     const simulation = d3.forceSimulation<Node>(graphData.nodes)
-      .force('link', d3.forceLink<Node, Link>(graphData.links).id(d => d.id).distance(150))
-      .force('charge', d3.forceManyBody().strength(-400))
+      .force('link', d3.forceLink<Node, Link>(graphData.links).id(d => d.id).distance(140).strength(0.6))
+      .force('charge', d3.forceManyBody().strength(-500))
       .force('center', d3.forceCenter(width / 2, height / 2))
-      .force('collision', d3.forceCollide().radius(50));
+      .force('collision', d3.forceCollide().radius(36));
 
-    const link = container.append('g')
+    // ---- Edges ----
+    const link = container.append('g').attr('class', 'links')
       .selectAll('line')
       .data(graphData.links)
       .enter().append('line')
-      .attr('stroke-width', (d: any) => Math.max(1, (d.rssi + 140) / 20))
+      .attr('stroke-width', (d: any) => {
+        // Neighbor edges: SNR-based (-20..+20 dB → 1..4)
+        if (d.kind === 'neighbor') return Math.max(1, Math.min(4, (d.signal + 20) / 10));
+        // Inferred (RSSI): -140..-50 → 1..4
+        return Math.max(1, Math.min(4, (d.signal + 140) / 25));
+      })
       .attr('stroke', (d: any) => {
-        if (d.rssi > -70) return '#10b981';
-        if (d.rssi > -90) return '#f59e0b';
+        // Color by signal strength regardless of kind
+        const s = d.signal;
+        if (d.kind === 'neighbor') {
+          if (s > 5) return '#10b981';
+          if (s > -5) return '#f59e0b';
+          return '#ef4444';
+        }
+        if (s > -70) return '#10b981';
+        if (s > -90) return '#f59e0b';
         return '#ef4444';
       })
-      .attr('stroke-opacity', 0.8)
-      .attr('stroke-dasharray', (d: any) => d.rssi < -90 ? '4 2' : 'none');
+      .attr('stroke-opacity', (d: any) => d.kind === 'neighbor' ? 0.85 : 0.45)
+      .attr('stroke-dasharray', (d: any) => d.kind === 'inferred' ? '4 3' : 'none');
 
     linkSelRef.current = link as any;
 
-    const node = container.append('g')
+    // ---- Nodes ----
+    const node = container.append('g').attr('class', 'nodes')
       .selectAll('g')
       .data(graphData.nodes)
       .enter().append('g')
       .attr('cursor', 'pointer')
       .on('click', (event, d: any) => {
+        event.stopPropagation();
+        // Capture position BEFORE any state change — graphData may regenerate
+        // and lose the simulation's coordinates by the time a useEffect fires.
+        const cx = d.x;
+        const cy = d.y;
         setFocusedNodeId((prev: string | null) => d.id === prev ? null : d.id);
         onNodeSelectRef.current(d.id);
+
+        if (cx !== undefined && cy !== undefined && svgRef.current && zoomBehaviorRef.current) {
+          const w = svgRef.current.clientWidth;
+          const h = svgRef.current.clientHeight;
+          d3.select(svgRef.current).transition().duration(600).call(
+            zoomBehaviorRef.current.transform,
+            d3.zoomIdentity.translate(w / 2, h / 2).scale(1.6).translate(-cx, -cy)
+          );
+        }
       })
-      .on('mouseenter', (event, d: any) => { setHoveredNodeId(d.id); })
+      .on('mouseenter', (_event, d: any) => { setHoveredNodeId(d.id); })
       .on('mouseleave', () => { setHoveredNodeId(null); })
       .call(d3.drag<SVGGElement, Node>()
         .on('start', (event, d: any) => {
@@ -138,29 +238,73 @@ export function TopologyView({ nodes, onNodeSelect }: { nodes: MeshNode[], onNod
           d.fx = null; d.fy = null;
         }) as any);
 
+    // Outer glow ring
     node.append('circle')
       .attr('class', 'glow-ring')
-      .attr('r', (d: any) => d.isHomeBase ? 18 : 10)
-      .attr('fill', 'transparent')
-      .attr('stroke', (d: any) => d.online ? '#10b981' : '#ef4444')
+      .attr('r', (d: any) => d.isHomeBase ? 26 : 20)
+      .attr('fill', 'none')
+      .attr('stroke', (d: any) =>
+        d.isHomeBase ? '#10b981'
+        : d.favorite ? '#f59e0b'
+        : d.online ? '#10b981'
+        : '#64748b')
       .attr('stroke-width', 2)
-      .attr('stroke-opacity', 0.5);
+      .attr('stroke-opacity', 0.55);
 
+    // Solid filled circle (the "marker")
     node.append('circle')
       .attr('class', 'inner-dot')
-      .attr('r', (d: any) => d.isHomeBase ? 12 : 6)
-      .attr('fill', (d: any) => d.isHomeBase ? '#10b981' : (d.online ? '#e2e8f0' : '#475569'))
-      .attr('stroke', '#020617')
-      .attr('stroke-width', 1.5);
+      .attr('r', (d: any) => d.isHomeBase ? 22 : 16)
+      .attr('fill', (d: any) =>
+        d.isHomeBase ? 'rgba(16,185,129,0.25)'
+        : d.favorite ? 'rgba(245,158,11,0.18)'
+        : d.online ? 'rgba(16,185,129,0.18)'
+        : 'rgba(30,41,59,0.85)')
+      .attr('stroke', (d: any) =>
+        d.isHomeBase ? '#10b981'
+        : d.favorite ? '#f59e0b'
+        : d.online ? '#10b981'
+        : '#475569')
+      .attr('stroke-width', 2);
 
+    // In-circle short-name label (Meshtastic-style)
     node.append('text')
-      .attr('dy', 30)
+      .attr('class', 'short-label')
       .attr('text-anchor', 'middle')
-      .attr('fill', '#94a3b8')
-      .attr('font-size', '10px')
-      .attr('font-weight', 'normal')
+      .attr('dy', '0.35em')
       .attr('font-family', 'JetBrains Mono, monospace')
-      .text((d: any) => d.name);
+      .attr('font-weight', '700')
+      .attr('font-size', (d: any) => {
+        const len = (d.label as string).length;
+        if (d.isHomeBase) return len <= 2 ? '14px' : len <= 3 ? '12px' : '10px';
+        return len <= 2 ? '12px' : len <= 3 ? '10px' : '8px';
+      })
+      .attr('fill', (d: any) =>
+        d.isHomeBase ? '#34d399'
+        : d.favorite ? '#fbbf24'
+        : d.online ? '#34d399'
+        : '#cbd5e1')
+      .attr('pointer-events', 'none')
+      .text((d: any) => d.label);
+
+    // Long-name label below the circle
+    node.append('text')
+      .attr('class', 'name-label')
+      .attr('dy', (d: any) => d.isHomeBase ? 42 : 34)
+      .attr('text-anchor', 'middle')
+      .attr('fill', '#e2e8f0')
+      .attr('font-size', '11px')
+      .attr('font-weight', '600')
+      .attr('font-family', 'JetBrains Mono, monospace')
+      .attr('pointer-events', 'none')
+      .attr('paint-order', 'stroke')
+      .attr('stroke', '#020617')
+      .attr('stroke-width', '3px')
+      .attr('stroke-linejoin', 'round')
+      .text((d: any) => {
+        const name = d.fullName as string;
+        return name.length > 18 ? name.slice(0, 17) + '…' : name;
+      });
 
     nodeSelRef.current = node as any;
 
@@ -174,7 +318,7 @@ export function TopologyView({ nodes, onNodeSelect }: { nodes: MeshNode[], onNod
     });
 
     return () => { simulation.stop(); };
-  }, [graphData]); // onNodeSelect intentionally excluded — accessed via ref
+  }, [graphData]);
 
   // Lightweight visual update on hover/focus — no simulation rebuild
   React.useEffect(() => {
@@ -201,32 +345,12 @@ export function TopologyView({ nodes, onNodeSelect }: { nodes: MeshNode[], onNod
       return srcId === activeId || tgtId === activeId;
     };
 
-    nodeSel.attr('opacity', (d: any) => isNeighbor(d.id) ? 1 : 0.2);
-    nodeSel.select('.glow-ring').attr('r', (d: any) => d.isHomeBase ? 18 : (d.id === activeId ? 14 : 10));
-    nodeSel.select('.inner-dot')
-      .attr('r', (d: any) => d.isHomeBase ? 12 : (d.id === activeId ? 10 : 6))
-      .attr('stroke', (d: any) => d.id === activeId ? '#10b981' : '#020617');
-    nodeSel.select('text')
-      .attr('fill', (d: any) => d.id === activeId ? '#10b981' : '#94a3b8')
-      .attr('font-size', (d: any) => d.id === activeId ? '12px' : '10px')
-      .attr('font-weight', (d: any) => d.id === activeId ? 'bold' : 'normal');
-    linkSel.attr('stroke-opacity', (d: any) => isLinkActive(d) ? 0.8 : 0.1);
+    nodeSel.attr('opacity', (d: any) => isNeighbor(d.id) ? 1 : 0.3);
+    nodeSel.select('.glow-ring')
+      .attr('r', (d: any) => d.id === activeId ? (d.isHomeBase ? 32 : 26) : (d.isHomeBase ? 26 : 20))
+      .attr('stroke-opacity', (d: any) => d.id === activeId ? 0.95 : 0.55);
+    linkSel.attr('stroke-opacity', (d: any) => isLinkActive(d) ? 0.95 : 0.12);
   }, [hoveredNodeId, focusedNodeId, graphData.links]);
-
-  React.useEffect(() => {
-    if (focusedNodeId && svgRef.current && zoomBehaviorRef.current) {
-      const node = graphData.nodes.find(n => n.id === focusedNodeId);
-      if (node && node.x !== undefined && node.y !== undefined) {
-        const svg = d3.select(svgRef.current);
-        const width = svgRef.current.clientWidth;
-        const height = svgRef.current.clientHeight;
-        svg.transition().duration(750).call(
-          zoomBehaviorRef.current.transform,
-          d3.zoomIdentity.translate(width / 2, height / 2).scale(1.5).translate(-node.x!, -node.y!)
-        );
-      }
-    }
-  }, [focusedNodeId, graphData.nodes]);
 
   const handleSearch = (e: React.ChangeEvent<HTMLInputElement>) => {
     const q = e.target.value;
@@ -234,19 +358,43 @@ export function TopologyView({ nodes, onNodeSelect }: { nodes: MeshNode[], onNod
     if (q.trim()) {
       setSearchResults(nodes.filter(n =>
         n.name.toLowerCase().includes(q.toLowerCase()) ||
-        n.id.toLowerCase().includes(q.toLowerCase())
-      ));
+        n.id.toLowerCase().includes(q.toLowerCase()) ||
+        (n.shortName && n.shortName.toLowerCase().includes(q.toLowerCase()))
+      ).slice(0, 12));
     } else {
       setSearchResults([]);
     }
   };
 
   const selectSearchResult = (nodeId: string) => {
+    // Find the node's current simulation position from the live D3 selection
+    // and zoom to it without round-tripping through state.
+    const sel = nodeSelRef.current;
+    const target = sel?.filter((d: any) => d.id === nodeId).datum() as Node | undefined;
     setFocusedNodeId(nodeId);
     onNodeSelectRef.current(nodeId);
     setSearchQuery('');
     setSearchResults([]);
+    if (target?.x !== undefined && target?.y !== undefined && svgRef.current && zoomBehaviorRef.current) {
+      const w = svgRef.current.clientWidth;
+      const h = svgRef.current.clientHeight;
+      d3.select(svgRef.current).transition().duration(600).call(
+        zoomBehaviorRef.current.transform,
+        d3.zoomIdentity.translate(w / 2, h / 2).scale(1.6).translate(-target.x, -target.y)
+      );
+    }
   };
+
+  const edgeCount = graphData.links.length;
+  const neighborEdgeCount = graphData.links.filter(l => l.kind === 'neighbor').length;
+  const usingInferredEdges = edgeCount > 0 && neighborEdgeCount === 0;
+
+  // Infer NeighborInfo state on the local radio: if our own node has appeared in
+  // the neighborInfo array, the module is broadcasting → it's enabled. If not,
+  // we don't actually know the firmware setting (could be off, or just hasn't
+  // broadcast yet at the configured interval). We bias UI toward "Enable".
+  const localNiSnapshot = localNodeId ? neighborInfo.find(ni => ni.fromNodeId === localNodeId) : undefined;
+  const niLocallyActive = !!localNiSnapshot;
 
   return (
     <div className="w-full h-full relative overflow-hidden bg-brand-bg/20 rounded-xl border border-brand-line">
@@ -273,7 +421,14 @@ export function TopologyView({ nodes, onNodeSelect }: { nodes: MeshNode[], onNod
                   className="w-full text-left px-3 py-2 hover:bg-brand-line transition-colors flex items-center justify-between group"
                 >
                   <div className="flex flex-col">
-                    <span className="text-xs font-bold">{n.name}</span>
+                    <span className="text-xs font-bold flex items-center gap-1.5">
+                      {n.shortName && (
+                        <span className="text-[9px] mono-text text-brand-accent bg-brand-accent/10 border border-brand-accent/30 px-1 py-0.5 rounded">
+                          {n.shortName}
+                        </span>
+                      )}
+                      {n.name}
+                    </span>
                     <span className="text-[10px] mono-text text-brand-muted">{n.id}</span>
                   </div>
                   <div className={cn(
@@ -292,28 +447,110 @@ export function TopologyView({ nodes, onNodeSelect }: { nodes: MeshNode[], onNod
         <h4 className="text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-2">Topology Legend</h4>
         <div className="space-y-1.5">
           <div className="flex items-center gap-2">
-            <div className="w-2.5 h-2.5 rounded-full bg-brand-accent shadow-[0_0_8px_rgba(16,185,129,0.4)]" />
-            <span className="text-[9px] mono-text uppercase">Home Base</span>
+            <div className="w-3 h-3 rounded-full bg-emerald-500/30 border-2 border-emerald-400" />
+            <span className="text-[9px] mono-text uppercase">Home / Online</span>
           </div>
           <div className="flex items-center gap-2">
-            <div className="w-2.5 h-2.5 rounded-full bg-slate-200 border border-emerald-500/50" />
-            <span className="text-[9px] mono-text uppercase">Node Online</span>
+            <div className="w-3 h-3 rounded-full bg-amber-500/20 border-2 border-amber-400" />
+            <span className="text-[9px] mono-text uppercase">Favorite</span>
           </div>
           <div className="flex items-center gap-2">
-            <div className="w-2.5 h-2.5 rounded-full bg-slate-600 border border-red-500/50" />
-            <span className="text-[9px] mono-text uppercase">Node Offline</span>
+            <div className="w-3 h-3 rounded-full bg-slate-700 border-2 border-slate-500" />
+            <span className="text-[9px] mono-text uppercase">Offline</span>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 pt-1 border-t border-brand-line">
             <div className="w-4 h-0.5 bg-emerald-500" />
-            <span className="text-[9px] mono-text uppercase">Strong Link</span>
+            <span className="text-[9px] mono-text uppercase">NeighborInfo Link</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="w-4 h-0.5 bg-emerald-500/50" style={{ borderTop: '1px dashed' }} />
+            <span className="text-[9px] mono-text uppercase">Inferred Link</span>
           </div>
         </div>
       </div>
 
-      <div className="absolute top-4 left-4 flex flex-col gap-2">
-        <p className="text-[10px] mono-text text-brand-muted bg-brand-bg/60 p-2 rounded border border-brand-line">
-          CLICK NODE TO FOCUS | DRAG TO REPOSITION
-        </p>
+      {/* Status banner — explains why edges look the way they do */}
+      <div className="absolute top-4 left-4 flex flex-col gap-2 max-w-md">
+        <div className="bg-brand-bg/70 backdrop-blur-md border border-brand-line rounded p-2 space-y-1">
+          <p className="text-[10px] mono-text text-brand-muted">
+            CLICK NODE TO FOCUS · DRAG TO REPOSITION · SCROLL TO ZOOM
+          </p>
+          <p className="text-[9px] mono-text">
+            <span className="text-brand-accent font-bold">{graphData.nodes.length}</span>
+            <span className="text-brand-muted"> nodes · </span>
+            <span className="text-brand-accent font-bold">{neighborEdgeCount}</span>
+            <span className="text-brand-muted"> NeighborInfo links{edgeCount > neighborEdgeCount ? ` · ${edgeCount - neighborEdgeCount} inferred` : ''}</span>
+          </p>
+          {edgeCount === 0 && (
+            <p className="text-[9px] text-amber-400 leading-snug">
+              No edges yet. Topology fills in as nodes report (NeighborInfo packets every few minutes when the module is enabled).
+            </p>
+          )}
+          {usingInferredEdges && (
+            <p className="text-[9px] text-amber-400/80 leading-snug">
+              Showing inferred home-base links — enable the NeighborInfo module on your radio for accurate topology.
+            </p>
+          )}
+
+          {canConfigureRadio && onConfigureNeighborInfo && (
+            <div className="pt-1.5 border-t border-brand-line/50 mt-1 space-y-1">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5">
+                  <span
+                    className={`w-1.5 h-1.5 rounded-full ${niLocallyActive ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'}`}
+                    title={niLocallyActive ? 'Local radio is broadcasting NeighborInfo' : 'No NeighborInfo broadcasts observed from local radio yet'}
+                  />
+                  <span className="text-[9px] font-bold uppercase tracking-widest text-brand-muted">
+                    NeighborInfo:
+                  </span>
+                  <span className={`text-[9px] font-bold mono-text ${niLocallyActive ? 'text-emerald-400' : 'text-slate-400'}`}>
+                    {niLocallyActive
+                      ? `ACTIVE${localNiSnapshot?.intervalSecs ? ` · ${Math.round(localNiSnapshot.intervalSecs / 60)}min` : ''}`
+                      : 'NOT BROADCASTING'}
+                  </span>
+                </div>
+
+                {niLocallyActive ? (
+                  <button
+                    onClick={async () => {
+                      setNiBusy(true);
+                      setNiResult(null);
+                      const r = await onConfigureNeighborInfo({ enabled: false });
+                      setNiBusy(false);
+                      if (r.ok) setNiResult({ kind: 'ok', text: 'Disabled — local radio will stop broadcasting (existing observations remain visible)' });
+                      else setNiResult({ kind: 'error', text: r.error ?? 'Disable failed' });
+                    }}
+                    disabled={niBusy}
+                    className="text-[9px] font-bold uppercase tracking-widest bg-red-500/10 hover:bg-red-500/20 border border-red-500/40 text-red-300 hover:text-red-200 rounded px-2 py-1 transition-colors disabled:opacity-50 pointer-events-auto"
+                  >
+                    {niBusy ? 'Disabling…' : 'Disable'}
+                  </button>
+                ) : (
+                  <button
+                    onClick={async () => {
+                      setNiBusy(true);
+                      setNiResult(null);
+                      // 30 minutes — balance between freshness and airtime
+                      const r = await onConfigureNeighborInfo({ enabled: true, intervalSecs: 1800 });
+                      setNiBusy(false);
+                      if (r.ok) setNiResult({ kind: 'ok', text: 'Enabled — first packet should arrive within ~1 min' });
+                      else setNiResult({ kind: 'error', text: r.error ?? 'Enable failed' });
+                    }}
+                    disabled={niBusy}
+                    className="text-[9px] font-bold uppercase tracking-widest bg-brand-accent/15 hover:bg-brand-accent/25 border border-brand-accent/40 text-brand-accent rounded px-2 py-1 transition-colors disabled:opacity-50 pointer-events-auto"
+                  >
+                    {niBusy ? 'Enabling…' : 'Enable'}
+                  </button>
+                )}
+              </div>
+              {niResult && (
+                <p className={`text-[9px] leading-snug ${niResult.kind === 'ok' ? 'text-emerald-400' : 'text-red-400'}`}>
+                  {niResult.text}
+                </p>
+              )}
+            </div>
+          )}
+        </div>
 
         {focusedNodeId && (
           <div className="flex items-center gap-2">

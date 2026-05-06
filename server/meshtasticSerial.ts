@@ -315,6 +315,17 @@ export class MeshtasticSerialBridge extends EventEmitter {
     return Array.from(this.nodes.values());
   }
 
+  /** Mark a node as favorite (or unfavorite). Updates the in-memory cache and persists. */
+  setFavorite(nodeId: string, favorite: boolean): boolean {
+    const node = this.nodes.get(nodeId);
+    if (!node) return false;
+    node.favorite = !!favorite;
+    try { this.db.setFavorite(nodeId, node.favorite); }
+    catch (err: any) { console.error('[MeshtasticSerial] setFavorite persist failed:', err.message); }
+    this.emit('nodeUpdate', node);
+    return true;
+  }
+
   getMessages(): MeshMessage[] {
     return [...this.messages];
   }
@@ -2569,6 +2580,62 @@ export class MeshtasticSerialBridge extends EventEmitter {
   /** AdminMessage.commit_edit_settings = field 64 (bool true) */
   private buildAdminCommit(): Buffer {
     return this.encodeTagBool(64, true);
+  }
+
+  /**
+   * Build AdminMessage { set_module_config: ModuleConfig { neighbor_info: ... } }.
+   * Field numbers per mesh.proto:
+   *   AdminMessage.set_module_config = 34 (length-delim ModuleConfig)
+   *   ModuleConfig.neighbor_info = 10 (length-delim NeighborInfoConfig)
+   *   NeighborInfoConfig: 1=enabled (bool), 2=update_interval (uint32 secs),
+   *                      3=transmit_over_lora (bool)
+   */
+  private buildAdminSetNeighborInfoConfig(opts: {
+    enabled: boolean;
+    intervalSecs: number;
+    transmitOverLora: boolean;
+  }): Buffer {
+    const niCfg = Buffer.concat([
+      this.encodeTagBool(1, opts.enabled),
+      this.encodeTagVarint(2, Math.max(0, Math.floor(opts.intervalSecs))),
+      this.encodeTagBool(3, opts.transmitOverLora),
+    ]);
+    const moduleConfig = this.encodeTagLen(10, niCfg);   // ModuleConfig.neighbor_info
+    return this.encodeTagLen(34, moduleConfig);          // AdminMessage.set_module_config
+  }
+
+  /**
+   * Public: enable (or disable) the NeighborInfo module on the local radio.
+   * The radio will start broadcasting NeighborInfo packets at `intervalSecs`
+   * and accept them from peers — populating our topology graph with real
+   * direct-link observations within a few minutes.
+   *
+   * Default interval (14400s = 4hrs) matches firmware default. The mesh
+   * accepts faster intervals (down to 60s) but they consume airtime.
+   */
+  async setNeighborInfoConfig(opts: {
+    enabled: boolean;
+    intervalSecs?: number;
+    transmitOverLora?: boolean;
+  }): Promise<void> {
+    if (!this.isLinkOpen()) throw new Error('Radio not connected');
+    if (!this.localNodeNum) throw new Error('Local node not yet identified — try again in a moment');
+
+    const intervalSecs = opts.intervalSecs ?? 14400;
+    const transmitOverLora = opts.transmitOverLora ?? true;
+
+    // Send the set + commit, with a small gap so the firmware can persist them in order.
+    this.sendAdminMessage(this.buildAdminSetNeighborInfoConfig({
+      enabled: opts.enabled,
+      intervalSecs,
+      transmitOverLora,
+    }));
+    await new Promise(r => setTimeout(r, 80));
+    this.sendAdminMessage(this.buildAdminCommit());
+
+    console.log(`[MeshtasticSerial] NeighborInfo module ${opts.enabled ? 'ENABLED' : 'DISABLED'} (interval=${intervalSecs}s, lora=${transmitOverLora})`);
+    this.addEvent('TELEMETRY', this.localNodeId || '!local',
+      `NeighborInfo module ${opts.enabled ? 'enabled' : 'disabled'} (every ${intervalSecs}s)`);
   }
 
   /** Wrap an AdminMessage payload into Data → MeshPacket → ToRadio and send it. */

@@ -256,6 +256,44 @@ export class MeshDataService {
     return [...this.lastNeighborInfo];
   }
 
+  /** Enable or disable the NeighborInfo module on the connected radio (firmware-side admin write). */
+  async setNeighborInfoConfig(opts: { enabled: boolean; intervalSecs?: number; transmitOverLora?: boolean }): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/neighbor-info`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(opts),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Mark a node as favorite (or unfavorite). Server persists to SQLite. */
+  async setFavorite(nodeId: string, favorite: boolean): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/nodes/${encodeURIComponent(nodeId)}/favorite`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ favorite }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      // Trigger an immediate poll so the favorite flag reflects in state right away
+      await this.poll();
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
   /** Subscribe to known Store & Forward routers (replays the last known list immediately). */
   onStoreForwardRouters(callback: (routers: StoreForwardRouter[]) => void) {
     this.sfRouterListeners.push(callback);

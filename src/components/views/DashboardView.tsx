@@ -102,6 +102,7 @@ interface DashboardViewProps {
   dashboardWidgets: WidgetConfig[];
   stats: { total: number; online: number; offline: number; favorites: number };
   unitSystem: UnitSystem;
+  onToggleFavorite: (nodeId: string, favorite: boolean) => void;
 }
 
 export function DashboardView({
@@ -116,6 +117,7 @@ export function DashboardView({
   dashboardWidgets,
   stats,
   unitSystem,
+  onToggleFavorite,
 }: DashboardViewProps) {
   return (
     <>
@@ -207,7 +209,18 @@ export function DashboardView({
                                   </span>
                                 )}
                                 <span className="font-medium">{node.name}</span>
-                                {node.favorite && <Star size={12} className="fill-brand-warning text-brand-warning" />}
+                                <button
+                                  onClick={(e) => { e.stopPropagation(); onToggleFavorite(node.id, !node.favorite); }}
+                                  title={node.favorite ? 'Unfavorite' : 'Favorite'}
+                                  className={cn(
+                                    "transition-colors",
+                                    node.favorite
+                                      ? "text-brand-warning hover:text-brand-warning/70"
+                                      : "text-brand-muted/40 opacity-0 group-hover:opacity-100 hover:text-brand-warning"
+                                  )}
+                                >
+                                  <Star size={12} fill={node.favorite ? 'currentColor' : 'none'} />
+                                </button>
                                 {node.sensors && <Activity size={12} className="text-brand-accent animate-pulse" />}
                               </div>
                             </td>
@@ -238,8 +251,20 @@ export function DashboardView({
                           </div>
                           <p className="mono-text text-brand-muted uppercase mt-1">{selectedNode.id}</p>
                         </div>
-                        <div className="flex flex-col items-end gap-2 flex-shrink-0">
-                           <button
+                        <div className="flex items-center gap-2 flex-shrink-0">
+                          <button
+                            onClick={() => onToggleFavorite(selectedNode.id, !selectedNode.favorite)}
+                            title={selectedNode.favorite ? 'Remove from favorites' : 'Mark as favorite'}
+                            className={cn(
+                              "p-2 rounded-lg transition-all border",
+                              selectedNode.favorite
+                                ? "bg-brand-warning/15 text-brand-warning border-brand-warning/40 hover:bg-brand-warning/25"
+                                : "bg-brand-line text-brand-muted border-transparent hover:text-brand-warning hover:border-brand-warning/40"
+                            )}
+                          >
+                            <Star size={14} fill={selectedNode.favorite ? 'currentColor' : 'none'} />
+                          </button>
+                          <button
                             onClick={() => setConfiguringNodeId(selectedNode.id)}
                             className="p-2 bg-brand-line hover:bg-brand-accent hover:text-black rounded-lg transition-all"
                           >

@@ -123,6 +123,13 @@ export class MeshtasticSimulator {
     return [...this.routeHistory];
   }
 
+  public setFavorite(nodeId: string, favorite: boolean) {
+    const node = this.nodes.find(n => n.id === nodeId);
+    if (!node) return;
+    node.favorite = !!favorite;
+    this.notify();
+  }
+
   public updateNode(nodeId: string, updates: Partial<Node>) {
     this.nodes = this.nodes.map(n => {
       if (n.id === nodeId) {

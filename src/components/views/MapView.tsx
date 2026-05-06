@@ -1,5 +1,5 @@
 import React from 'react';
-import { Signal, X, MessageSquare, Battery, MapPin, Wifi, Clock, Plus, Edit3, Lock, Trash2, ChevronRight, Route, Loader2, Network, QrCode, Ban, Undo2, History, Server } from 'lucide-react';
+import { Signal, X, MessageSquare, Battery, MapPin, Wifi, Clock, Plus, Edit3, Lock, Trash2, ChevronRight, Route, Loader2, Network, QrCode, Ban, Undo2, History, Server, Star } from 'lucide-react';
 import { Map, ZoomControl, Overlay } from "pigeon-maps";
 
 import { Node, Message, Group, UnitSystem, Waypoint, TraceResult, NeighborInfoSnapshot, StoreForwardRouter } from '../../types';
@@ -25,6 +25,7 @@ interface MapViewProps {
   onBlockNode: (id: string) => void;
   onUnblockNode: (id: string) => void;
   onRequestStoreForwardHistory: (routerId: string, minutes: number) => Promise<{ ok: boolean; error?: string }>;
+  onToggleFavorite: (nodeId: string, favorite: boolean) => Promise<void> | void;
   localNodeId: string | null;
   dataSource: 'live' | 'simulator';
   onSaveWaypoint: (input: {
@@ -80,6 +81,7 @@ function NodePopup({
   onShareContact,
   onBlock,
   onUnblock,
+  onToggleFavorite,
   isBlocked,
   trace,
   neighbors,
@@ -96,6 +98,7 @@ function NodePopup({
   onShareContact: (node: Node) => void;
   onBlock: (id: string) => void;
   onUnblock: (id: string) => void;
+  onToggleFavorite: (nodeId: string, favorite: boolean) => void;
   isBlocked: boolean;
   trace: TraceResult | null;
   neighbors: NeighborInfoSnapshot | null;
@@ -205,12 +208,21 @@ function NodePopup({
           </div>
           <p className="text-[9px] mono-text text-slate-400 mt-0.5">{node.id}</p>
         </div>
-        <button
-          onClick={onClose}
-          className="text-slate-400 hover:text-white flex-shrink-0 ml-1 mt-0.5"
-        >
-          <X size={12} />
-        </button>
+        <div className="flex items-start gap-1 flex-shrink-0 ml-1 mt-0.5">
+          <button
+            onClick={() => onToggleFavorite(node.id, !node.favorite)}
+            title={node.favorite ? 'Remove from favorites' : 'Mark as favorite'}
+            className={`transition-colors ${node.favorite ? 'text-amber-400 hover:text-amber-300' : 'text-slate-500 hover:text-amber-400'}`}
+          >
+            <Star size={12} fill={node.favorite ? 'currentColor' : 'none'} />
+          </button>
+          <button
+            onClick={onClose}
+            className="text-slate-400 hover:text-white"
+          >
+            <X size={12} />
+          </button>
+        </div>
       </div>
 
       {/* Telemetry grid */}
@@ -634,6 +646,7 @@ export function MapView({
   onBlockNode,
   onUnblockNode,
   onRequestStoreForwardHistory,
+  onToggleFavorite,
 }: MapViewProps) {
   const positioned = nodes.filter(n => n.position);
   const [popupNodeId, setPopupNodeId] = React.useState<string | null>(null);
@@ -867,6 +880,7 @@ export function MapView({
                 onShareContact={(n) => { setQrNode(n); setPopupNodeId(null); }}
                 onBlock={onBlockNode}
                 onUnblock={onUnblockNode}
+                onToggleFavorite={(id, fav) => { onToggleFavorite(id, fav); }}
                 isBlocked={blockedNodeIds.has(popupNode.id)}
                 trace={
                   traces

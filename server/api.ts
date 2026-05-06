@@ -254,6 +254,16 @@ app.get('/api/mesh/nodes', (_req, res) => {
   return res.json(meshBridge.getNodes());
 });
 
+// Toggle favorite flag (purely a client-side preference; no radio packet)
+app.post('/api/mesh/nodes/:id/favorite', (req, res) => {
+  const id = req.params.id;
+  const favorite = !!(req.body?.favorite);
+  if (!id.startsWith('!')) return res.status(400).json({ error: 'id must be a !hex node id' });
+  const ok = meshBridge.setFavorite(id, favorite);
+  if (!ok) return res.status(404).json({ error: 'Node not found' });
+  return res.json({ ok: true, id, favorite });
+});
+
 // All messages received by the radio
 app.get('/api/mesh/messages', (_req, res) => {
   return res.json(meshBridge.getMessages());
@@ -294,6 +304,26 @@ app.get('/api/mesh/snapshot', (_req, res) => {
 
 app.get('/api/mesh/neighbor-info', (_req, res) => {
   return res.json(meshBridge.getNeighborInfo());
+});
+
+// Configure the NeighborInfo module on the connected radio (admin write).
+app.post('/api/mesh/modules/neighbor-info', async (req, res) => {
+  const { enabled, intervalSecs, transmitOverLora } = req.body ?? {};
+  if (typeof enabled !== 'boolean') return res.status(400).json({ error: 'enabled must be a boolean' });
+  if (intervalSecs !== undefined && (typeof intervalSecs !== 'number' || intervalSecs < 60 || intervalSecs > 86400)) {
+    return res.status(400).json({ error: 'intervalSecs must be between 60 and 86400' });
+  }
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.setNeighborInfoConfig({
+      enabled,
+      intervalSecs,
+      transmitOverLora: typeof transmitOverLora === 'boolean' ? transmitOverLora : true,
+    });
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 // Store & Forward: list routers, request history replay
