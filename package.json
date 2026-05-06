@@ -1,7 +1,13 @@
 {
-  "name": "react-example",
+  "name": "meshview-sentinel",
+  "version": "0.1.0",
+  "description": "Web dashboard, control center, and diagnostic tool for Meshtastic LoRa mesh networks. Personal open-source project; not affiliated with any employer.",
+  "license": "MIT",
+  "author": {
+    "name": "Michael Broadwater",
+    "email": "michael.broadwater@gmail.com"
+  },
   "private": true,
-  "version": "0.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite --port=3000 --host=0.0.0.0",
