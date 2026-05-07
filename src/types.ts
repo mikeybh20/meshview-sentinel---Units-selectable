@@ -165,6 +165,19 @@ export interface StoreForwardStats {
   returnWindowMins?: number;
 }
 
+export interface NeighborInfoModuleConfig {
+  enabled: boolean;
+  updateIntervalSecs: number;
+  transmitOverLora: boolean;
+  /** Epoch ms when this config was last read from the radio. */
+  lastReadAt: number;
+}
+
+export interface LocalModuleConfigSnapshot {
+  /** Authoritative NeighborInfo config; undefined until the first readback completes. */
+  neighborInfo?: NeighborInfoModuleConfig;
+}
+
 export interface StoreForwardRouter {
   nodeId: string;
   periodSecs: number;

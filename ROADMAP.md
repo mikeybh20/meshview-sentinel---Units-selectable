@@ -37,32 +37,29 @@ A unified **Settings → Modules** section would group all of these. The `set_mo
 
 ## Module state readback
 
-The current "Active / Not Broadcasting" indicator on the NeighborInfo control is **inferred from observed traffic** — we look for the local node in the `neighborInfo` array. This works well in practice but has two caveats:
+✅ **Done** — the bridge now issues `AdminMessage.get_module_config_request` for NeighborInfo on connect and after every write. The response (`get_module_config_response` carrying a `ModuleConfig`) is parsed by a new `handleAdminResponse` dispatcher case (PORT_ADMIN_APP) and stored on `localModuleConfig.neighborInfo`. The topology banner uses this authoritative state when available and falls back to inferred state otherwise (with an "inferred" hint badge so operators know which they're seeing). Local admin only — no mesh airtime cost.
 
-- After enabling, status shows "Not Broadcasting" until the first packet (~1 broadcast interval)
-- After disabling, the previous observation has to age out before the indicator updates
-
-A proper fix would be to issue an `AdminMessage.get_module_config_request` and parse the response to read the firmware's actual setting. **📋 Deferred** — the inferred state is good enough for day-to-day toggling.
+A new **Settings → Modules** section exposes the full editor: enable/disable, update interval (with presets from 10 min to 12 hr plus a manual-input field), and transmit-over-LoRa toggle. Includes a Refresh button to re-read the firmware state on demand. Changes auto-trigger a readback so the UI re-syncs to the radio's actual saved state.
 
 ---
 
 ## Real-time sync gaps
 
-Multi-client sync is implemented, but only some events are broadcast via SSE — the rest fall through the 3-second poll.
+✅ **Done** — every server-side bridge event now fans out to connected SSE clients, which trigger a debounced (250 ms) poll on receipt to coalesce bursts.
 
 | Event | SSE? | Latency between clients |
 |---|---|---|
-| Message ack/status | ✅ | instant |
-| Traceroute results | ✅ | instant |
-| Waypoint changes | ✅ | instant |
-| New nodes discovered | ❌ | up to 3 s |
-| New events (NODE_JOINED, etc.) | ❌ | up to 3 s |
-| New S&F router heartbeats | ❌ | up to 3 s |
-| New NeighborInfo packets | ❌ | up to 3 s |
-| Node telemetry refresh | ❌ | up to 3 s |
-| Favorite toggles | ❌ | up to 3 s |
+| Message ack/status | ✅ | instant (direct payload) |
+| Traceroute results | ✅ | instant (direct payload) |
+| Waypoint changes | ✅ | instant (re-poll) |
+| New nodes discovered | ✅ | ~250 ms (debounced re-poll) |
+| New events (NODE_JOINED, etc.) | ✅ | ~250 ms (debounced re-poll) |
+| New S&F router heartbeats | ✅ | ~250 ms (debounced re-poll) |
+| New NeighborInfo packets | ✅ | ~250 ms (debounced re-poll) |
+| Node telemetry refresh | ✅ | ~250 ms (debounced re-poll, via `nodeUpdate`) |
+| Favorite toggles | ✅ | ~250 ms (debounced re-poll, via `nodeUpdate`) |
 
-**⚠️ Partial** — extending SSE to the missing events is a small change. The bridge already emits `nodeUpdate`, `event`, `storeForwardUpdate`, `neighborInfoUpdate` — the API just doesn't forward them yet.
+The 3-second background poll still runs as a safety net in case the SSE stream drops. The browser's EventSource auto-reconnects on disconnect, so a lost SSE just degrades temporarily to the 3 s cadence.
 
 ---
 
@@ -74,8 +71,8 @@ The Reply and React buttons on hover only appear on messages that have a `packet
 ### ⚠️ Reactions are add-only
 Tapping an existing reaction chip adds another reaction with the same emoji rather than removing yours. Removal would require a tombstone-reaction protocol the firmware doesn't currently expose. **📋 Deferred** — matches behavior of most Meshtastic clients today.
 
-### ⚠️ Mention notification routing
-Clicking a mention notification jumps to `chan:0` instead of resolving the actual channel from the message's `m.channel` string. **TODO comment in [useMeshNotifications.ts](src/hooks/useMeshNotifications.ts#L75)** — needs a name → channel-index lookup using the channels list. ~10 LOC fix.
+### ✅ Mention notification routing — done
+Notifications now resolve `m.channel` (e.g. "LongFast", "Channel 2") to the correct `chan:N` chat id via the same matching rules `useReadStatus` uses. Clicking a mention notification jumps to the actual channel where the mention happened. As a bonus, the notification body is now prefixed with `[channel name]` for context, and focus-suppression works for channel mentions too (no notification fires if you're already viewing that channel).
 
 ### ⚠️ Mention parsing edge cases
 `@everyone`, `@all`, or channel-wide mentions aren't recognized. Only `@shortname` and `@!hex` resolve. **📋 Deferred** — none of these are part of the Meshtastic protocol; would be UI-only conventions.

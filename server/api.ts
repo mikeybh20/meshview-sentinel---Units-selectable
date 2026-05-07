@@ -297,9 +297,22 @@ app.get('/api/mesh/snapshot', (_req, res) => {
     traces: meshBridge.getTraces(),
     neighborInfo: meshBridge.getNeighborInfo(),
     storeForwardRouters: meshBridge.getStoreForwardRouters(),
+    localModuleConfig: meshBridge.getLocalModuleConfig(),
     radioConnected: meshBridge.connected,
     localNodeId: meshBridge.getLocalNodeId(),
   });
+});
+
+// Trigger a readback of the local NeighborInfo module config from the radio.
+// Admin to local node only — does not consume mesh airtime.
+app.post('/api/mesh/modules/neighbor-info/refresh', async (_req, res) => {
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.requestNeighborInfoConfig();
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 app.get('/api/mesh/neighbor-info', (_req, res) => {
@@ -525,6 +538,22 @@ meshBridge.on('waypointsChanged', () => {
     try { send(payload); } catch { /* client gone */ }
   }
 });
+
+// Generic "something interesting changed" multiplexer. The bridge fires these
+// fairly frequently (nodeUpdate fires on every telemetry/position update, etc.)
+// — the client debounces them server-side could be added later if needed.
+const fanOut = (eventName: string) => () => {
+  const payload = `event: ${eventName}\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`;
+  for (const send of sseClients) {
+    try { send(payload); } catch { /* client gone */ }
+  }
+};
+
+meshBridge.on('nodeUpdate',              fanOut('node'));
+meshBridge.on('event',                   fanOut('eventLog'));
+meshBridge.on('storeForwardUpdate',      fanOut('storeForward'));
+meshBridge.on('neighborInfoUpdate',      fanOut('neighborInfo'));
+meshBridge.on('localModuleConfigUpdate', fanOut('moduleConfig'));
 
 app.get('/api/mesh/stream', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');

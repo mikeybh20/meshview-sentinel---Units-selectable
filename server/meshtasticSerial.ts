@@ -139,6 +139,22 @@ export interface StoreForwardStats {
   returnWindowMins?: number;
 }
 
+export interface NeighborInfoModuleConfig {
+  /** True if the firmware is configured to broadcast NeighborInfo packets. */
+  enabled: boolean;
+  /** Broadcast interval in seconds (firmware default: 14400 = 4 hours). */
+  updateIntervalSecs: number;
+  /** Whether to transmit observations over LoRa (vs MQTT-only). */
+  transmitOverLora: boolean;
+  /** Epoch ms when this config was last read from the radio. */
+  lastReadAt: number;
+}
+
+export interface LocalModuleConfigSnapshot {
+  /** Authoritative NeighborInfo config read from the radio via admin readback. */
+  neighborInfo?: NeighborInfoModuleConfig;
+}
+
 export interface MeshStoreForwardRouter {
   /** !hex of the node running the S&F module. */
   nodeId: string;
@@ -225,6 +241,8 @@ export class MeshtasticSerialBridge extends EventEmitter {
   private neighborInfo = new Map<string, NeighborInfoSnapshot>();
   /** Known Store & Forward routers, keyed by node id. */
   private storeForwardRouters = new Map<string, MeshStoreForwardRouter>();
+  /** Authoritative module config read from the local radio via admin readback. */
+  private localModuleConfig: LocalModuleConfigSnapshot = {};
   /** Hours to keep events around. Set via setEventRetention(). */
   private eventRetentionHours: number = 24;
   private retentionPruneTimer: ReturnType<typeof setInterval> | null = null;
@@ -358,6 +376,11 @@ export class MeshtasticSerialBridge extends EventEmitter {
   /** All known Store & Forward routers (most-recently-heard first). */
   getStoreForwardRouters(): MeshStoreForwardRouter[] {
     return Array.from(this.storeForwardRouters.values()).sort((a, b) => b.lastHeartbeat - a.lastHeartbeat);
+  }
+
+  /** Authoritative module config last read from the local radio via admin readback. */
+  getLocalModuleConfig(): LocalModuleConfigSnapshot {
+    return { ...this.localModuleConfig };
   }
 
   /** Local node hex id (e.g. "!aabbccdd") if known, null otherwise. */
@@ -813,6 +836,13 @@ export class MeshtasticSerialBridge extends EventEmitter {
             this.localNodeId = id;
             this.localNodeNum = value;
             console.log(`[MeshtasticSerial] Local node identified as ${id}`);
+
+            // Read the local module configs once we know the local node id.
+            // This populates the authoritative state used by the UI's
+            // "NeighborInfo: ACTIVE/OFF" indicator. Local admin only — no LoRa cost.
+            setTimeout(() => {
+              this.requestNeighborInfoConfig().catch(() => { /* best-effort */ });
+            }, 500);
           }
         }
       } else if (wireType === 2) {
@@ -1141,6 +1171,12 @@ export class MeshtasticSerialBridge extends EventEmitter {
         break;
       case PORT_NEIGHBORINFO_APP:
         this.handleNeighborInfo(fromId, payloadBuf);
+        break;
+      case PORT_ADMIN_APP:
+        // Local admin replies (e.g. get_module_config_response) — populate
+        // the authoritative module-config snapshot so the UI can display it
+        // instead of relying on inferred state.
+        this.handleAdminResponse(fromId, payloadBuf);
         break;
       case PORT_RANGE_TEST_APP: {
         // RangeTest packets are typically text payloads ("seq 12345") used to
@@ -2636,6 +2672,122 @@ export class MeshtasticSerialBridge extends EventEmitter {
     console.log(`[MeshtasticSerial] NeighborInfo module ${opts.enabled ? 'ENABLED' : 'DISABLED'} (interval=${intervalSecs}s, lora=${transmitOverLora})`);
     this.addEvent('TELEMETRY', this.localNodeId || '!local',
       `NeighborInfo module ${opts.enabled ? 'enabled' : 'disabled'} (every ${intervalSecs}s)`);
+
+    // Read the config back so the UI shows the radio's authoritative state.
+    // Small delay to let the firmware finish persisting before we ask.
+    setTimeout(() => { this.requestNeighborInfoConfig().catch(() => { /* best-effort */ }); }, 250);
+  }
+
+  // ---- Module config readback (admin → local radio, no LoRa cost) -------
+
+  /** ModuleConfigType enum value for NeighborInfo (mesh.proto). */
+  private static readonly MODULE_CFG_NEIGHBORINFO = 9;
+
+  /**
+   * Ask the local radio for its current NeighborInfo module config. The reply
+   * arrives asynchronously as a PORT_ADMIN_APP packet and populates
+   * `localModuleConfig.neighborInfo`. Local admin only — does NOT touch the mesh.
+   */
+  async requestNeighborInfoConfig(): Promise<void> {
+    if (!this.isLinkOpen()) return;
+    if (!this.localNodeNum) return;
+
+    // AdminMessage { get_module_config_request: ModuleConfigType (varint, field 3) }
+    const adminPayload = this.encodeTagVarint(3, MeshtasticSerialBridge.MODULE_CFG_NEIGHBORINFO);
+    this.sendAdminMessage(adminPayload);
+    console.log('[MeshtasticSerial] Requested NeighborInfo module config readback');
+  }
+
+  /**
+   * Parse an inbound PORT_ADMIN_APP packet. We're looking for
+   * `get_module_config_response` (AdminMessage field 4) which contains a
+   * ModuleConfig — when its `neighbor_info` variant (field 10) is populated,
+   * we capture the authoritative state.
+   */
+  private handleAdminResponse(fromId: string, buf: Buffer | null) {
+    if (!buf) return;
+    // Only honour replies from the local node; other admin traffic isn't ours
+    if (this.localNodeId && fromId !== this.localNodeId && fromId !== '!00000000') return;
+
+    let offset = 0;
+    while (offset < buf.length) {
+      const tag = buf[offset++];
+      const fieldNumber = tag >> 3;
+      const wireType = tag & 0x07;
+
+      if (wireType === 0) {
+        const { bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+      } else if (wireType === 2) {
+        const { value: len, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (offset + len > buf.length) break;
+        const sub = buf.subarray(offset, offset + len);
+        offset += len;
+        if (fieldNumber === 4) {
+          // get_module_config_response — parse the ModuleConfig oneof
+          this.parseModuleConfigResponse(sub);
+        }
+      } else if (wireType === 5) {
+        offset += 4;
+      } else {
+        break;
+      }
+    }
+  }
+
+  /** Parse a ModuleConfig submessage and update local state for any variants we care about. */
+  private parseModuleConfigResponse(buf: Buffer) {
+    let offset = 0;
+    while (offset < buf.length) {
+      const tag = buf[offset++];
+      const fieldNumber = tag >> 3;
+      const wireType = tag & 0x07;
+
+      if (wireType === 2) {
+        const { value: len, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (offset + len > buf.length) break;
+        const sub = buf.subarray(offset, offset + len);
+        offset += len;
+        if (fieldNumber === 10) {
+          // ModuleConfig.neighbor_info (NeighborInfoConfig)
+          const cfg = this.parseNeighborInfoConfigSub(sub);
+          this.localModuleConfig.neighborInfo = { ...cfg, lastReadAt: Date.now() };
+          console.log(`[MeshtasticSerial] NeighborInfo config readback: enabled=${cfg.enabled} interval=${cfg.updateIntervalSecs}s lora=${cfg.transmitOverLora}`);
+          this.emit('localModuleConfigUpdate', this.localModuleConfig);
+        }
+      } else if (wireType === 0) {
+        const { bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+      } else if (wireType === 5) {
+        offset += 4;
+      } else {
+        break;
+      }
+    }
+  }
+
+  /** Parse a NeighborInfoConfig submessage. */
+  private parseNeighborInfoConfigSub(buf: Buffer): Omit<NeighborInfoModuleConfig, 'lastReadAt'> {
+    let enabled = false;
+    let updateIntervalSecs = 0;
+    let transmitOverLora = false;
+    let offset = 0;
+
+    while (offset < buf.length) {
+      const tag = buf[offset++];
+      const fieldNumber = tag >> 3;
+      const wireType = tag & 0x07;
+      if (wireType === 0) {
+        const { value, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (fieldNumber === 1) enabled = value !== 0;
+        else if (fieldNumber === 2) updateIntervalSecs = value;
+        else if (fieldNumber === 3) transmitOverLora = value !== 0;
+      } else { break; }
+    }
+    return { enabled, updateIntervalSecs, transmitOverLora };
   }
 
   /** Wrap an AdminMessage payload into Data → MeshPacket → ToRadio and send it. */

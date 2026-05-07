@@ -5,7 +5,7 @@
  * interface identical to the simulator, so the app can switch between
  * real hardware and simulated data seamlessly.
  */
-import { Node, Message, RadioEvent, Channel, Waypoint, TraceResult, NeighborInfoSnapshot, StoreForwardRouter } from '../types';
+import { Node, Message, RadioEvent, Channel, Waypoint, TraceResult, NeighborInfoSnapshot, StoreForwardRouter, LocalModuleConfigSnapshot } from '../types';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
@@ -20,6 +20,7 @@ interface MeshSnapshot {
   traces?: TraceResult[];
   neighborInfo?: NeighborInfoSnapshot[];
   storeForwardRouters?: StoreForwardRouter[];
+  localModuleConfig?: LocalModuleConfigSnapshot;
   radioConnected: boolean;
   localNodeId?: string | null;
 }
@@ -53,6 +54,8 @@ export class MeshDataService {
   private lastNeighborInfo: NeighborInfoSnapshot[] = [];
   private sfRouterListeners: ((routers: StoreForwardRouter[]) => void)[] = [];
   private lastSfRouters: StoreForwardRouter[] = [];
+  private moduleConfigListeners: ((cfg: LocalModuleConfigSnapshot) => void)[] = [];
+  private lastModuleConfig: LocalModuleConfigSnapshot = {};
   private statusListeners: ((status: MeshStatus | null) => void)[] = [];
   private ackListeners: ((msgId: string, status: AckStatus, errorCode: number) => void)[] = [];
   private traceListeners: ((trace: TraceResult) => void)[] = [];
@@ -60,6 +63,7 @@ export class MeshDataService {
   private lastTraces: TraceResult[] = [];
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private statusTimer: ReturnType<typeof setInterval> | null = null;
+  private debouncedPollTimer: ReturnType<typeof setTimeout> | null = null;
   private eventSource: EventSource | null = null;
   private lastStatus: MeshStatus | null = null;
   private lastChannels: Channel[] = [];
@@ -93,6 +97,23 @@ export class MeshDataService {
       this.eventSource.close();
       this.eventSource = null;
     }
+    if (this.debouncedPollTimer) {
+      clearTimeout(this.debouncedPollTimer);
+      this.debouncedPollTimer = null;
+    }
+  }
+
+  /**
+   * Schedule a poll() to run shortly. Called from SSE event handlers when the
+   * server signals state changed but doesn't push the new state directly.
+   * Coalesces bursts of events into a single fetch.
+   */
+  private schedulePoll(delayMs: number = 250) {
+    if (this.debouncedPollTimer) return; // already pending
+    this.debouncedPollTimer = setTimeout(() => {
+      this.debouncedPollTimer = null;
+      void this.poll();
+    }, delayMs);
   }
 
   /** Subscribe to real-time ACK/status updates for sent messages */
@@ -131,6 +152,17 @@ export class MeshDataService {
       this.eventSource.addEventListener('waypoints', () => {
         void this.poll();
       });
+
+      // Other state-changed signals: debounce so a burst of node updates
+      // (e.g. several telemetry packets in a second) collapses into a
+      // single full-snapshot fetch. 250 ms is short enough to feel instant
+      // but long enough to absorb most bursts.
+      const triggerDebouncedPoll = () => this.schedulePoll();
+      this.eventSource.addEventListener('node', triggerDebouncedPoll);
+      this.eventSource.addEventListener('eventLog', triggerDebouncedPoll);
+      this.eventSource.addEventListener('storeForward', triggerDebouncedPoll);
+      this.eventSource.addEventListener('neighborInfo', triggerDebouncedPoll);
+      this.eventSource.addEventListener('moduleConfig', triggerDebouncedPoll);
 
       this.eventSource.onerror = () => {
         // Browser will auto-reconnect; no action needed
@@ -254,6 +286,31 @@ export class MeshDataService {
 
   getNeighborInfo(): NeighborInfoSnapshot[] {
     return [...this.lastNeighborInfo];
+  }
+
+  /** Subscribe to authoritative module-config snapshots read back from the radio. */
+  onModuleConfig(callback: (cfg: LocalModuleConfigSnapshot) => void) {
+    this.moduleConfigListeners.push(callback);
+    callback(this.lastModuleConfig);
+    return () => { this.moduleConfigListeners = this.moduleConfigListeners.filter(l => l !== callback); };
+  }
+
+  getLocalModuleConfig(): LocalModuleConfigSnapshot {
+    return { ...this.lastModuleConfig };
+  }
+
+  /** Ask the radio to re-send its current NeighborInfo module config. Local admin only. */
+  async refreshNeighborInfoConfig(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/neighbor-info/refresh`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
   }
 
   /** Enable or disable the NeighborInfo module on the connected radio (firmware-side admin write). */
@@ -478,6 +535,11 @@ export class MeshDataService {
       if (data.storeForwardRouters) {
         this.lastSfRouters = data.storeForwardRouters;
         this.sfRouterListeners.forEach(l => l(data.storeForwardRouters!));
+      }
+
+      if (data.localModuleConfig) {
+        this.lastModuleConfig = data.localModuleConfig;
+        this.moduleConfigListeners.forEach(l => l(data.localModuleConfig!));
       }
 
       if (data.localNodeId !== undefined) {

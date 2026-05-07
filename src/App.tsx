@@ -30,7 +30,7 @@ import { IncomingContactToast } from './components/IncomingContactToast';
 import { useMeshNotifications } from './hooks/useMeshNotifications';
 import { parseDeepLinkFromHash, clearHash, DeepLink } from './lib/deepLink';
 import { useBlockList } from './hooks/useBlockList';
-import { Node, Message, RadioEvent, Group, WidgetConfig, UnitSystem, Channel, Waypoint, TraceResult, NeighborInfoSnapshot, StoreForwardRouter } from './types';
+import { Node, Message, RadioEvent, Group, WidgetConfig, UnitSystem, Channel, Waypoint, TraceResult, NeighborInfoSnapshot, StoreForwardRouter, LocalModuleConfigSnapshot } from './types';
 import { cn } from './lib/utils';
 import { TopologyView } from './components/TopologyView';
 import { NodeSettingsModal } from './components/NodeSettingsModal';
@@ -75,6 +75,7 @@ export default function App() {
   const [traces, setTraces] = React.useState<TraceResult[]>([]);
   const [neighborInfo, setNeighborInfo] = React.useState<NeighborInfoSnapshot[]>([]);
   const [sfRouters, setSfRouters] = React.useState<StoreForwardRouter[]>([]);
+  const [localModuleConfig, setLocalModuleConfig] = React.useState<LocalModuleConfigSnapshot>({});
   const [localNodeId, setLocalNodeId] = React.useState<string | null>(null);
   const [activeChatId, setActiveChatId] = React.useState<string>('chan:0'); // 'chan:N' or a nodeId
   const [channels, setChannels] = React.useState<Channel[]>([]);
@@ -144,6 +145,7 @@ export default function App() {
       const unsubTraces = meshDataService.onTraces((list) => setTraces(list));
       const unsubNeighbors = meshDataService.onNeighborInfo((list) => setNeighborInfo(list));
       const unsubSfRouters = meshDataService.onStoreForwardRouters((list) => setSfRouters(list));
+      const unsubModuleConfig = meshDataService.onModuleConfig((cfg) => setLocalModuleConfig(cfg));
       return () => {
         unsub();
         unsubStatus();
@@ -153,6 +155,7 @@ export default function App() {
         unsubTraces();
         unsubNeighbors();
         unsubSfRouters();
+        unsubModuleConfig();
         meshDataService.stop();
       };
     } else {
@@ -238,6 +241,7 @@ export default function App() {
     nodes,
     messages,
     events,
+    channels,
     localNodeId,
     activeChatId,
     enabled: notificationsEnabled && notificationPermission === 'granted',
@@ -733,6 +737,7 @@ export default function App() {
                       neighborInfo={neighborInfo}
                       localNodeId={localNodeId}
                       canConfigureRadio={dataSource === 'live' && radioConnected}
+                      neighborInfoConfig={localModuleConfig.neighborInfo}
                       onConfigureNeighborInfo={(opts) => meshDataService.setNeighborInfoConfig(opts)}
                       onNodeSelect={(id) => { setSelectedNodeId(id); }}
                     />
@@ -836,6 +841,7 @@ export default function App() {
               blockedNodeIds={blockList.blocked}
               nodes={nodes}
               onUnblockNode={blockList.unblock}
+              localModuleConfig={localModuleConfig}
             />
           )}
         </AnimatePresence>

@@ -2,16 +2,16 @@ import React from 'react';
 import { motion } from 'motion/react';
 import {
   X, Wifi, Bell, Globe, FileDown, FileUp, Bot, Plug, AlertCircle,
-  Check, Loader2, Eye, EyeOff, Radio, Ban, Undo2,
+  Check, Loader2, Eye, EyeOff, Radio, Ban, Undo2, Network, RefreshCw,
 } from 'lucide-react';
 
 import { meshDataService, TransportInfo } from '../services/meshDataService';
-import { Node, UnitSystem } from '../types';
+import { LocalModuleConfigSnapshot, Node, UnitSystem } from '../types';
 import { cn } from '../lib/utils';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
-type SectionKey = 'connection' | 'notifications' | 'display' | 'blocked' | 'data' | 'ai';
+type SectionKey = 'connection' | 'modules' | 'notifications' | 'display' | 'blocked' | 'data' | 'ai';
 
 interface SectionDef {
   key: SectionKey;
@@ -21,6 +21,7 @@ interface SectionDef {
 
 const SECTIONS: SectionDef[] = [
   { key: 'connection',    label: 'Connection',    icon: <Wifi size={14} /> },
+  { key: 'modules',       label: 'Modules',       icon: <Network size={14} /> },
   { key: 'notifications', label: 'Notifications', icon: <Bell size={14} /> },
   { key: 'display',       label: 'Display',       icon: <Globe size={14} /> },
   { key: 'blocked',       label: 'Blocked',       icon: <Ban size={14} /> },
@@ -54,6 +55,10 @@ interface SettingsModalProps {
   blockedNodeIds: Set<string>;
   nodes: Node[];
   onUnblockNode: (id: string) => void;
+
+  // Modules section (also reuses `radioConnected` declared above)
+  /** Current authoritative module config (undefined fields mean "not yet read"). */
+  localModuleConfig: LocalModuleConfigSnapshot;
 }
 
 export function SettingsModal(props: SettingsModalProps) {
@@ -109,6 +114,7 @@ export function SettingsModal(props: SettingsModalProps) {
           {/* Content */}
           <div className="flex-1 overflow-y-auto p-5">
             {active === 'connection'    && <ConnectionSection {...props} />}
+            {active === 'modules'       && <ModulesSection {...props} />}
             {active === 'notifications' && <NotificationsSection {...props} />}
             {active === 'display'       && <DisplaySection {...props} />}
             {active === 'blocked'       && <BlockedSection {...props} />}
@@ -570,6 +576,243 @@ function KeyInput({ label, configured, hint, placeholder, value, onChange, visib
           {visible ? <EyeOff size={13} /> : <Eye size={13} />}
         </button>
       </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// Modules — firmware module configuration on the local radio
+// ============================================================================
+
+const NI_INTERVAL_PRESETS = [
+  { value: 600,   label: '10 minutes' },
+  { value: 1800,  label: '30 minutes (default)' },
+  { value: 3600,  label: '1 hour' },
+  { value: 7200,  label: '2 hours' },
+  { value: 14400, label: '4 hours (firmware default)' },
+  { value: 28800, label: '8 hours' },
+  { value: 43200, label: '12 hours' },
+];
+
+function ModulesSection({ localModuleConfig, radioConnected }: SettingsModalProps) {
+  const ni = localModuleConfig.neighborInfo;
+
+  // Local-edit state. Initialise from the authoritative config when it arrives;
+  // re-sync if the snapshot updates (e.g. another tab made a change).
+  const [enabled, setEnabled] = React.useState<boolean>(ni?.enabled ?? false);
+  const [intervalSecs, setIntervalSecs] = React.useState<number>(ni?.updateIntervalSecs ?? 1800);
+  const [transmitOverLora, setTransmitOverLora] = React.useState<boolean>(ni?.transmitOverLora ?? true);
+  const [busy, setBusy] = React.useState(false);
+  const [refreshing, setRefreshing] = React.useState(false);
+  const [status, setStatus] = React.useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
+
+  // Re-sync local edit state whenever the authoritative snapshot changes
+  // (e.g. first readback after connect, or another tab saved). Skip if the
+  // user is mid-edit (busy = true).
+  const lastSyncedRef = React.useRef<number | null>(null);
+  React.useEffect(() => {
+    if (!ni || busy) return;
+    if (lastSyncedRef.current === ni.lastReadAt) return;
+    lastSyncedRef.current = ni.lastReadAt;
+    setEnabled(ni.enabled);
+    setIntervalSecs(ni.updateIntervalSecs);
+    setTransmitOverLora(ni.transmitOverLora);
+  }, [ni?.lastReadAt, ni?.enabled, ni?.updateIntervalSecs, ni?.transmitOverLora, busy]);
+
+  const dirty =
+    !!ni && (
+      enabled !== ni.enabled ||
+      intervalSecs !== ni.updateIntervalSecs ||
+      transmitOverLora !== ni.transmitOverLora
+    );
+
+  const handleSave = async () => {
+    setBusy(true);
+    setStatus(null);
+    const r = await meshDataService.setNeighborInfoConfig({ enabled, intervalSecs, transmitOverLora });
+    setBusy(false);
+    if (r.ok) {
+      setStatus({ kind: 'ok', text: 'Saved — radio is committing the new config' });
+    } else {
+      setStatus({ kind: 'error', text: r.error ?? 'Save failed' });
+    }
+  };
+
+  const handleRefresh = async () => {
+    setRefreshing(true);
+    setStatus(null);
+    const r = await meshDataService.refreshNeighborInfoConfig();
+    setRefreshing(false);
+    if (!r.ok) {
+      setStatus({ kind: 'error', text: r.error ?? 'Refresh failed' });
+    }
+    // The actual config update arrives asynchronously via the snapshot poll;
+    // the useEffect above will re-sync the form when ni.lastReadAt changes.
+  };
+
+  const lastReadLabel = ni?.lastReadAt
+    ? new Date(ni.lastReadAt).toLocaleString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' })
+    : null;
+
+  return (
+    <div className="space-y-5">
+      <SectionHeader
+        title="Radio Modules"
+        subtitle="Configure firmware modules on the locally-connected radio. Admin writes are local-only — they don't consume mesh airtime."
+      />
+
+      {!radioConnected && (
+        <div className="bg-amber-500/10 border border-amber-500/30 rounded p-3 flex items-start gap-2">
+          <AlertCircle size={14} className="text-amber-400 flex-shrink-0 mt-0.5" />
+          <p className="text-[11px] text-amber-300 leading-relaxed">
+            No live radio connected. Module configuration is only available when a real Meshtastic radio is attached via serial or TCP.
+          </p>
+        </div>
+      )}
+
+      {/* NeighborInfo */}
+      <div className="bg-slate-800/40 border border-slate-700 rounded-lg p-4 space-y-4">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="flex items-center gap-2">
+              <Network size={14} className="text-emerald-400" />
+              <h5 className="text-xs font-bold uppercase tracking-tight text-white">NeighborInfo</h5>
+              {ni && (
+                <span className={`text-[9px] uppercase font-bold mono-text px-1.5 py-0.5 rounded border ${
+                  ni.enabled
+                    ? 'text-emerald-300 bg-emerald-500/10 border-emerald-500/30'
+                    : 'text-slate-400 bg-slate-800 border-slate-600'
+                }`}>
+                  {ni.enabled ? 'Enabled' : 'Disabled'}
+                </span>
+              )}
+              {!ni && radioConnected && (
+                <span className="text-[9px] uppercase font-bold mono-text px-1.5 py-0.5 rounded border border-slate-600 text-slate-400 bg-slate-800">
+                  Reading…
+                </span>
+              )}
+            </div>
+            <p className="text-[11px] text-slate-400 mt-1 leading-relaxed">
+              Each node periodically broadcasts a list of its directly-heard neighbors with SNR.
+              These broadcasts are what populate the Topology view's real edges.
+            </p>
+          </div>
+          <button
+            onClick={handleRefresh}
+            disabled={!radioConnected || refreshing}
+            title="Re-read the config from the radio"
+            className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest text-slate-400 hover:text-white border border-slate-700 hover:border-slate-500 rounded px-2 py-1 transition-colors disabled:opacity-50"
+          >
+            <RefreshCw size={10} className={refreshing ? 'animate-spin' : ''} />
+            {refreshing ? '...' : 'Refresh'}
+          </button>
+        </div>
+
+        {/* Enabled toggle */}
+        <label className="flex items-center justify-between cursor-pointer">
+          <div>
+            <p className="text-xs font-bold text-slate-200">Enabled</p>
+            <p className="text-[10px] text-slate-400">When on, this radio broadcasts and ingests NeighborInfo packets.</p>
+          </div>
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={e => setEnabled(e.target.checked)}
+            disabled={!radioConnected}
+            className="w-4 h-4 accent-emerald-500"
+          />
+        </label>
+
+        {/* Update interval */}
+        <div className="space-y-1.5">
+          <label className="text-[10px] uppercase font-bold text-slate-400 block">
+            Update Interval
+          </label>
+          <select
+            value={NI_INTERVAL_PRESETS.some(p => p.value === intervalSecs) ? String(intervalSecs) : 'custom'}
+            onChange={e => {
+              const v = e.target.value;
+              if (v !== 'custom') setIntervalSecs(parseInt(v, 10));
+            }}
+            disabled={!radioConnected || !enabled}
+            className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-white focus:outline-none focus:border-emerald-500/50 disabled:opacity-50"
+          >
+            {NI_INTERVAL_PRESETS.map(p => (
+              <option key={p.value} value={p.value}>{p.label}</option>
+            ))}
+            {!NI_INTERVAL_PRESETS.some(p => p.value === intervalSecs) && (
+              <option value="custom">Custom: {intervalSecs}s</option>
+            )}
+          </select>
+
+          {/* Manual / fine-grained input */}
+          <div className="flex items-center gap-2 mt-1">
+            <label className="text-[9px] uppercase font-bold text-slate-500 flex-shrink-0">Custom (s)</label>
+            <input
+              type="number"
+              min={60}
+              max={86400}
+              step={60}
+              value={intervalSecs}
+              onChange={e => {
+                const v = parseInt(e.target.value, 10);
+                if (Number.isFinite(v)) setIntervalSecs(Math.max(60, Math.min(86400, v)));
+              }}
+              disabled={!radioConnected || !enabled}
+              className="w-32 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-[11px] mono-text text-white focus:outline-none focus:border-emerald-500/50 disabled:opacity-50"
+            />
+            <span className="text-[9px] text-slate-500">
+              ≈ {intervalSecs < 3600
+                ? `${Math.round(intervalSecs / 60)} min`
+                : `${(intervalSecs / 3600).toFixed(1)} hr`}
+              · {Math.round(86400 / intervalSecs)}/day per node
+            </span>
+          </div>
+          <p className="text-[10px] text-amber-400/80 leading-snug">
+            ⚠️ Lower intervals (faster updates) consume more LoRa airtime. 30 min is the recommended balance for most meshes; 4 hr is the firmware default.
+          </p>
+        </div>
+
+        {/* Transmit over LoRa */}
+        <label className="flex items-center justify-between cursor-pointer">
+          <div>
+            <p className="text-xs font-bold text-slate-200">Transmit over LoRa</p>
+            <p className="text-[10px] text-slate-400">If off, observations are local-only (MQTT-only meshes). Leave on for normal operation.</p>
+          </div>
+          <input
+            type="checkbox"
+            checked={transmitOverLora}
+            onChange={e => setTransmitOverLora(e.target.checked)}
+            disabled={!radioConnected || !enabled}
+            className="w-4 h-4 accent-emerald-500"
+          />
+        </label>
+
+        {/* Footer / status */}
+        <div className="flex items-center justify-between gap-2 pt-2 border-t border-slate-700/50">
+          <p className="text-[9px] mono-text text-slate-500">
+            {lastReadLabel ? `Last read: ${lastReadLabel}` : 'Awaiting first readback…'}
+          </p>
+          <button
+            onClick={handleSave}
+            disabled={!radioConnected || busy || !dirty}
+            className="flex items-center gap-1.5 bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/50 text-emerald-300 hover:text-emerald-200 text-xs font-bold uppercase tracking-widest rounded px-3 py-1.5 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {busy ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
+            {busy ? 'Saving…' : dirty ? 'Save changes' : 'No changes'}
+          </button>
+        </div>
+
+        {status && (
+          <p className={`text-[10px] leading-snug ${status.kind === 'ok' ? 'text-emerald-400' : 'text-red-400'}`}>
+            {status.text}
+          </p>
+        )}
+      </div>
+
+      <p className="text-[10px] text-slate-500 leading-relaxed">
+        More modules (Range Test, Store &amp; Forward as router, MQTT broker, etc.) will be added here as the admin write paths are implemented.
+      </p>
     </div>
   );
 }

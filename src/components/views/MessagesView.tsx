@@ -423,10 +423,10 @@ export function MessagesView({
 
                   <div className="relative">
                     <div className={cn(
-                      'px-3 py-2 rounded-lg max-w-[80%] text-sm',
+                      'px-4 py-2 rounded-2xl max-w-[80%] min-w-[3rem] text-sm break-words',
                       isOwn
-                        ? 'bg-brand-accent text-black rounded-tr-none'
-                        : 'bg-brand-line text-brand-ink rounded-tl-none border border-brand-line',
+                        ? 'bg-brand-accent text-black'
+                        : 'bg-brand-line text-brand-ink',
                       m.status === 'error' && 'opacity-70'
                     )}>
                       {parseMentions(m.text, nodes).map((seg, i) => (

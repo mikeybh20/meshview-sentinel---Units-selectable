@@ -1,14 +1,33 @@
 import { useEffect, useRef } from 'react';
-import { Node, Message, RadioEvent } from '../types';
+import { Channel, Node, Message, RadioEvent } from '../types';
 import { isMentioned } from '../lib/mentions';
 
 interface Args {
   nodes: Node[];
   messages: Message[];
   events: RadioEvent[];
+  channels: Channel[];
   localNodeId: string | null;
   activeChatId: string;
   enabled: boolean;
+}
+
+/**
+ * Resolve a Message's channel string (e.g. "LongFast", "Channel 2", "") to its
+ * "chan:N" id. Matches the resolution rules used by useReadStatus.
+ */
+function chatIdForChannelMessage(m: Message, channels: Channel[]): string {
+  const ch = channels.find(c =>
+    c.name === m.channel ||
+    (c.role === 'PRIMARY' && (m.channel === 'LongFast' || m.channel === 'Broadcast' || m.channel === ''))
+  );
+  if (ch) return `chan:${ch.index}`;
+  // Synthetic primary fallback (matches the rest of the app)
+  if (m.channel === 'LongFast' || m.channel === 'Broadcast' || !m.channel) return 'chan:0';
+  // Last-resort: try parsing "Channel N"
+  const match = m.channel.match(/Channel (\d+)/);
+  if (match) return `chan:${match[1]}`;
+  return 'chan:0';
 }
 
 /**
@@ -20,7 +39,7 @@ interface Args {
  * app can switch to the messages tab with that node selected.
  */
 export function useMeshNotifications({
-  nodes, messages, events, localNodeId, activeChatId, enabled,
+  nodes, messages, events, channels, localNodeId, activeChatId, enabled,
 }: Args) {
   // Track high-water marks so we only notify on items that arrived after the
   // hook started. Without these, every reload would replay the entire history.
@@ -60,30 +79,35 @@ export function useMeshNotifications({
 
       if (!isDmToMe && !mentioned) continue;
 
-      // Suppress if the user is already focused on the relevant chat
-      if (typeof document !== 'undefined' && document.hasFocus()) {
-        if (isDmToMe && activeChatId === m.from) continue;
-        // For channel mentions, "active chat" is whichever channel the message
-        // landed in — we don't easily know that here, so always notify on
-        // mentions even if focused (mentions are higher signal than passive DMs).
+      // Pre-resolve the click-target chat id so we can use it for both
+      // focus suppression and the notification's onclick handler.
+      const targetChatId = isDmToMe ? m.from : chatIdForChannelMessage(m, channels);
+
+      // Suppress if the user is already focused on the chat where the
+      // message landed — for DMs that's the sender's chat, for channel
+      // mentions that's the resolved chan:N.
+      if (typeof document !== 'undefined' && document.hasFocus() && activeChatId === targetChatId) {
+        continue;
       }
 
       const sender = nodes.find(n => n.id === m.from);
       const senderLabel = sender?.name || m.from;
       const title = isDmToMe ? `DM from ${senderLabel}` : `${senderLabel} mentioned you`;
+      // For mentions, prefix the body with the channel so the user has context
+      const body = isDmToMe
+        ? m.text
+        : `[${m.channel || 'channel'}] ${m.text}`;
 
       try {
         const n = new Notification(title, {
-          body: m.text.length > 140 ? `${m.text.slice(0, 140)}...` : m.text,
+          body: body.length > 140 ? `${body.slice(0, 140)}...` : body,
           tag: isDmToMe ? `dm-${m.from}` : `mention-${m.id}`,
           icon: '/favicon.ico',
         });
         n.onclick = (ev) => {
           ev.preventDefault();
           window.focus();
-          // For DMs, jump to the sender's chat. For channel mentions, jump to the channel.
-          const target = isDmToMe ? m.from : `chan:0`; // TODO: resolve channel index from m.channel
-          window.dispatchEvent(new CustomEvent('mesh:openChat', { detail: { nodeId: target } }));
+          window.dispatchEvent(new CustomEvent('mesh:openChat', { detail: { nodeId: targetChatId } }));
           n.close();
         };
       } catch {
@@ -94,7 +118,7 @@ export function useMeshNotifications({
     if (messages.length > 0) {
       lastMsgIdRef.current = messages[messages.length - 1].id;
     }
-  }, [messages, enabled, nodes, localNodeId, activeChatId]);
+  }, [messages, enabled, nodes, channels, localNodeId, activeChatId]);
 
   // New events → NODE_LOST for favorites
   useEffect(() => {

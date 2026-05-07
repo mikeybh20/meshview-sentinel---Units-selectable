@@ -1,6 +1,6 @@
 import React from 'react';
 import * as d3 from 'd3';
-import { Node as MeshNode, NeighborInfoSnapshot } from '../types';
+import { Node as MeshNode, NeighborInfoSnapshot, NeighborInfoModuleConfig } from '../types';
 import { cn } from '../lib/utils';
 import { Search } from 'lucide-react';
 
@@ -28,6 +28,8 @@ interface TopologyViewProps {
   localNodeId?: string | null;
   /** Whether a real radio is connected (vs simulator). Controls availability of admin actions. */
   canConfigureRadio?: boolean;
+  /** Authoritative NeighborInfo config from the radio (preferred over inferred state). */
+  neighborInfoConfig?: NeighborInfoModuleConfig;
   /** Configure the NeighborInfo module on the local radio. Returns success/error. */
   onConfigureNeighborInfo?: (opts: { enabled: boolean; intervalSecs?: number }) => Promise<{ ok: boolean; error?: string }>;
   onNodeSelect: (id: string) => void;
@@ -38,6 +40,7 @@ export function TopologyView({
   neighborInfo = [],
   localNodeId,
   canConfigureRadio = false,
+  neighborInfoConfig,
   onConfigureNeighborInfo,
   onNodeSelect,
 }: TopologyViewProps) {
@@ -389,12 +392,15 @@ export function TopologyView({
   const neighborEdgeCount = graphData.links.filter(l => l.kind === 'neighbor').length;
   const usingInferredEdges = edgeCount > 0 && neighborEdgeCount === 0;
 
-  // Infer NeighborInfo state on the local radio: if our own node has appeared in
-  // the neighborInfo array, the module is broadcasting → it's enabled. If not,
-  // we don't actually know the firmware setting (could be off, or just hasn't
-  // broadcast yet at the configured interval). We bias UI toward "Enable".
+  // Prefer the authoritative readback from the firmware admin response. If we
+  // haven't received that yet, fall back to inferring from observed traffic
+  // (presence of the local node in the neighborInfo array means it's broadcasting).
   const localNiSnapshot = localNodeId ? neighborInfo.find(ni => ni.fromNodeId === localNodeId) : undefined;
-  const niLocallyActive = !!localNiSnapshot;
+  const niLocallyActive = neighborInfoConfig
+    ? neighborInfoConfig.enabled
+    : !!localNiSnapshot;
+  const niStateAuthoritative = !!neighborInfoConfig;
+  const niIntervalSecs = neighborInfoConfig?.updateIntervalSecs ?? localNiSnapshot?.intervalSecs ?? 0;
 
   return (
     <div className="w-full h-full relative overflow-hidden bg-brand-bg/20 rounded-xl border border-brand-line">
@@ -505,9 +511,14 @@ export function TopologyView({
                   </span>
                   <span className={`text-[9px] font-bold mono-text ${niLocallyActive ? 'text-emerald-400' : 'text-slate-400'}`}>
                     {niLocallyActive
-                      ? `ACTIVE${localNiSnapshot?.intervalSecs ? ` · ${Math.round(localNiSnapshot.intervalSecs / 60)}min` : ''}`
-                      : 'NOT BROADCASTING'}
+                      ? `ACTIVE${niIntervalSecs ? ` · ${Math.round(niIntervalSecs / 60)}min` : ''}`
+                      : niStateAuthoritative ? 'DISABLED' : 'NOT BROADCASTING'}
                   </span>
+                  {!niStateAuthoritative && canConfigureRadio && (
+                    <span title="Inferred from observed traffic (no admin readback yet)" className="text-[8px] text-slate-500 italic">
+                      inferred
+                    </span>
+                  )}
                 </div>
 
                 {niLocallyActive ? (
