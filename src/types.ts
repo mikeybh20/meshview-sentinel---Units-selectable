@@ -57,6 +57,14 @@ export interface Node {
   positionSource?: 'manual' | 'gps';
   /** Channel-imposed precision_bits the node sent its position with (T3.15). */
   positionPrecisionBits?: number;
+  /** Meshtastic Role enum (0=CLIENT, 2=ROUTER, 4=REPEATER, 5=TRACKER, 6=SENSOR, 7=TAK, etc.). */
+  role?: number;
+  /** Whether this user has identified as a licensed amateur radio operator. */
+  isLicensed?: boolean;
+  /** Meshtastic HardwareModel enum (TBEAM, HELTEC_V3, RAK4631, etc.). */
+  hwModel?: number;
+  /** Last-observed inbound transport ('lora' = direct over RF, 'mqtt' = bridged). */
+  lastVia?: 'lora' | 'mqtt';
   settings?: NodeSettings;
   position?: {
     lat: number;

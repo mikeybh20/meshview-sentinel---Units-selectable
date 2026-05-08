@@ -619,12 +619,17 @@ function ModulesSection({ localModuleConfig, radioConnected }: SettingsModalProp
     setTransmitOverLora(ni.transmitOverLora);
   }, [ni?.lastReadAt, ni?.enabled, ni?.updateIntervalSecs, ni?.transmitOverLora, busy]);
 
-  const dirty =
-    !!ni && (
-      enabled !== ni.enabled ||
-      intervalSecs !== ni.updateIntervalSecs ||
-      transmitOverLora !== ni.transmitOverLora
-    );
+  // Dirty when the form differs from the radio's last-known state. When we have
+  // no baseline yet (firmware hasn't responded to a readback request), treat the
+  // form as always saveable — the operator should be able to *set* values even
+  // if the radio never acks the read. After Save, the bridge optimistically
+  // populates `localModuleConfig.neighborInfo`, so subsequent edits dirty-check
+  // properly.
+  const dirty = !ni
+    ? true
+    : (enabled !== ni.enabled ||
+       intervalSecs !== ni.updateIntervalSecs ||
+       transmitOverLora !== ni.transmitOverLora);
 
   const handleSave = async () => {
     setBusy(true);
@@ -791,7 +796,11 @@ function ModulesSection({ localModuleConfig, radioConnected }: SettingsModalProp
         {/* Footer / status */}
         <div className="flex items-center justify-between gap-2 pt-2 border-t border-slate-700/50">
           <p className="text-[9px] mono-text text-slate-500">
-            {lastReadLabel ? `Last read: ${lastReadLabel}` : 'Awaiting first readback…'}
+            {lastReadLabel
+              ? `Last read: ${lastReadLabel}`
+              : ni
+                ? 'Set by you (no readback yet)'
+                : 'No readback yet — Save will apply your values'}
           </p>
           <button
             onClick={handleSave}
@@ -799,7 +808,7 @@ function ModulesSection({ localModuleConfig, radioConnected }: SettingsModalProp
             className="flex items-center gap-1.5 bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/50 text-emerald-300 hover:text-emerald-200 text-xs font-bold uppercase tracking-widest rounded px-3 py-1.5 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
           >
             {busy ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
-            {busy ? 'Saving…' : dirty ? 'Save changes' : 'No changes'}
+            {busy ? 'Saving…' : dirty ? 'Save' : 'No changes'}
           </button>
         </div>
 

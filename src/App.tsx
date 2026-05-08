@@ -85,14 +85,12 @@ export default function App() {
   // ACK status overlay: messageId → status (overrides whatever the poll returns)
   const [ackStatuses, setAckStatuses] = React.useState<Record<string, { status: string; errorCode: number }>>({});
   
-  // Grouping State
-  const [groups, setGroups] = React.useState<Group[]>([
-    { id: 'g1', name: 'Field Team', color: '#10b981' },
-    { id: 'g2', name: 'Logistics', color: '#f59e0b' }
-  ]);
+  // Grouping State — groups are persisted server-side; we mirror them here.
+  const [groups, setGroups] = React.useState<Group[]>([]);
   const [selectedGroupId, setSelectedGroupId] = React.useState<string | 'all' | 'favorites'>('all');
   const [isAddingGroup, setIsAddingGroup] = React.useState(false);
   const [newGroupName, setNewGroupName] = React.useState('');
+  const [newGroupColor, setNewGroupColor] = React.useState<string>('#10b981');
   const [unitSystem, setUnitSystem] = React.useState<UnitSystem>('METRIC');
   const [dataSource, setDataSource] = React.useState<DataSource>('simulator');
   const [radioConnected, setRadioConnected] = React.useState(false);
@@ -146,6 +144,7 @@ export default function App() {
       const unsubNeighbors = meshDataService.onNeighborInfo((list) => setNeighborInfo(list));
       const unsubSfRouters = meshDataService.onStoreForwardRouters((list) => setSfRouters(list));
       const unsubModuleConfig = meshDataService.onModuleConfig((cfg) => setLocalModuleConfig(cfg));
+      const unsubGroups = meshDataService.onGroups((list) => setGroups(list));
       return () => {
         unsub();
         unsubStatus();
@@ -156,6 +155,7 @@ export default function App() {
         unsubNeighbors();
         unsubSfRouters();
         unsubModuleConfig();
+        unsubGroups();
         meshDataService.stop();
       };
     } else {
@@ -304,40 +304,50 @@ export default function App() {
     favorites: nodes.filter(n => n.favorite).length
   }), [nodes]);
 
-  const handleCreateGroup = () => {
-    if (!newGroupName.trim()) return;
-    const newGroup: Group = {
-      id: Math.random().toString(36).substr(2, 9),
-      name: newGroupName,
-      color: `hsl(${Math.random() * 360}, 70%, 50%)`
-    };
-    setGroups([...groups, newGroup]);
+  const handleCreateGroup = async () => {
+    const name = newGroupName.trim();
+    if (!name) return;
+    if (dataSource === 'live') {
+      const r = await meshDataService.createGroup(name, newGroupColor);
+      if (!r.ok) console.error('createGroup failed:', r.error);
+    } else {
+      // Simulator path: keep client-side state for development
+      const newGroup: Group = {
+        id: Math.random().toString(36).substr(2, 9),
+        name,
+        color: newGroupColor,
+      };
+      setGroups([...groups, newGroup]);
+    }
     setNewGroupName('');
+    setNewGroupColor('#10b981');
     setIsAddingGroup(false);
   };
 
-  const assignNodeToGroup = (nodeId: string, groupId?: string) => {
-    setNodes(prev => prev.map(n => n.id === nodeId ? { ...n, groupId } : n));
+  const handleDeleteGroup = async (groupId: string) => {
+    if (dataSource === 'live') {
+      const r = await meshDataService.deleteGroup(groupId);
+      if (!r.ok) console.error('deleteGroup failed:', r.error);
+    } else {
+      setGroups(prev => prev.filter(g => g.id !== groupId));
+      setNodes(prev => prev.map(n => n.groupId === groupId ? { ...n, groupId: undefined } : n));
+    }
+    if (selectedGroupId === groupId) setSelectedGroupId('all');
+  };
+
+  const assignNodeToGroup = async (nodeId: string, groupId?: string) => {
+    if (dataSource === 'live') {
+      const r = await meshDataService.setNodeGroup(nodeId, groupId ?? null);
+      if (!r.ok) console.error('setNodeGroup failed:', r.error);
+    } else {
+      setNodes(prev => prev.map(n => n.id === nodeId ? { ...n, groupId } : n));
+    }
   };
 
   // Matrix Stats Calculation
-  const matrixData = React.useMemo(() => {
-    const list = nodes.map(n => ({ id: n.id, name: n.shortName }));
-    const matrix: Record<string, Record<string, { count: number, success: number }>> = {};
-    
-    list.forEach(from => {
-      matrix[from.id] = {};
-      list.forEach(to => {
-        const pairingMessages = messages.filter(m => m.from === from.id && m.to === to.id);
-        matrix[from.id][to.id] = {
-          count: pairingMessages.length,
-          success: pairingMessages.length > 0 ? 100 : 0 // Simplified for demo
-        };
-      });
-    });
-
-    return { nodes: list, matrix };
-  }, [nodes, messages]);
+  // Comm Matrix data is now computed inside MatrixView itself with filter state
+  // (time range, top-N senders, etc.) — see src/components/views/MatrixView.tsx.
+  // The view consumes raw `messages`, `nodes`, and `channels` directly.
 
   return (
     <div className="flex h-screen bg-brand-bg font-sans overflow-hidden">
@@ -466,13 +476,18 @@ export default function App() {
                 count={stats.favorites}
               />
               {groups.map(group => (
-                <GroupItem 
+                <GroupItem
                   key={group.id}
                   active={selectedGroupId === group.id}
                   onClick={() => setSelectedGroupId(group.id)}
                   label={group.name}
                   color={group.color}
                   count={nodes.filter(n => n.groupId === group.id).length}
+                  onDelete={() => {
+                    if (confirm(`Delete group "${group.name}"? Nodes in this group will be unassigned.`)) {
+                      handleDeleteGroup(group.id);
+                    }
+                  }}
                 />
               ))}
             </div>
@@ -538,29 +553,56 @@ export default function App() {
                 exit={{ opacity: 0 }}
                 className="absolute inset-0 bg-brand-bg/80 backdrop-blur-md z-[100] flex items-center justify-center p-6"
               >
-                <div className="technical-panel w-full max-w-sm p-6 space-y-4">
+                <div className="technical-panel w-full max-w-sm p-6 space-y-4 bg-brand-bg">
                   <h3 className="text-lg font-bold tracking-tight">Create New Group</h3>
                   <div className="space-y-2">
                     <label className="text-[10px] font-bold uppercase tracking-widest text-brand-muted">Group Name</label>
-                    <input 
-                      type="text" 
+                    <input
+                      type="text"
                       value={newGroupName}
                       onChange={(e) => setNewGroupName(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === 'Enter' && newGroupName.trim()) handleCreateGroup(); }}
                       placeholder="e.g. West Relay Team"
                       className="w-full bg-brand-line border border-brand-line rounded px-3 py-2 text-sm focus:outline-none focus:border-brand-accent"
                       autoFocus
                     />
                   </div>
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-bold uppercase tracking-widest text-brand-muted">Color</label>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      {['#10b981', '#f59e0b', '#3b82f6', '#a855f7', '#ec4899', '#ef4444', '#06b6d4', '#84cc16'].map(c => (
+                        <button
+                          key={c}
+                          type="button"
+                          onClick={() => setNewGroupColor(c)}
+                          className={cn(
+                            "w-7 h-7 rounded-full transition-all border-2",
+                            newGroupColor === c ? "border-white scale-110" : "border-transparent hover:border-brand-muted"
+                          )}
+                          style={{ backgroundColor: c }}
+                          title={c}
+                        />
+                      ))}
+                      <input
+                        type="color"
+                        value={newGroupColor}
+                        onChange={(e) => setNewGroupColor(e.target.value)}
+                        className="w-7 h-7 rounded cursor-pointer bg-transparent border border-brand-line"
+                        title="Custom color"
+                      />
+                    </div>
+                  </div>
                   <div className="flex gap-2 justify-end">
-                    <button 
+                    <button
                       onClick={() => setIsAddingGroup(false)}
                       className="px-4 py-2 text-sm hover:text-brand-accent transition-colors"
                     >
                       Cancel
                     </button>
-                    <button 
+                    <button
                       onClick={handleCreateGroup}
-                      className="bg-brand-accent text-black px-4 py-2 rounded text-sm font-bold hover:brightness-110"
+                      disabled={!newGroupName.trim()}
+                      className="bg-brand-accent text-black px-4 py-2 rounded text-sm font-bold hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed"
                     >
                       Create
                     </button>
@@ -600,6 +642,8 @@ export default function App() {
                       simulator.setFavorite(nodeId, favorite);
                     }
                   }}
+                  groups={groups}
+                  onAssignGroup={(nodeId, groupId) => assignNodeToGroup(nodeId, groupId)}
                 />
               </motion.div>
             )}
@@ -645,6 +689,7 @@ export default function App() {
                       simulator.setFavorite(nodeId, favorite);
                     }
                   }}
+                  onAssignGroup={(nodeId, groupId) => assignNodeToGroup(nodeId, groupId)}
                   onSaveWaypoint={async (input) => {
                     if (dataSource === 'live') {
                       const r = await meshDataService.saveWaypoint(input);
@@ -707,7 +752,7 @@ export default function App() {
                 exit={{ opacity: 0, scale: 0.95 }}
                 className="p-6 h-full flex flex-col gap-6"
               >
-                <MatrixView matrixData={matrixData} />
+                <MatrixView nodes={nodes} messages={messages} channels={channels} />
               </motion.div>
             )}
 
@@ -735,6 +780,7 @@ export default function App() {
                     <TopologyView
                       nodes={nodes}
                       neighborInfo={neighborInfo}
+                      groups={groups}
                       localNodeId={localNodeId}
                       canConfigureRadio={dataSource === 'live' && radioConnected}
                       neighborInfoConfig={localModuleConfig.neighborInfo}

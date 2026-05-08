@@ -5,7 +5,7 @@
  * interface identical to the simulator, so the app can switch between
  * real hardware and simulated data seamlessly.
  */
-import { Node, Message, RadioEvent, Channel, Waypoint, TraceResult, NeighborInfoSnapshot, StoreForwardRouter, LocalModuleConfigSnapshot } from '../types';
+import { Node, Message, RadioEvent, Channel, Waypoint, TraceResult, NeighborInfoSnapshot, StoreForwardRouter, LocalModuleConfigSnapshot, Group } from '../types';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
@@ -21,6 +21,7 @@ interface MeshSnapshot {
   neighborInfo?: NeighborInfoSnapshot[];
   storeForwardRouters?: StoreForwardRouter[];
   localModuleConfig?: LocalModuleConfigSnapshot;
+  groups?: Group[];
   radioConnected: boolean;
   localNodeId?: string | null;
 }
@@ -56,6 +57,8 @@ export class MeshDataService {
   private lastSfRouters: StoreForwardRouter[] = [];
   private moduleConfigListeners: ((cfg: LocalModuleConfigSnapshot) => void)[] = [];
   private lastModuleConfig: LocalModuleConfigSnapshot = {};
+  private groupListeners: ((groups: Group[]) => void)[] = [];
+  private lastGroups: Group[] = [];
   private statusListeners: ((status: MeshStatus | null) => void)[] = [];
   private ackListeners: ((msgId: string, status: AckStatus, errorCode: number) => void)[] = [];
   private traceListeners: ((trace: TraceResult) => void)[] = [];
@@ -163,6 +166,7 @@ export class MeshDataService {
       this.eventSource.addEventListener('storeForward', triggerDebouncedPoll);
       this.eventSource.addEventListener('neighborInfo', triggerDebouncedPoll);
       this.eventSource.addEventListener('moduleConfig', triggerDebouncedPoll);
+      this.eventSource.addEventListener('groups', triggerDebouncedPoll);
 
       this.eventSource.onerror = () => {
         // Browser will auto-reconnect; no action needed
@@ -288,6 +292,23 @@ export class MeshDataService {
     return [...this.lastNeighborInfo];
   }
 
+  /** Fetch the persisted telemetry history for one node (server returns newest-first). */
+  async fetchTelemetryHistory(nodeId: string, limit: number = 200): Promise<Array<{
+    timestamp: number;
+    battery?: number; voltage?: number;
+    chUtil?: number; airUtilTx?: number;
+    snr?: number; rssi?: number;
+    temperature?: number; humidity?: number; pressure?: number;
+  }>> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/nodes/${encodeURIComponent(nodeId)}/telemetry?limit=${limit}`);
+      if (!res.ok) return [];
+      return await res.json();
+    } catch {
+      return [];
+    }
+  }
+
   /** Subscribe to authoritative module-config snapshots read back from the radio. */
   onModuleConfig(callback: (cfg: LocalModuleConfigSnapshot) => void) {
     this.moduleConfigListeners.push(callback);
@@ -325,6 +346,89 @@ export class MeshDataService {
         const body = await res.json().catch(() => ({}));
         return { ok: false, error: body.error || `HTTP ${res.status}` };
       }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  // ---- Node groups ----
+
+  /** Subscribe to the current groups list (replays the last known list immediately). */
+  onGroups(callback: (groups: Group[]) => void) {
+    this.groupListeners.push(callback);
+    callback(this.lastGroups);
+    return () => { this.groupListeners = this.groupListeners.filter(l => l !== callback); };
+  }
+
+  getGroups(): Group[] {
+    return [...this.lastGroups];
+  }
+
+  async createGroup(name: string, color: string): Promise<{ ok: boolean; group?: Group; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/groups`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, color }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      const body = await res.json();
+      await this.poll();
+      return { ok: true, group: body.group };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  async updateGroup(id: string, patch: { name?: string; color?: string }): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/groups/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      await this.poll();
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  async deleteGroup(id: string): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/groups/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      await this.poll();
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Assign a node to a group, or pass null to unassign. */
+  async setNodeGroup(nodeId: string, groupId: string | null): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/nodes/${encodeURIComponent(nodeId)}/group`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ groupId }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      await this.poll();
       return { ok: true };
     } catch (err: any) {
       return { ok: false, error: err.message || 'Network error' };
@@ -540,6 +644,11 @@ export class MeshDataService {
       if (data.localModuleConfig) {
         this.lastModuleConfig = data.localModuleConfig;
         this.moduleConfigListeners.forEach(l => l(data.localModuleConfig!));
+      }
+
+      if (data.groups) {
+        this.lastGroups = data.groups;
+        this.groupListeners.forEach(l => l(data.groups!));
       }
 
       if (data.localNodeId !== undefined) {

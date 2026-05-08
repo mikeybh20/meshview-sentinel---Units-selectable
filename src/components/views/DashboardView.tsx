@@ -1,24 +1,28 @@
 import React from 'react';
-import { 
-  MessageSquare, 
-  Settings, 
-  Activity, 
-  Signal, 
+import {
+  MessageSquare,
+  Settings,
+  Activity,
+  Signal,
   Star,
   ArrowRight,
   Wifi,
   AlertCircle,
   LayoutTemplate,
   Compass,
-  ArrowsUpFromLine
+  ArrowsUpFromLine,
+  Check,
+  X,
+  Loader2,
 } from 'lucide-react';
 import { Map, Marker } from "pigeon-maps";
 
-import { Node, Message, WidgetConfig, UnitSystem } from '../../types';
+import { Node, Message, WidgetConfig, UnitSystem, Group } from '../../types';
 import { cn } from '../../lib/utils';
 import { StatCard } from '../ui/StatCard';
 import { TelemetryItem } from '../ui/TelemetryItem';
 import { SensorWidget } from '../SensorWidget';
+import { TelemetryChart } from '../TelemetryChart';
 
 // Maryland home base — same fallback as the main MapView so a fresh DB with
 // no positioned nodes lands on the operator's actual region instead of the
@@ -103,6 +107,8 @@ interface DashboardViewProps {
   stats: { total: number; online: number; offline: number; favorites: number };
   unitSystem: UnitSystem;
   onToggleFavorite: (nodeId: string, favorite: boolean) => void;
+  groups: Group[];
+  onAssignGroup: (nodeId: string, groupId: string | undefined) => void;
 }
 
 export function DashboardView({
@@ -118,7 +124,94 @@ export function DashboardView({
   stats,
   unitSystem,
   onToggleFavorite,
+  groups,
+  onAssignGroup,
 }: DashboardViewProps) {
+  // Bulk-selection state for the NODE_LIST table. Lives here as transient UI
+  // state — no need to lift to App.tsx since other views don't use it.
+  const [selectedIds, setSelectedIds] = React.useState<Set<string>>(new Set());
+  const [lastCheckedId, setLastCheckedId] = React.useState<string | null>(null);
+  const [bulkBusy, setBulkBusy] = React.useState(false);
+  const [showGroupMenu, setShowGroupMenu] = React.useState(false);
+
+  // Drop selections that no longer exist in the filtered list (e.g. node
+  // disappeared, search filter narrowed).
+  React.useEffect(() => {
+    if (selectedIds.size === 0) return;
+    const visibleIds = new Set(filteredNodes.map(n => n.id));
+    let changed = false;
+    const next = new Set<string>();
+    for (const id of selectedIds) {
+      if (visibleIds.has(id)) next.add(id);
+      else changed = true;
+    }
+    if (changed) setSelectedIds(next);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filteredNodes]);
+
+  const toggleSelection = (nodeId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    const isShiftRange = e.shiftKey && lastCheckedId && lastCheckedId !== nodeId;
+    const next = new Set(selectedIds);
+
+    if (isShiftRange) {
+      // Range select: from lastCheckedId to nodeId, both inclusive.
+      // The new state of every row in the range matches the destination row's new state.
+      const rowIds = filteredNodes.map(n => n.id);
+      const a = rowIds.indexOf(lastCheckedId!);
+      const b = rowIds.indexOf(nodeId);
+      if (a >= 0 && b >= 0) {
+        const lo = Math.min(a, b);
+        const hi = Math.max(a, b);
+        const wantSelected = !selectedIds.has(nodeId);
+        for (let i = lo; i <= hi; i++) {
+          if (wantSelected) next.add(rowIds[i]);
+          else next.delete(rowIds[i]);
+        }
+      }
+    } else {
+      if (next.has(nodeId)) next.delete(nodeId);
+      else next.add(nodeId);
+    }
+
+    setSelectedIds(next);
+    setLastCheckedId(nodeId);
+  };
+
+  const selectAll = () => {
+    setSelectedIds(new Set(filteredNodes.map(n => n.id)));
+  };
+
+  const clearSelection = () => {
+    setSelectedIds(new Set());
+    setLastCheckedId(null);
+    setShowGroupMenu(false);
+  };
+
+  const bulkAssignGroup = async (groupId: string | undefined) => {
+    if (selectedIds.size === 0) return;
+    setBulkBusy(true);
+    setShowGroupMenu(false);
+    try {
+      await Promise.all(Array.from(selectedIds).map(id => Promise.resolve(onAssignGroup(id, groupId))));
+    } finally {
+      setBulkBusy(false);
+    }
+  };
+
+  const bulkSetFavorite = async (favorite: boolean) => {
+    if (selectedIds.size === 0) return;
+    setBulkBusy(true);
+    try {
+      await Promise.all(Array.from(selectedIds).map(id => Promise.resolve(onToggleFavorite(id, favorite))));
+    } finally {
+      setBulkBusy(false);
+    }
+  };
+
+  const allSelected = selectedIds.size > 0 && selectedIds.size === filteredNodes.length;
+  const someSelected = selectedIds.size > 0;
+
   return (
     <>
       <div className="flex items-center justify-between mb-6">
@@ -167,17 +260,38 @@ export function DashboardView({
               )}
 
               {widget.type === 'NODE_LIST' && (
-                <div className="technical-panel h-full flex flex-col min-h-0 max-h-[70vh]">
+                <div className="technical-panel h-full flex flex-col min-h-0 max-h-[70vh] relative">
                   <div className="p-4 border-b border-brand-line flex items-center justify-between flex-shrink-0">
                     <h3 className="font-bold flex items-center gap-2 text-xs uppercase tracking-widest text-brand-muted">
                       Active Network Peers
                       <span className="text-brand-muted/60 mono-text">({filteredNodes.length})</span>
                     </h3>
+                    {someSelected && (
+                      <span className="text-[10px] mono-text text-brand-accent">
+                        {selectedIds.size} selected
+                      </span>
+                    )}
                   </div>
                   <div className="flex-1 min-h-0 overflow-y-auto overflow-x-auto">
                     <table className="w-full text-left">
                       <thead className="sticky top-0 z-10 bg-brand-bg">
                         <tr className="border-b border-brand-line bg-brand-line/20">
+                          <th className="pl-4 py-2 w-8">
+                            <button
+                              onClick={() => allSelected ? clearSelection() : selectAll()}
+                              title={allSelected ? 'Clear selection' : 'Select all'}
+                              className={cn(
+                                "w-4 h-4 rounded border flex items-center justify-center transition-colors",
+                                allSelected
+                                  ? "bg-brand-accent border-brand-accent text-black"
+                                  : someSelected
+                                  ? "bg-brand-accent/40 border-brand-accent/60 text-brand-accent"
+                                  : "border-brand-muted/40 hover:border-brand-accent text-transparent hover:text-brand-accent/40"
+                              )}
+                            >
+                              {(allSelected || someSelected) && <Check size={10} strokeWidth={3} />}
+                            </button>
+                          </th>
                           <th className="px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-brand-muted">Status</th>
                           <th className="px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-brand-muted">Node ID</th>
                           <th className="px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-brand-muted">Name</th>
@@ -185,15 +299,34 @@ export function DashboardView({
                         </tr>
                       </thead>
                       <tbody>
-                        {filteredNodes.map(node => (
-                          <tr 
-                            key={node.id} 
+                        {filteredNodes.map(node => {
+                          const isChecked = selectedIds.has(node.id);
+                          return (
+                          <tr
+                            key={node.id}
                             onClick={() => setSelectedNodeId(node.id)}
                             className={cn(
-                              "group border-b border-brand-line/50 hover:bg-brand-ink hover:text-brand-bg transition-all cursor-pointer",
-                              selectedNodeId === node.id && "bg-brand-line/30"
+                              "group border-b border-brand-line/50 transition-all cursor-pointer",
+                              isChecked
+                                ? "bg-brand-accent/10 hover:bg-brand-accent/15"
+                                : "hover:bg-brand-ink hover:text-brand-bg",
+                              selectedNodeId === node.id && !isChecked && "bg-brand-line/30"
                             )}
                           >
+                            <td className="pl-4 py-4 w-8">
+                              <button
+                                onClick={(e) => toggleSelection(node.id, e)}
+                                title={isChecked ? 'Deselect' : 'Select (shift-click for range)'}
+                                className={cn(
+                                  "w-4 h-4 rounded border flex items-center justify-center transition-all",
+                                  isChecked
+                                    ? "bg-brand-accent border-brand-accent text-black"
+                                    : "border-brand-muted/30 opacity-30 group-hover:opacity-100 hover:border-brand-accent text-transparent hover:text-brand-accent/40"
+                                )}
+                              >
+                                {isChecked && <Check size={10} strokeWidth={3} />}
+                              </button>
+                            </td>
                             <td className="px-4 py-4">
                               <div className={cn(
                                 "w-2 h-2 rounded-full",
@@ -228,10 +361,88 @@ export function DashboardView({
                               <ArrowRight size={16} className="ml-auto opacity-0 group-hover:opacity-100 transition-opacity" />
                             </td>
                           </tr>
-                        ))}
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
+
+                  {/* Floating bulk action bar — appears when ≥1 row selected */}
+                  {someSelected && (
+                    <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 bg-brand-bg/95 backdrop-blur-md border border-brand-accent/40 rounded-lg shadow-2xl p-2 flex items-center gap-2">
+                      <span className="text-[10px] font-bold uppercase tracking-widest text-brand-muted px-2">
+                        {selectedIds.size} selected
+                      </span>
+
+                      {/* Move to group */}
+                      <div className="relative">
+                        <button
+                          onClick={() => setShowGroupMenu(p => !p)}
+                          disabled={bulkBusy}
+                          className="flex items-center gap-1 bg-brand-line hover:bg-brand-line/70 border border-brand-line text-brand-ink text-[10px] font-bold uppercase tracking-widest rounded px-2 py-1 transition-colors disabled:opacity-50"
+                        >
+                          {bulkBusy ? <Loader2 size={11} className="animate-spin" /> : null}
+                          Move to group ▾
+                        </button>
+                        {showGroupMenu && (
+                          <>
+                            <div className="fixed inset-0 z-10" onClick={() => setShowGroupMenu(false)} />
+                            <div className="absolute bottom-full mb-1 left-0 z-20 bg-brand-bg border border-brand-line rounded-lg shadow-xl min-w-[180px] overflow-hidden">
+                              <button
+                                onClick={() => bulkAssignGroup(undefined)}
+                                className="w-full text-left px-3 py-2 text-[11px] hover:bg-brand-line/40 transition-colors flex items-center gap-2"
+                              >
+                                <span className="w-2 h-2 rounded-full border border-brand-muted/50" />
+                                <span className="italic text-brand-muted">— Unassigned —</span>
+                              </button>
+                              {groups.map(g => (
+                                <button
+                                  key={g.id}
+                                  onClick={() => bulkAssignGroup(g.id)}
+                                  className="w-full text-left px-3 py-2 text-[11px] hover:bg-brand-line/40 transition-colors flex items-center gap-2"
+                                >
+                                  <span className="w-2 h-2 rounded-full" style={{ backgroundColor: g.color }} />
+                                  <span>{g.name}</span>
+                                </button>
+                              ))}
+                              {groups.length === 0 && (
+                                <p className="px-3 py-2 text-[10px] text-brand-muted italic">No groups defined yet</p>
+                              )}
+                            </div>
+                          </>
+                        )}
+                      </div>
+
+                      {/* Star all / Unstar all */}
+                      <button
+                        onClick={() => bulkSetFavorite(true)}
+                        disabled={bulkBusy}
+                        title="Mark all selected as favorite"
+                        className="flex items-center gap-1 bg-brand-line hover:bg-brand-warning/15 hover:border-brand-warning/40 border border-brand-line text-brand-ink hover:text-brand-warning text-[10px] font-bold uppercase tracking-widest rounded px-2 py-1 transition-colors disabled:opacity-50"
+                      >
+                        <Star size={11} />
+                        Star
+                      </button>
+                      <button
+                        onClick={() => bulkSetFavorite(false)}
+                        disabled={bulkBusy}
+                        title="Unfavorite all selected"
+                        className="flex items-center gap-1 bg-brand-line hover:bg-brand-line/70 border border-brand-line text-brand-muted hover:text-brand-ink text-[10px] font-bold uppercase tracking-widest rounded px-2 py-1 transition-colors disabled:opacity-50"
+                      >
+                        <Star size={11} className="opacity-60" />
+                        Unstar
+                      </button>
+
+                      {/* Clear selection */}
+                      <button
+                        onClick={clearSelection}
+                        title="Clear selection"
+                        className="text-brand-muted hover:text-white p-1 rounded transition-colors"
+                      >
+                        <X size={14} />
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -272,6 +483,29 @@ export function DashboardView({
                           </button>
                         </div>
                       </div>
+
+                      {/* Group assignment */}
+                      {groups.length > 0 && (
+                        <div className="flex items-center gap-2 -mt-2">
+                          <span className="text-[10px] uppercase font-bold text-brand-muted">Group</span>
+                          <select
+                            value={selectedNode.groupId ?? ''}
+                            onChange={(e) => onAssignGroup(selectedNode.id, e.target.value || undefined)}
+                            className="flex-1 bg-brand-line/50 border border-brand-line rounded px-2 py-1 text-xs mono-text focus:outline-none focus:border-brand-accent"
+                          >
+                            <option value="">— Unassigned —</option>
+                            {groups.map(g => (
+                              <option key={g.id} value={g.id}>{g.name}</option>
+                            ))}
+                          </select>
+                          {selectedNode.groupId && (
+                            <span
+                              className="w-3 h-3 rounded-full flex-shrink-0"
+                              style={{ backgroundColor: groups.find(g => g.id === selectedNode.groupId)?.color ?? 'transparent' }}
+                            />
+                          )}
+                        </div>
+                      )}
                         <div className="grid grid-cols-2 gap-4">
                           <TelemetryItem icon={<Signal size={14}/>} label="RSSI" value={`${selectedNode.telemetry?.rssi} dBm`} />
                           <TelemetryItem icon={<Activity size={14}/>} label="SNR" value={`${selectedNode.telemetry?.snr} dB`} />
@@ -303,6 +537,9 @@ export function DashboardView({
                           <p className="flex justify-between"><span>LNG:</span> <span className="text-brand-ink">{selectedNode.position?.lng.toFixed(6)}</span></p>
                         </div>
                       </div>
+
+                      {/* Time-series telemetry chart — battery, signal, environment */}
+                      <TelemetryChart nodeId={selectedNode.id} />
                     </div>
                   ) : (
                     <div className="h-full flex flex-col items-center justify-center text-center space-y-4 opacity-50">

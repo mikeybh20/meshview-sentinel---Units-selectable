@@ -24,6 +24,16 @@ export interface MeshNode {
   positionSource?: 'manual' | 'gps';
   /** Channel-imposed precision_bits, if the node's last Position carried it (32 = full precision). */
   positionPrecisionBits?: number;
+  /** User.role enum (Meshtastic config.proto Role) — CLIENT, ROUTER, TAK, etc. */
+  role?: number;
+  /** User.is_licensed — set when the operator has identified as licensed. */
+  isLicensed?: boolean;
+  /** User.hw_model — Meshtastic HardwareModel enum (TBEAM, HELTEC_V3, RAK4631, etc.). */
+  hwModel?: number;
+  /** Last-observed inbound transport for this node ('lora' = direct over RF, 'mqtt' = bridged). */
+  lastVia?: 'lora' | 'mqtt';
+  /** Group id this node belongs to (operator-assigned). null/undefined = unassigned. */
+  groupId?: string;
   position?: { lat: number; lng: number; alt: number };
   telemetry?: {
     battery: number;
@@ -76,6 +86,13 @@ export interface MeshEvent {
   nodeId: string;
   timestamp: number;
   details: string;
+}
+
+export interface MeshGroup {
+  id: string;
+  name: string;
+  color: string;        // hex like '#10b981'
+  createdAt: number;    // epoch ms
 }
 
 export type ChannelRole = 'DISABLED' | 'PRIMARY' | 'SECONDARY';
@@ -243,6 +260,8 @@ export class MeshtasticSerialBridge extends EventEmitter {
   private storeForwardRouters = new Map<string, MeshStoreForwardRouter>();
   /** Authoritative module config read from the local radio via admin readback. */
   private localModuleConfig: LocalModuleConfigSnapshot = {};
+  /** Operator-defined node groups (for organizing the mesh into Field Team / Logistics / etc.). */
+  private groups = new Map<string, MeshGroup>();
   /** Hours to keep events around. Set via setEventRetention(). */
   private eventRetentionHours: number = 24;
   private retentionPruneTimer: ReturnType<typeof setInterval> | null = null;
@@ -302,6 +321,9 @@ export class MeshtasticSerialBridge extends EventEmitter {
       const persistedSfRouters = this.db.loadStoreForwardRouters();
       for (const r of persistedSfRouters) this.storeForwardRouters.set(r.nodeId, r);
 
+      const persistedGroups = this.db.loadGroups();
+      for (const g of persistedGroups) this.groups.set(g.id, g);
+
       const s = this.db.stats();
       console.log(
         `[MeshtasticSerial] Hydrated from DB — nodes:${s.nodes} messages:${s.messages} events:${s.events} channels:${s.channels} telemetry:${s.telemetry}`
@@ -331,6 +353,71 @@ export class MeshtasticSerialBridge extends EventEmitter {
 
   getNodes(): MeshNode[] {
     return Array.from(this.nodes.values());
+  }
+
+  // ---- Node groups ----
+
+  getGroups(): MeshGroup[] {
+    return Array.from(this.groups.values()).sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  /** Create a new group. Returns the created group. */
+  createGroup(name: string, color: string): MeshGroup {
+    const trimmed = name.trim();
+    if (!trimmed) throw new Error('Group name cannot be empty');
+    const id = `g_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+    const group: MeshGroup = { id, name: trimmed, color, createdAt: Date.now() };
+    this.groups.set(id, group);
+    try { this.db.upsertGroup(group); }
+    catch (err: any) { console.error('[MeshtasticSerial] group persist failed:', err.message); }
+    return group;
+  }
+
+  /** Update name and/or color of an existing group. */
+  updateGroup(id: string, patch: { name?: string; color?: string }): MeshGroup | null {
+    const existing = this.groups.get(id);
+    if (!existing) return null;
+    const next: MeshGroup = {
+      ...existing,
+      name: patch.name !== undefined ? patch.name.trim() : existing.name,
+      color: patch.color !== undefined ? patch.color : existing.color,
+    };
+    if (!next.name) throw new Error('Group name cannot be empty');
+    this.groups.set(id, next);
+    try { this.db.upsertGroup(next); }
+    catch (err: any) { console.error('[MeshtasticSerial] group update persist failed:', err.message); }
+    return next;
+  }
+
+  /** Delete a group and unassign every node currently in it. */
+  deleteGroup(id: string): boolean {
+    if (!this.groups.has(id)) return false;
+    this.groups.delete(id);
+    try { this.db.deleteGroup(id); }
+    catch (err: any) { console.error('[MeshtasticSerial] group delete persist failed:', err.message); }
+
+    // Unassign every node that pointed at this group
+    let cleared = 0;
+    for (const node of this.nodes.values()) {
+      if (node.groupId === id) {
+        node.groupId = undefined;
+        this.upsertNode(node);
+        cleared++;
+      }
+    }
+    if (cleared > 0) console.log(`[MeshtasticSerial] Group ${id} deleted; ${cleared} node(s) unassigned`);
+    return true;
+  }
+
+  /** Assign a node to a group, or pass null/undefined to unassign. */
+  setNodeGroup(nodeId: string, groupId: string | null): boolean {
+    const node = this.nodes.get(nodeId);
+    if (!node) return false;
+    if (groupId && !this.groups.has(groupId)) return false;
+    node.groupId = groupId || undefined;
+    this.upsertNode(node); // raw_json round-trip persists groupId
+    this.emit('nodeUpdate', node);
+    return true;
   }
 
   /** Mark a node as favorite (or unfavorite). Updates the in-memory cache and persists. */
@@ -945,6 +1032,9 @@ export class MeshtasticSerialBridge extends EventEmitter {
     let longName = '';
     let shortName = '';
     let publicKey: string | undefined;
+    let hwModel: number | undefined;
+    let isLicensed: boolean | undefined;
+    let role: number | undefined;
     let offset = 0;
 
     while (offset < buf.length) {
@@ -964,11 +1054,14 @@ export class MeshtasticSerialBridge extends EventEmitter {
         offset += len;
 
         if (fieldNumber === 2) {
-          // User submessage — extract names + public key
+          // User submessage — extract names, public key, role, hardware, licensed
           const user = this.parseUser(subBuf);
           longName = user.longName;
           shortName = user.shortName;
           publicKey = user.publicKey;
+          hwModel = user.hwModel;
+          isLicensed = user.isLicensed;
+          role = user.role;
         }
       } else {
         break;
@@ -992,6 +1085,10 @@ export class MeshtasticSerialBridge extends EventEmitter {
         // Only update publicKey if we got a non-empty one this packet (don't
         // erase a previously-known key just because the latest NodeInfo omitted it).
         ...(publicKey ? { publicKey } : {}),
+        // Same logic for the new identity fields — only overwrite when present.
+        ...(hwModel !== undefined ? { hwModel } : {}),
+        ...(isLicensed !== undefined ? { isLicensed } : {}),
+        ...(role !== undefined ? { role } : {}),
       };
       node.lastSeen = Date.now();
       node.online = true;
@@ -1011,10 +1108,20 @@ export class MeshtasticSerialBridge extends EventEmitter {
     }
   }
 
-  private parseUser(buf: Buffer): { longName: string; shortName: string; publicKey?: string } {
+  private parseUser(buf: Buffer): {
+    longName: string;
+    shortName: string;
+    publicKey?: string;
+    hwModel?: number;
+    isLicensed?: boolean;
+    role?: number;
+  } {
     let longName = '';
     let shortName = '';
     let publicKey: string | undefined;
+    let hwModel: number | undefined;
+    let isLicensed: boolean | undefined;
+    let role: number | undefined;
     let offset = 0;
 
     while (offset < buf.length) {
@@ -1036,14 +1143,17 @@ export class MeshtasticSerialBridge extends EventEmitter {
           publicKey = slice.toString('base64');
         }
       } else if (wireType === 0) {
-        const { bytesRead } = this.readVarint(buf, offset);
+        const { value, bytesRead } = this.readVarint(buf, offset);
         offset += bytesRead;
+        if (fieldNumber === 5) hwModel = value;          // HardwareModel enum
+        else if (fieldNumber === 6) isLicensed = value !== 0;
+        else if (fieldNumber === 7) role = value;        // Role enum
       } else {
         break;
       }
     }
 
-    return { longName, shortName, publicKey };
+    return { longName, shortName, publicKey, hwModel, isLicensed, role };
   }
 
   /** Parse a MeshPacket submessage for text, position, telemetry, and ACKs */
@@ -1060,6 +1170,7 @@ export class MeshtasticSerialBridge extends EventEmitter {
     let replyId = 0;
     let emoji = 0;
     let incomingPacketId = 0;
+    let viaMqtt = false;
     let offset = 0;
 
     while (offset < buf.length) {
@@ -1077,6 +1188,7 @@ export class MeshtasticSerialBridge extends EventEmitter {
         else if (fieldNumber === 10) hopLimit = value;
         else if (fieldNumber === 12) rxSnr = value;
         else if (fieldNumber === 13) rxRssi = value;
+        else if (fieldNumber === 14) viaMqtt = value !== 0; // MeshPacket.via_mqtt — MQTT-bridged packet
       } else if (wireType === 2) {
         const { value: len, bytesRead } = this.readVarint(buf, offset);
         offset += bytesRead;
@@ -1127,12 +1239,16 @@ export class MeshtasticSerialBridge extends EventEmitter {
       this.addEvent('NODE_JOINED', fromId, `New node ${fromId} seen on mesh`);
     }
 
-    // Update sender's lastSeen + SNR/RSSI
+    // Update sender's lastSeen + SNR/RSSI + transport observation.
     const senderNode = this.nodes.get(fromId);
     if (senderNode) {
       senderNode.lastSeen = Date.now();
       senderNode.online = true;
-      if (rxSnr || rxRssi) {
+      senderNode.lastVia = viaMqtt ? 'mqtt' : 'lora';
+      // MQTT-bridged packets don't carry meaningful RX SNR/RSSI — they were
+      // received over IP, not LoRa. Don't overwrite a previous LoRa observation
+      // with synthetic zeros from an MQTT relay.
+      if (!viaMqtt && (rxSnr || rxRssi)) {
         senderNode.telemetry = {
           ...senderNode.telemetry || { battery: 0, voltage: 0, channelUtilization: 0, airUtilTx: 0, snr: 0, rssi: 0 },
           snr: rxSnr / 4,
@@ -2673,8 +2789,21 @@ export class MeshtasticSerialBridge extends EventEmitter {
     this.addEvent('TELEMETRY', this.localNodeId || '!local',
       `NeighborInfo module ${opts.enabled ? 'enabled' : 'disabled'} (every ${intervalSecs}s)`);
 
-    // Read the config back so the UI shows the radio's authoritative state.
-    // Small delay to let the firmware finish persisting before we ask.
+    // Optimistic local update: assume the radio accepted what we just sent.
+    // This gives the UI a baseline immediately so subsequent dirty checks work
+    // even if the firmware doesn't reply with a readback (some firmware
+    // versions ignore admin readbacks unless session-pass-key is configured).
+    // The actual readback (if it arrives) will overwrite this with authoritative state.
+    this.localModuleConfig.neighborInfo = {
+      enabled: opts.enabled,
+      updateIntervalSecs: intervalSecs,
+      transmitOverLora,
+      lastReadAt: Date.now(),
+    };
+    this.emit('localModuleConfigUpdate', this.localModuleConfig);
+
+    // Still try to read the config back. If the firmware does respond, the
+    // optimistic state above gets overwritten with the real values.
     setTimeout(() => { this.requestNeighborInfoConfig().catch(() => { /* best-effort */ }); }, 250);
   }
 

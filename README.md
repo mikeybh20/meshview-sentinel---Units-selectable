@@ -9,11 +9,13 @@ A web-based dashboard, control center, and diagnostic tool for [Meshtastic](http
 ## Features
 
 ### Mesh awareness
-- **Live node directory** with online/offline status, telemetry (RSSI, SNR, battery, sensors), short-name labels, position source (GPS vs fixed), and PKC public keys
-- **Map view** with Meshtastic-style labeled markers (short-name rendered inside each circle, color-coded by status/favorite), signal-quality links, message trace overlays, and right-click waypoint drops
-- **Topology** view with edges built from real `NeighborInfo` observations (with home-base-radial fallback), force-directed layout, focus-neighborhood mode, and one-click NeighborInfo module enable/disable on the local radio
+- **Live node directory** with online/offline status, telemetry (RSSI, SNR, battery, sensors), short-name labels, position source (GPS vs fixed), PKC public keys, role (Router/Tracker/TAK/etc.), hardware model, licensed-operator flag, and last-observed transport (LoRa-direct vs MQTT-bridged)
+- **Map view** with Meshtastic-style labeled markers (short-name inside each circle, color priority **group → favorite → online → offline**), signal-quality links, message trace overlays, and right-click / long-press waypoint drops
+- **Topology** view with edges built from real `NeighborInfo` observations (home-base-radial fallback when no NeighborInfo data yet), force-directed layout, focus-neighborhood mode, **zoom-to-fit + persistent drag positions**, and one-click NeighborInfo module enable/disable on the local radio
+- **Per-node telemetry charts** (Signal · Power · Environment tabs) on the dashboard's node-details panel — battery / SNR / RSSI / temp / humidity / pressure time-series with auto-refresh
+- **Comm Matrix** — filtered cross-tab of who-talks-to-whom with time range (1h / 6h / 24h / all), top-N senders, channel columns, and Count vs Success-rate coloring
 - **Route Intelligence** view with relay statistics
-- **Comm Matrix** heatmap and **Event Log** stream
+- **Event Log** stream with configurable retention (6 h / 24 h / 36 h / 48 h / 72 h)
 
 ### Messaging
 - Channels and direct messages with per-message ack/error status, hop visualization, and message retry
@@ -31,15 +33,16 @@ A web-based dashboard, control center, and diagnostic tool for [Meshtastic](http
 
 ### Operator features
 - **TCP transport** alongside serial (firmware 2.7.4+); persists last endpoint and auto-reconnects on server restart
+- **Settings hub** — unified Connection / Modules / Notifications / Display / Blocked / Data / AI sections (replaces the cluttered six-button rail)
 - **Favorite nodes** with a single click from the popup, dashboard list, or detail panel — favorites get amber rings on the map and topology graph
+- **Node groups** with operator-defined names + colors, persistent server-side; per-node assignment dropdown plus **bulk-select multi-assign** (checkbox column, shift-click ranges, floating action bar) in the dashboard node list; **group color overrides marker/topology color** so groupings are obvious at a glance
 - **QR contact sharing** producing `meshtastic.org/v/#` URLs compatible with mobile clients
 - **Deep linking** for incoming contact (`#v/`) and chat (`#chat=`) URLs
 - **Block list** for hiding noisy nodes (purely local UI filter)
-- **Browser notifications** for DMs, mentions, and lost favorites
-- **Configurable event log retention** (6 h / 24 h / 36 h / 48 h / 72 h)
+- **Browser notifications** for DMs, mentions, and lost favorites — mention notifications resolve to the actual channel and click-to-open the right chat
 - **CSV import/export** of messages, events, and telemetry
 - **AI assistant** (Anthropic Claude or Google Gemini) with full mesh context
-- **Multi-client live sync** — open the dashboard in multiple tabs/browsers, state is shared via SQLite + SSE
+- **Multi-client live sync** — open the dashboard in multiple tabs/browsers; SSE pushes ack updates, traceroute results, waypoints, node updates, events, S&F router heartbeats, NeighborInfo packets, module config, and group changes (~250 ms cross-client latency)
 
 ---
 
@@ -83,10 +86,11 @@ A `Dockerfile` and `docker-compose.yml` are also included for containerized depl
 
 ## Architecture
 
-- **Frontend**: React 19 + Vite + Tailwind v4, [pigeon-maps](https://pigeon-maps.js.org/) for mapping, [emoji-picker-react](https://github.com/ealush/emoji-picker-react) for waypoint icons and reactions
+- **Frontend**: React 19 + Vite + Tailwind v4, [pigeon-maps](https://pigeon-maps.js.org/) for mapping, [recharts](https://recharts.org/) for telemetry time-series, [emoji-picker-react](https://github.com/ealush/emoji-picker-react) for waypoint icons and reactions, [qrcode.react](https://github.com/zpao/qrcode.react) for contact-sharing QR codes
 - **Backend**: Node.js + Express + [better-sqlite3](https://github.com/WiseLibs/better-sqlite3), with raw protobuf encoding/decoding for Meshtastic packets (no `@meshtastic/js` dependency — the protocol is implemented directly to keep the dependency surface small)
-- **Persistence**: SQLite at `data/mesh.sqlite` with tables for nodes, messages (FTS5-indexed), events, channels, waypoints, neighbor info, S&F routers, and per-node telemetry history. All schema changes are forward-compatible additive migrations
-- **Real-time**: 3-second polling on `/api/mesh/snapshot` plus an SSE stream at `/api/mesh/stream` for ack updates, traceroute results, and waypoint changes
+- **Persistence**: SQLite at `data/mesh.sqlite` with tables for nodes, messages (FTS5-indexed), events, channels, waypoints, neighbor info, S&F routers, groups, and per-node telemetry history. All schema changes are forward-compatible additive migrations
+- **Real-time**: 3-second polling on `/api/mesh/snapshot` as a safety net, plus an SSE stream at `/api/mesh/stream` carrying named events (`ack`, `trace`, `waypoints`, `node`, `eventLog`, `storeForward`, `neighborInfo`, `moduleConfig`, `groups`). Bursts of high-frequency events are coalesced via a 250 ms client-side debounce
+- **Module config writes**: Admin messages to the local radio (no LoRa airtime cost) for things like enabling/disabling NeighborInfo, with authoritative readback via `get_module_config_response`
 
 ---
 
@@ -122,6 +126,8 @@ Issues and pull requests welcome. Before submitting:
 
 - The [Meshtastic](https://meshtastic.org/) project for the firmware, protocol, and ecosystem
 - [pigeon-maps](https://pigeon-maps.js.org/) for a tiny dependency-free map component
+- [recharts](https://recharts.org/) for the telemetry time-series charts
 - [emoji-picker-react](https://github.com/ealush/emoji-picker-react) for the waypoint and reaction emoji picker
 - [qrcode.react](https://github.com/zpao/qrcode.react) for contact-sharing QR code rendering
+- [d3-force](https://github.com/d3/d3-force) for the topology graph layout
 - The Meshtastic community for documentation and protocol guidance

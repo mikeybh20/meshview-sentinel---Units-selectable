@@ -2,7 +2,7 @@
 
 This document tracks features that are **partially implemented**, **deferred**, **needing real-radio validation**, or **future work** worth considering.
 
-Updated: 2026-05-06
+Updated: 2026-05-07
 
 ---
 
@@ -17,21 +17,19 @@ Updated: 2026-05-06
 
 ## Module configuration (admin writes)
 
-Only NeighborInfo currently has a UI-driven enable/disable. The same `AdminMessage.set_module_config` plumbing could expose the others.
+A unified **Settings → Modules** section now exists with NeighborInfo as the first module configured end-to-end (enable/disable, interval, transmit-over-LoRa, with a Refresh-readback button). The `set_module_config` builder pattern in `server/meshtasticSerial.ts` (`buildAdminSetNeighborInfoConfig`) is reusable for any other `ModuleConfig.*` variant — adding the rest is mostly UI work plus a per-module config parser.
 
 | Module | Status | Notes |
 |---|---|---|
-| **NeighborInfo** | ✅ Done | Enable/Disable from topology banner with state inference |
+| **NeighborInfo** | ✅ Done | Enable/disable + interval + transmit-over-LoRa via Settings → Modules with authoritative readback. Quick-toggle button also lives in the topology banner |
 | **Range Test** | 📋 Deferred | Read-only ingest works; no UI to configure sender mode/interval |
 | **Store & Forward** | ⚠️ Partial | Detection + replay request work; no UI to configure local node *as* a router |
-| **MQTT bridge** | ⚠️ Partial | Per-channel uplink/downlink toggles exist (write path through channel admin); broker URL/auth config not exposed |
+| **MQTT bridge** | ⚠️ Partial | Per-channel uplink/downlink toggles exist (write path through channel admin); broker URL/auth config not exposed. Inbound `via_mqtt` flag is now parsed and surfaced as a node badge |
 | **Telemetry module** | 📋 Deferred | Receive works; configuring broadcast intervals not exposed |
 | **External Notification** | 📋 Deferred | No UI |
 | **Detection Sensor** | 📋 Deferred | No UI |
 | **Audio module** | 📋 Deferred | No UI |
 | **Position precision (per channel)** | ⚠️ Partial | Display-only in node popup (`precision_bits` field); no per-channel write |
-
-A unified **Settings → Modules** section would group all of these. The `set_module_config` builder pattern in [meshtasticSerial.ts](server/meshtasticSerial.ts#L2585) (`buildAdminSetNeighborInfoConfig`) is reusable for any other `ModuleConfig.*` variant.
 
 ---
 
@@ -40,6 +38,8 @@ A unified **Settings → Modules** section would group all of these. The `set_mo
 ✅ **Done** — the bridge now issues `AdminMessage.get_module_config_request` for NeighborInfo on connect and after every write. The response (`get_module_config_response` carrying a `ModuleConfig`) is parsed by a new `handleAdminResponse` dispatcher case (PORT_ADMIN_APP) and stored on `localModuleConfig.neighborInfo`. The topology banner uses this authoritative state when available and falls back to inferred state otherwise (with an "inferred" hint badge so operators know which they're seeing). Local admin only — no mesh airtime cost.
 
 A new **Settings → Modules** section exposes the full editor: enable/disable, update interval (with presets from 10 min to 12 hr plus a manual-input field), and transmit-over-LoRa toggle. Includes a Refresh button to re-read the firmware state on demand. Changes auto-trigger a readback so the UI re-syncs to the radio's actual saved state.
+
+**Robustness:** some firmware versions don't reply to self-admin readback requests (session-passkey gating, etc.). To prevent the Save button from being stuck on "No changes" forever, the bridge now **optimistically populates `localModuleConfig.neighborInfo`** with the values it just sent right after the admin write. If the actual readback arrives, it overwrites the optimistic state with authoritative values; if it never arrives, the optimistic state at least represents the operator's intent. The Save button is also enabled when there's no baseline yet so the form can apply values on a cold start.
 
 ---
 
@@ -94,20 +94,37 @@ We detect routers, surface their stats, and request replays. Things missing:
 - Periodic "ping" to verify a router is alive
 - Stats request (`CLIENT_STATS`) UI
 
-### 📋 MQTT inbound visualization
-We surface uplink/downlink config per channel, but don't visualize **which packets came in via MQTT** vs LoRa. The Meshtastic firmware sets a `via_mqtt` flag on incoming `MeshPacket` (field 14) we currently don't parse. **📋 Deferred** — would let you distinguish "LoRa-direct" peers from "MQTT-bridged" ones in the UI.
+### ✅ MQTT inbound visualization
+The bridge now parses `MeshPacket.via_mqtt` (field 14) and tracks it as `lastVia: 'lora' | 'mqtt'` per node. NodePopup shows a cyan **MQTT** badge when the last received packet came in via the bridge. SNR/RSSI are no longer overwritten with synthetic zeros from MQTT relays — we only refresh signal strength on LoRa-direct observations.
 
-### 📋 Inbound NodeInfo: licensed flag, role, hardware
-The User proto has `is_licensed` (bool), `role` (Router / Client / TAK / etc.), `hw_model` (HardwareModel enum) that we currently ignore. Surfacing role and hardware would help operators identify routers and TAK clients at a glance. **📋 Deferred**.
+### ✅ Inbound NodeInfo: licensed flag, role, hardware
+`User.is_licensed` (field 6), `User.role` (field 7), and `User.hw_model` (field 5) are now parsed in `parseUser()` and stored on each node. Visible in the NodePopup as small badges (`ROUTER`, `TRACKER`, `TAK`, `SENSOR`, etc.) plus a `LIC` badge for licensed operators, with the hardware model name appended to the node-id row (`!aabbccdd · Heltec v3`). Full enum mappings live in [src/lib/meshEnums.ts](src/lib/meshEnums.ts) — covers ~60 hardware models and all Role enum values.
 
 ### 📋 PKC encryption verification
 We surface "PKC capable" when a node has a public key, but don't yet **verify** that DMs to that node actually used PKC vs PSK fallback. The firmware sets a flag on inbound packets indicating which key was used. **📋 Deferred** — operationally low impact since the firmware handles the choice transparently.
 
 ---
 
+## Comm Matrix — ✅ rewritten
+
+The previous N×N matrix collapsed all broadcasts into one column, hardcoded "RELAY SCORE: HIGH", and was unusable at 134 nodes. Replaced with a filtered cross-tab:
+
+- **Time range filter**: Last 1h / 6h / 24h / All — defaults to 24h
+- **Top-N senders** (10 / 15 / 25 / 50, default 15) instead of every node
+- **Channels become real columns** (`#LongFast`, `#BH20Private`) — broadcasts are no longer hidden in `!ffffffff`. DMs appear as `@OPS`-style columns alongside, top-N most-DM'd by traffic
+- **Two color modes**:
+  - **Count**: emerald-intensity by traffic density (the old behavior)
+  - **Success**: emerald for ≥85% acked, amber for 50–85%, red for <50%, intensity scaled by total messages
+- **Real tooltip** with per-status breakdown (acked / sent-no-ack / pending / errored) and computed success rate — replaces the hardcoded "RELAY SCORE: HIGH" stub
+- **Sticky header + sticky sender column** so you can scroll a wide matrix without losing axis labels
+- **"X senders hidden / X DM peers hidden"** counter in the subtitle so you know when filtering trimmed real data
+- Computation moved out of `App.tsx` into the view itself (filter state lives where it's used)
+
+---
+
 ## Real-radio validation status
 
-Items that have been **field-tested** vs only **smoke-tested locally**:
+Items that have been **field-tested** against the operator's BroadH20 radio vs only **smoke-tested locally**. For each 🧪 item, a few minutes of real-mesh observation should confirm the parser correctly handles real packets.
 
 | Feature | Validated against | Confidence |
 |---|---|---|
@@ -120,9 +137,12 @@ Items that have been **field-tested** vs only **smoke-tested locally**:
 | Position source (GPS/fixed) | 🧪 Parser only | Medium |
 | Telemetry (battery/SNR/RSSI) | ✅ Real radio | High |
 | NodeInfo + public_key | ✅ Real radio | High |
+| User.role / hw_model / is_licensed | 🧪 Parser only | Medium |
+| MeshPacket.via_mqtt | 🧪 Parser only | Medium |
 | Traceroute request/response | 🧪 Send path only | Medium |
 | NeighborInfo ingest | 🧪 Parser tested with stubs | Medium |
 | NeighborInfo enable/disable admin write | 🧪 Packet builder validated | Medium |
+| NeighborInfo `get_module_config` readback | 🧪 Parser tested with stubs | Medium |
 | Store & Forward heartbeat parse | 🧪 Parser only | Medium |
 | Store & Forward CLIENT_HISTORY admin write | 🧪 Packet builder validated | Medium |
 | Waypoint broadcast | 🧪 Parser only | Medium |
@@ -131,7 +151,35 @@ Items that have been **field-tested** vs only **smoke-tested locally**:
 | Channel admin writes | ✅ Real radio | High |
 | QR contact URL (Meshtastic mobile compat) | 🧪 Encoder only | Medium |
 
-For each 🧪 item, a few minutes of real-mesh observation should confirm the parser correctly handles real packets.
+---
+
+## Node Groups — ✅ persistence + assignment UI shipped
+
+**Persistence**: new `groups` SQLite table; node `groupId` round-trips via the existing `raw_json` column. Seed simulator groups removed (groups now start empty for a fresh radio install).
+
+**API**: `GET / POST / PATCH / DELETE /api/mesh/groups` plus `POST /api/mesh/nodes/:id/group { groupId | null }`. All CRUD paths smoke-tested (creation with hex-color validation, update, delete-with-cascade-unassign, snapshot inclusion).
+
+**SSE**: new `groups` event channel fans out group changes to every connected client → multi-tab updates within ~250 ms.
+
+**UI**:
+- **Group create modal** now has a color picker (8 swatches + custom hex input), Enter-to-create, disabled-when-empty Save button. The previously-random HSL color is gone
+- **Sidebar** GroupItems show a delete × on hover (with a confirm dialog) for non-favorites/non-all groups
+- **NodePopup** has a Group dropdown above the action grid — assign / unassign in one click; matching color dot displayed when assigned
+- **Dashboard NODE_DETAILS** has the same Group dropdown right under the node title
+
+**Still deferred:**
+- Inline group rename — currently you'd delete and recreate. A double-click-to-edit on the GroupItem would close that gap
+
+**✅ Multi-select bulk-assign — done**
+- Per-row checkbox in the dashboard NODE_LIST table (subtle, brightens on hover)
+- Shift-click to extend a range to the destination row's new state
+- Header checkbox toggles select-all / clear-all
+- Floating action bar appears when ≥1 row is selected with `Move to group ▾` (dropdown of groups + Unassigned), `Star`, `Unstar`, and `Clear` actions
+- Bulk apply runs in parallel via `Promise.all` of the existing per-node API calls; loading spinner on the Move button while in flight
+- Selection auto-prunes when the visible filter changes (e.g. switching to a different group filter)
+
+**✅ Done in a follow-up round:**
+- Group color now overrides node coloring on **map markers** (Meshtastic-style labeled circles) AND **topology graph nodes** (ring + fill + label color). Color priority: assigned group > favorite > online > offline. Star icon on the popup still indicates favorite as a separate signal so neither is hidden
 
 ---
 
@@ -139,10 +187,14 @@ For each 🧪 item, a few minutes of real-mesh observation should confirm the pa
 
 | Item | Type | Notes |
 |---|---|---|
-| Bundle size | ⚠️ Partial | 1.08 MB total, ~140 KB of which is `emoji-picker-react`. Lazy-load via dynamic import would shrink initial load |
-| Settings → Modules section | 💡 Idea | Currently NeighborInfo is in the topology banner. Pulling all module config into a unified Settings tab would be more discoverable |
-| Topology zoom-to-fit | 💡 Idea | After layout settles, auto-fit the camera to all nodes. Would help with 100+ node meshes |
-| Topology layout persistence | 💡 Idea | Drag-positions reset on every refresh; could persist `fx/fy` in localStorage |
+| Bundle size | ⚠️ Partial | ~1.2 MB total; `emoji-picker-react` (~140 KB) and `recharts` (~120 KB) are the largest single contributors. Lazy-load either via dynamic import to shrink initial load |
+| Settings → Modules section | ✅ Done | Unified Settings modal hosts the module config UI (NeighborInfo first; expandable to others as admin write paths land) |
+| Settings hub consolidation | ✅ Done | Connection / Modules / Notifications / Display / Blocked / Data / AI all in one tabbed modal — replaces the previous 6-button rail |
+| Comm Matrix usability at scale | ✅ Done | Time filter + top-N + channels-as-columns + success-rate coloring + sticky axes — see "Comm Matrix" section above |
+| Per-node telemetry charts | ✅ Done | Three-tab (Signal · Power · Environment) chart in the dashboard NODE_DETAILS widget; auto-refreshes every 30 s |
+| Topology zoom-to-fit | ✅ Done | Auto-fits ~800 ms after layout settles; manual ⛶ button in the camera-controls cluster |
+| Topology layout persistence | ✅ Done | Drag-positions saved to `localStorage` (`mesh.topologyLayout`); restored before simulation runs. "Reset" button clears all pinned positions and re-runs the layout |
+| Group color on map + topology | ✅ Done | Assigned group's hex color overrides the default emerald/amber/slate ring + fill + label. Priority: group > favorite > online > offline |
 | Node tooltip hover | 💡 Idea | On topology, hover-tooltip with node info (currently you have to click) |
 | Mobile / responsive layout | 📋 Deferred | App works on desktop and tablet; phone screens will be cramped |
 | Dark/light theme toggle | 📋 Deferred | Currently dark only |
@@ -182,7 +234,7 @@ These haven't been requested but seem natural fits:
 
 - **Coverage heatmap** — combine Range Test + position data into a colored overlay on the map showing where reception is strong/weak
 - **Mesh playback** — scrub through historical events on a timeline, replay the mesh state at any point
-- **Per-node graphs** — RSSI/SNR/battery time-series for a single node (telemetry table is already populated, just needs a chart)
+- ~~**Per-node graphs** — RSSI/SNR/battery time-series for a single node~~ ✅ Done — three-tab chart (Signal · Power · Environment) inline in the NODE_DETAILS dashboard widget, auto-refreshes every 30 s, uses `recharts` (was already in deps but unused)
 - **Node ignore (firmware-level)** — combine block list with the firmware's actual ignore list for nodes that are spamming
 - **Channel sharing via QR** — the per-channel PSK + name URL format for sharing a whole channel config
 - **Camera scan for incoming contact QR** — currently we only generate QRs; can't read them in

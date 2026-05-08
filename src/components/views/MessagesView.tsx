@@ -421,9 +421,9 @@ export function MessagesView({
                     </div>
                   )}
 
-                  <div className="relative">
+                  <div className="relative max-w-[80%]">
                     <div className={cn(
-                      'px-4 py-2 rounded-2xl max-w-[80%] min-w-[3rem] text-sm break-words',
+                      'px-4 py-2 rounded-2xl text-sm break-words',
                       isOwn
                         ? 'bg-brand-accent text-black'
                         : 'bg-brand-line text-brand-ink',

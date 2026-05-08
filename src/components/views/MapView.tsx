@@ -7,6 +7,8 @@ import { MeshLinks } from '../ui/MeshLinks';
 import { TraceLinks } from '../ui/TraceLinks';
 import { WaypointEditorModal } from '../WaypointEditorModal';
 import { ContactQrModal } from '../ContactQrModal';
+import { roleLabel, hardwareLabel, ROLE_SHORT } from '../../lib/meshEnums';
+import { hexToRgba } from '../../lib/color';
 
 interface MapViewProps {
   nodes: Node[];
@@ -26,6 +28,7 @@ interface MapViewProps {
   onUnblockNode: (id: string) => void;
   onRequestStoreForwardHistory: (routerId: string, minutes: number) => Promise<{ ok: boolean; error?: string }>;
   onToggleFavorite: (nodeId: string, favorite: boolean) => Promise<void> | void;
+  onAssignGroup: (nodeId: string, groupId: string | undefined) => Promise<void> | void;
   localNodeId: string | null;
   dataSource: 'live' | 'simulator';
   onSaveWaypoint: (input: {
@@ -89,6 +92,8 @@ function NodePopup({
   onRequestHistory,
   unitSystem,
   canTrace,
+  groups,
+  onAssignGroup,
 }: {
   node: Node;
   nodes: Node[];
@@ -106,6 +111,8 @@ function NodePopup({
   onRequestHistory: (routerId: string, minutes: number) => Promise<{ ok: boolean; error?: string }>;
   unitSystem: UnitSystem;
   canTrace: boolean;
+  groups: Group[];
+  onAssignGroup: (nodeId: string, groupId: string | undefined) => void;
 }) {
   const rssi = node.telemetry?.rssi;
   const snr = node.telemetry?.snr;
@@ -205,8 +212,37 @@ function NodePopup({
                 S&amp;F
               </span>
             )}
+            {node.role !== undefined && node.role !== 0 && ROLE_SHORT[node.role] && (
+              <span
+                className="text-[9px] font-bold mono-text text-slate-300 bg-slate-700/50 border border-slate-600 px-1 py-0.5 rounded flex-shrink-0"
+                title={`Role: ${roleLabel(node.role) ?? 'Unknown'}`}
+              >
+                {ROLE_SHORT[node.role]}
+              </span>
+            )}
+            {node.isLicensed && (
+              <span
+                className="text-[9px] font-bold mono-text text-blue-300 bg-blue-500/10 border border-blue-500/30 px-1 py-0.5 rounded flex-shrink-0"
+                title="Operator has identified as a licensed amateur radio operator"
+              >
+                LIC
+              </span>
+            )}
+            {node.lastVia === 'mqtt' && (
+              <span
+                className="text-[9px] font-bold mono-text text-cyan-300 bg-cyan-500/10 border border-cyan-500/30 px-1 py-0.5 rounded flex-shrink-0"
+                title="Last seen via MQTT bridge — not a direct LoRa peer"
+              >
+                MQTT
+              </span>
+            )}
           </div>
-          <p className="text-[9px] mono-text text-slate-400 mt-0.5">{node.id}</p>
+          <p className="text-[9px] mono-text text-slate-400 mt-0.5">
+            {node.id}
+            {hardwareLabel(node.hwModel) && (
+              <span className="text-slate-500"> · {hardwareLabel(node.hwModel)}</span>
+            )}
+          </p>
         </div>
         <div className="flex items-start gap-1 flex-shrink-0 ml-1 mt-0.5">
           <button
@@ -471,6 +507,29 @@ function NodePopup({
         </div>
       )}
 
+      {/* Group assignment */}
+      {groups.length > 0 && (
+        <div className="mb-2 flex items-center gap-2">
+          <span className="text-[9px] uppercase font-bold text-slate-400 flex-shrink-0">Group</span>
+          <select
+            value={node.groupId ?? ''}
+            onChange={(e) => onAssignGroup(node.id, e.target.value || undefined)}
+            className="flex-1 bg-slate-800 border border-slate-700 rounded text-[11px] mono-text text-slate-200 px-1.5 py-0.5 focus:outline-none focus:border-emerald-500/50"
+          >
+            <option value="">— Unassigned —</option>
+            {groups.map(g => (
+              <option key={g.id} value={g.id}>{g.name}</option>
+            ))}
+          </select>
+          {node.groupId && (
+            <span
+              className="w-2 h-2 rounded-full flex-shrink-0"
+              style={{ backgroundColor: groups.find(g => g.id === node.groupId)?.color ?? 'transparent' }}
+            />
+          )}
+        </div>
+      )}
+
       {/* Blocked banner */}
       {isBlocked && (
         <div className="mb-2 flex items-center gap-2 bg-red-500/10 border border-red-500/30 rounded p-2">
@@ -647,6 +706,7 @@ export function MapView({
   onUnblockNode,
   onRequestStoreForwardHistory,
   onToggleFavorite,
+  onAssignGroup,
 }: MapViewProps) {
   const positioned = nodes.filter(n => n.position);
   const [popupNodeId, setPopupNodeId] = React.useState<string | null>(null);
@@ -803,17 +863,22 @@ export function MapView({
             // the marker so each node is identifiable at a glance, no popup needed.
             const label = node.shortName || node.id.slice(-4).toUpperCase();
             const isOpen = popupNodeId === node.id;
-            const ringColor = node.favorite
-              ? 'rgba(245, 158, 11, 0.95)'      // amber for favorites
-              : node.online
-                ? 'rgba(16, 185, 129, 0.95)'    // emerald for active
-                : 'rgba(100, 116, 139, 0.85)';  // slate for offline
-            const fillColor = node.favorite
-              ? 'rgba(245, 158, 11, 0.18)'
-              : node.online
-                ? 'rgba(16, 185, 129, 0.18)'
-                : 'rgba(30, 41, 59, 0.85)';
-            const textColor = node.favorite ? '#fbbf24' : node.online ? '#34d399' : '#cbd5e1';
+
+            // Color priority: assigned group > favorite > online > offline.
+            // Operators with groups defined want to see their groupings at a glance;
+            // the favorite star icon (rendered separately) carries the favorite signal.
+            const group = node.groupId ? groups.find(g => g.id === node.groupId) : undefined;
+            const groupRing = group ? hexToRgba(group.color, 0.95) : null;
+            const groupFill = group ? hexToRgba(group.color, 0.18) : null;
+            const ringColor = groupRing
+              ?? (node.favorite ? 'rgba(245, 158, 11, 0.95)'      // amber for favorites
+              :   node.online   ? 'rgba(16, 185, 129, 0.95)'      // emerald for active
+              :                   'rgba(100, 116, 139, 0.85)');   // slate for offline
+            const fillColor = groupFill
+              ?? (node.favorite ? 'rgba(245, 158, 11, 0.18)'
+              :   node.online   ? 'rgba(16, 185, 129, 0.18)'
+              :                   'rgba(30, 41, 59, 0.85)');
+            const textColor = group?.color ?? (node.favorite ? '#fbbf24' : node.online ? '#34d399' : '#cbd5e1');
 
             return (
               <Overlay key={node.id} anchor={[node.position!.lat, node.position!.lng]} offset={[18, 18]}>
@@ -892,6 +957,8 @@ export function MapView({
                 onRequestHistory={onRequestStoreForwardHistory}
                 canTrace={dataSource === 'live'}
                 unitSystem={unitSystem}
+                groups={groups}
+                onAssignGroup={onAssignGroup}
               />
             </Overlay>
           )}

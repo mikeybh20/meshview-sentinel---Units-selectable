@@ -15,6 +15,7 @@ import type {
   MeshEvent,
   MeshChannel,
   MeshWaypoint,
+  MeshGroup,
   NeighborInfoSnapshot,
   MeshStoreForwardRouter,
   ChannelRole,
@@ -173,6 +174,13 @@ export class MeshDatabase {
       );
 
       CREATE INDEX IF NOT EXISTS idx_sf_routers_last_heartbeat ON store_forward_routers(last_heartbeat DESC);
+
+      CREATE TABLE IF NOT EXISTS groups (
+        id         TEXT PRIMARY KEY,
+        name       TEXT NOT NULL,
+        color      TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
     `);
 
     // Additive migrations for older DBs. SQLite throws if the column already
@@ -355,6 +363,30 @@ export class MeshDatabase {
       neighbors: safeParse<NeighborInfoSnapshot['neighbors']>(r.neighbors_json) ?? [],
       lastSeen: r.last_seen,
     }));
+  }
+
+  // ---------------------------------------------------------------------
+  // Groups (operator-defined node tags)
+  // ---------------------------------------------------------------------
+  upsertGroup(g: MeshGroup) {
+    this.db.prepare(`
+      INSERT INTO groups (id, name, color, created_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        name  = excluded.name,
+        color = excluded.color
+    `).run(g.id, g.name, g.color, g.createdAt);
+  }
+
+  deleteGroup(id: string) {
+    this.db.prepare(`DELETE FROM groups WHERE id = ?`).run(id);
+  }
+
+  loadGroups(): MeshGroup[] {
+    const rows = this.db.prepare(`
+      SELECT id, name, color, created_at FROM groups ORDER BY created_at ASC
+    `).all() as Array<{ id: string; name: string; color: string; created_at: number }>;
+    return rows.map(r => ({ id: r.id, name: r.name, color: r.color, createdAt: r.created_at }));
   }
 
   // ---------------------------------------------------------------------

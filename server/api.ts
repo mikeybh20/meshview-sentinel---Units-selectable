@@ -254,6 +254,65 @@ app.get('/api/mesh/nodes', (_req, res) => {
   return res.json(meshBridge.getNodes());
 });
 
+// Node groups (operator-defined organizational tags)
+app.get('/api/mesh/groups', (_req, res) => {
+  return res.json(meshBridge.getGroups());
+});
+
+app.post('/api/mesh/groups', (req, res) => {
+  const { name, color } = req.body ?? {};
+  if (typeof name !== 'string' || !name.trim()) {
+    return res.status(400).json({ error: 'name is required' });
+  }
+  if (typeof color !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(color)) {
+    return res.status(400).json({ error: 'color must be a 6-digit hex like #10b981' });
+  }
+  try {
+    const group = meshBridge.createGroup(name, color);
+    broadcastGroupsChanged();
+    return res.json({ ok: true, group });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/mesh/groups/:id', (req, res) => {
+  const { name, color } = req.body ?? {};
+  if (color !== undefined && !/^#[0-9a-fA-F]{6}$/.test(color)) {
+    return res.status(400).json({ error: 'color must be a 6-digit hex like #10b981' });
+  }
+  try {
+    const group = meshBridge.updateGroup(req.params.id, { name, color });
+    if (!group) return res.status(404).json({ error: 'Group not found' });
+    broadcastGroupsChanged();
+    return res.json({ ok: true, group });
+  } catch (err: any) {
+    return res.status(400).json({ error: err.message });
+  }
+});
+
+app.delete('/api/mesh/groups/:id', (req, res) => {
+  const ok = meshBridge.deleteGroup(req.params.id);
+  if (!ok) return res.status(404).json({ error: 'Group not found' });
+  broadcastGroupsChanged();
+  return res.json({ ok: true });
+});
+
+// Assign / unassign a node to a group (body: { groupId: string | null })
+app.post('/api/mesh/nodes/:id/group', (req, res) => {
+  const { groupId } = req.body ?? {};
+  if (groupId !== null && groupId !== undefined && typeof groupId !== 'string') {
+    return res.status(400).json({ error: 'groupId must be a string or null' });
+  }
+  if (!req.params.id.startsWith('!')) {
+    return res.status(400).json({ error: 'id must be a !hex node id' });
+  }
+  const ok = meshBridge.setNodeGroup(req.params.id, groupId ?? null);
+  if (!ok) return res.status(404).json({ error: 'Node or group not found' });
+  // Node-update event already fans out via the existing 'node' SSE channel
+  return res.json({ ok: true });
+});
+
 // Toggle favorite flag (purely a client-side preference; no radio packet)
 app.post('/api/mesh/nodes/:id/favorite', (req, res) => {
   const id = req.params.id;
@@ -263,6 +322,15 @@ app.post('/api/mesh/nodes/:id/favorite', (req, res) => {
   if (!ok) return res.status(404).json({ error: 'Node not found' });
   return res.json({ ok: true, id, favorite });
 });
+
+// Group create/update/delete + node assignment all use the same fanOut
+// channel so other clients re-poll and see the change instantly.
+const broadcastGroupsChanged = () => {
+  const payload = `event: groups\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`;
+  for (const send of sseClients) {
+    try { send(payload); } catch { /* client gone */ }
+  }
+};
 
 // All messages received by the radio
 app.get('/api/mesh/messages', (_req, res) => {
@@ -298,6 +366,7 @@ app.get('/api/mesh/snapshot', (_req, res) => {
     neighborInfo: meshBridge.getNeighborInfo(),
     storeForwardRouters: meshBridge.getStoreForwardRouters(),
     localModuleConfig: meshBridge.getLocalModuleConfig(),
+    groups: meshBridge.getGroups(),
     radioConnected: meshBridge.connected,
     localNodeId: meshBridge.getLocalNodeId(),
   });

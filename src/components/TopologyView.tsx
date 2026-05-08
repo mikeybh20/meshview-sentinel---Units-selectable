@@ -1,8 +1,40 @@
 import React from 'react';
 import * as d3 from 'd3';
-import { Node as MeshNode, NeighborInfoSnapshot, NeighborInfoModuleConfig } from '../types';
+import { Node as MeshNode, NeighborInfoSnapshot, NeighborInfoModuleConfig, Group } from '../types';
 import { cn } from '../lib/utils';
-import { Search } from 'lucide-react';
+import { Search, Maximize2 } from 'lucide-react';
+import { hexToRgba } from '../lib/color';
+
+/** localStorage key prefix for persisting drag positions per node id. */
+const TOPOLOGY_LAYOUT_STORAGE_KEY = 'mesh.topologyLayout';
+
+interface PersistedLayout { [nodeId: string]: { x: number; y: number } }
+
+function loadLayout(): PersistedLayout {
+  try {
+    const raw = localStorage.getItem(TOPOLOGY_LAYOUT_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object') return parsed as PersistedLayout;
+  } catch { /* ignore */ }
+  return {};
+}
+
+function saveLayoutEntry(nodeId: string, x: number, y: number) {
+  try {
+    const layout = loadLayout();
+    layout[nodeId] = { x, y };
+    localStorage.setItem(TOPOLOGY_LAYOUT_STORAGE_KEY, JSON.stringify(layout));
+  } catch { /* private mode etc. */ }
+}
+
+function clearLayoutEntry(nodeId: string) {
+  try {
+    const layout = loadLayout();
+    delete layout[nodeId];
+    localStorage.setItem(TOPOLOGY_LAYOUT_STORAGE_KEY, JSON.stringify(layout));
+  } catch { /* ignore */ }
+}
 
 interface Node extends d3.SimulationNodeDatum {
   id: string;
@@ -11,6 +43,8 @@ interface Node extends d3.SimulationNodeDatum {
   online: boolean;
   isHomeBase: boolean;
   favorite: boolean;
+  /** Group color (hex like '#10b981') if the node is assigned to a group. */
+  groupColor?: string;
 }
 
 interface Link extends d3.SimulationLinkDatum<Node> {
@@ -25,6 +59,7 @@ interface Link extends d3.SimulationLinkDatum<Node> {
 interface TopologyViewProps {
   nodes: MeshNode[];
   neighborInfo?: NeighborInfoSnapshot[];
+  groups?: Group[];
   localNodeId?: string | null;
   /** Whether a real radio is connected (vs simulator). Controls availability of admin actions. */
   canConfigureRadio?: boolean;
@@ -38,6 +73,7 @@ interface TopologyViewProps {
 export function TopologyView({
   nodes,
   neighborInfo = [],
+  groups = [],
   localNodeId,
   canConfigureRadio = false,
   neighborInfoConfig,
@@ -71,12 +107,13 @@ export function TopologyView({
   // simulation, otherwise all node positions get recomputed and the focus
   // zoom can't find the just-clicked node.
   const topologyKey = React.useMemo(() => {
-    const nodeKey = nodes.map(n => `${n.id}:${n.online ? '1' : '0'}`).sort().join('|');
+    const nodeKey = nodes.map(n => `${n.id}:${n.online ? '1' : '0'}:${n.groupId ?? ''}`).sort().join('|');
     const neighborKey = neighborInfo.map(ni =>
       `${ni.fromNodeId}>${ni.neighbors.map(x => x.nodeId).sort().join(',')}`
     ).sort().join('|');
-    return `${nodeKey}#${neighborKey}#${homeBaseId}#${isFocusMode ? '1' : '0'}#${isFocusMode ? focusedNodeId ?? '' : ''}`;
-  }, [nodes, neighborInfo, homeBaseId, isFocusMode, focusedNodeId]);
+    const groupKey = groups.map(g => `${g.id}:${g.color}`).sort().join('|');
+    return `${nodeKey}#${neighborKey}#${groupKey}#${homeBaseId}#${isFocusMode ? '1' : '0'}#${isFocusMode ? focusedNodeId ?? '' : ''}`;
+  }, [nodes, neighborInfo, groups, homeBaseId, isFocusMode, focusedNodeId]);
 
   const graphData = React.useMemo(() => {
     let activeNodes = nodes;
@@ -138,6 +175,7 @@ export function TopologyView({
       return activeIds.has(s) && activeIds.has(t);
     });
 
+    const groupById = new Map(groups.map(g => [g.id, g]));
     const d3Nodes: Node[] = activeNodes.map(n => ({
       id: n.id,
       label: n.shortName || n.id.slice(-4).toUpperCase(),
@@ -145,6 +183,7 @@ export function TopologyView({
       online: n.online,
       isHomeBase: n.id === homeBaseId,
       favorite: n.favorite,
+      groupColor: n.groupId ? groupById.get(n.groupId)?.color : undefined,
     }));
 
     return { nodes: d3Nodes, links: filteredEdges };
@@ -169,6 +208,19 @@ export function TopologyView({
 
     svg.call(zoom);
     zoomBehaviorRef.current = zoom;
+
+    // Restore any persisted drag positions before the simulation starts so
+    // operators don't have to re-arrange the graph on every page load.
+    const savedLayout = loadLayout();
+    for (const n of graphData.nodes) {
+      const saved = savedLayout[n.id];
+      if (saved) {
+        n.x = saved.x;
+        n.y = saved.y;
+        n.fx = saved.x;
+        n.fy = saved.y;
+      }
+    }
 
     const simulation = d3.forceSimulation<Node>(graphData.nodes)
       .force('link', d3.forceLink<Node, Link>(graphData.links).id(d => d.id).distance(140).strength(0.6))
@@ -238,19 +290,42 @@ export function TopologyView({
         .on('drag', (event, d: any) => { d.fx = event.x; d.fy = event.y; })
         .on('end', (event, d: any) => {
           if (!event.active) simulation.alphaTarget(0);
-          d.fx = null; d.fy = null;
+          // Pin the node where the operator dropped it (don't release fx/fy
+          // back to null) and persist so the layout survives reloads.
+          if (typeof d.fx === 'number' && typeof d.fy === 'number') {
+            saveLayoutEntry(d.id, d.fx, d.fy);
+          }
         }) as any);
+
+    // Color resolution helpers — group color overrides favorite which overrides online/offline.
+    const ringStroke = (d: Node): string => {
+      if (d.groupColor) return d.groupColor;
+      if (d.isHomeBase) return '#10b981';
+      if (d.favorite) return '#f59e0b';
+      if (d.online) return '#10b981';
+      return '#64748b';
+    };
+    const fillRgba = (d: Node): string => {
+      if (d.groupColor) return hexToRgba(d.groupColor, 0.18) ?? 'rgba(16,185,129,0.18)';
+      if (d.isHomeBase) return 'rgba(16,185,129,0.25)';
+      if (d.favorite) return 'rgba(245,158,11,0.18)';
+      if (d.online) return 'rgba(16,185,129,0.18)';
+      return 'rgba(30,41,59,0.85)';
+    };
+    const labelFill = (d: Node): string => {
+      if (d.groupColor) return d.groupColor;
+      if (d.isHomeBase) return '#34d399';
+      if (d.favorite) return '#fbbf24';
+      if (d.online) return '#34d399';
+      return '#cbd5e1';
+    };
 
     // Outer glow ring
     node.append('circle')
       .attr('class', 'glow-ring')
       .attr('r', (d: any) => d.isHomeBase ? 26 : 20)
       .attr('fill', 'none')
-      .attr('stroke', (d: any) =>
-        d.isHomeBase ? '#10b981'
-        : d.favorite ? '#f59e0b'
-        : d.online ? '#10b981'
-        : '#64748b')
+      .attr('stroke', (d: any) => ringStroke(d))
       .attr('stroke-width', 2)
       .attr('stroke-opacity', 0.55);
 
@@ -258,16 +333,8 @@ export function TopologyView({
     node.append('circle')
       .attr('class', 'inner-dot')
       .attr('r', (d: any) => d.isHomeBase ? 22 : 16)
-      .attr('fill', (d: any) =>
-        d.isHomeBase ? 'rgba(16,185,129,0.25)'
-        : d.favorite ? 'rgba(245,158,11,0.18)'
-        : d.online ? 'rgba(16,185,129,0.18)'
-        : 'rgba(30,41,59,0.85)')
-      .attr('stroke', (d: any) =>
-        d.isHomeBase ? '#10b981'
-        : d.favorite ? '#f59e0b'
-        : d.online ? '#10b981'
-        : '#475569')
+      .attr('fill', (d: any) => fillRgba(d))
+      .attr('stroke', (d: any) => ringStroke(d))
       .attr('stroke-width', 2);
 
     // In-circle short-name label (Meshtastic-style)
@@ -282,11 +349,7 @@ export function TopologyView({
         if (d.isHomeBase) return len <= 2 ? '14px' : len <= 3 ? '12px' : '10px';
         return len <= 2 ? '12px' : len <= 3 ? '10px' : '8px';
       })
-      .attr('fill', (d: any) =>
-        d.isHomeBase ? '#34d399'
-        : d.favorite ? '#fbbf24'
-        : d.online ? '#34d399'
-        : '#cbd5e1')
+      .attr('fill', (d: any) => labelFill(d))
       .attr('pointer-events', 'none')
       .text((d: any) => d.label);
 
@@ -320,8 +383,69 @@ export function TopologyView({
       node.attr('transform', (d: any) => `translate(${d.x},${d.y})`);
     });
 
-    return () => { simulation.stop(); };
+    // Auto fit-to-view once the simulation settles enough to have stable
+    // positions. We fire after a short delay (~600ms) to let the layout
+    // breathe; if the operator already moved the camera, we skip.
+    let didAutoFit = false;
+    const autoFitTimer = setTimeout(() => {
+      if (didAutoFit) return;
+      didAutoFit = true;
+      fitToView();
+    }, 800);
+
+    return () => {
+      clearTimeout(autoFitTimer);
+      simulation.stop();
+    };
   }, [graphData]);
+
+  /**
+   * Frame the camera so all nodes are visible with a comfortable margin.
+   * Computes the bounding box from live D3 data (node.x/.y) so it works
+   * regardless of where the simulation has settled.
+   */
+  const fitToView = React.useCallback(() => {
+    const sel = nodeSelRef.current;
+    const svgEl = svgRef.current;
+    const zoom = zoomBehaviorRef.current;
+    if (!sel || !svgEl || !zoom) return;
+
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    sel.each((d: any) => {
+      if (typeof d.x !== 'number' || typeof d.y !== 'number') return;
+      if (d.x < minX) minX = d.x;
+      if (d.y < minY) minY = d.y;
+      if (d.x > maxX) maxX = d.x;
+      if (d.y > maxY) maxY = d.y;
+    });
+    if (!isFinite(minX) || !isFinite(maxX)) return;
+
+    const w = svgEl.clientWidth;
+    const h = svgEl.clientHeight;
+    const padding = 60;
+    const dx = Math.max(1, maxX - minX);
+    const dy = Math.max(1, maxY - minY);
+    const scale = Math.max(0.1, Math.min(1.5, Math.min((w - 2 * padding) / dx, (h - 2 * padding) / dy)));
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+
+    d3.select(svgEl).transition().duration(500).call(
+      zoom.transform,
+      d3.zoomIdentity.translate(w / 2, h / 2).scale(scale).translate(-cx, -cy),
+    );
+  }, []);
+
+  /** Clear all persisted drag positions and re-trigger the layout. */
+  const resetLayout = React.useCallback(() => {
+    try { localStorage.removeItem(TOPOLOGY_LAYOUT_STORAGE_KEY); } catch { /* ignore */ }
+    // Unpin every live node and let the simulation re-layout naturally
+    const sel = nodeSelRef.current;
+    if (sel) {
+      sel.each((d: any) => { d.fx = null; d.fy = null; });
+    }
+    // Trigger a fit after layout settles
+    setTimeout(() => fitToView(), 1000);
+  }, [fitToView]);
 
   // Lightweight visual update on hover/focus — no simulation rebuild
   React.useEffect(() => {
@@ -405,6 +529,28 @@ export function TopologyView({
   return (
     <div className="w-full h-full relative overflow-hidden bg-brand-bg/20 rounded-xl border border-brand-line">
       <svg ref={svgRef} className="w-full h-full" />
+
+      {/* Camera controls — fit-to-view + reset layout */}
+      <div className="absolute top-4 right-72 z-10 flex items-center gap-1 pointer-events-auto">
+        <button
+          onClick={fitToView}
+          title="Fit all nodes in view"
+          className="bg-brand-bg/80 backdrop-blur-md border border-brand-line hover:border-brand-accent text-brand-muted hover:text-brand-accent rounded px-2 py-2 transition-colors"
+        >
+          <Maximize2 size={13} />
+        </button>
+        <button
+          onClick={() => {
+            if (confirm('Reset all dragged node positions and re-run the layout?')) {
+              resetLayout();
+            }
+          }}
+          title="Reset saved layout (clears all pinned positions)"
+          className="bg-brand-bg/80 backdrop-blur-md border border-brand-line hover:border-brand-accent text-brand-muted hover:text-brand-accent rounded px-2 py-2 text-[10px] mono-text uppercase font-bold transition-colors"
+        >
+          Reset
+        </button>
+      </div>
 
       {/* Search Bar */}
       <div className="absolute top-4 right-4 z-10 w-64">
