@@ -102,7 +102,7 @@ This project is licensed under the [MIT License](LICENSE) — free for personal 
 
 ## Disclaimer
 
-**meshview-sentinel is the personal open-source work of Michael Broadwater. It is not a product, project, or work-for-hire of Government Acquisitions, Inc. or any of its affiliates.** No employer time, resources, intellectual property, trademarks, or proprietary information were used in its development. The opinions, code, and design choices expressed here are mine alone and do not reflect those of any current or former employer.
+**meshview-sentinel is the personal open-source work of Kit Kim and Michael Broadwater. It is not a product, project, or work-for-hire of Government Acquisitions, Inc. or any of its affiliates.** No employer time, resources, intellectual property, trademarks, or proprietary information were used in its development. The opinions, code, and design choices expressed here are ours alone and do not reflect those of any current or former employer.
 
 Meshtastic® is a registered trademark of Meshtastic LLC. This project is not affiliated with, endorsed by, or sponsored by Meshtastic LLC. It is an independent third-party tool that interoperates with the Meshtastic open firmware and protocol.
 
