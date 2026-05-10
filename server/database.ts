@@ -16,6 +16,7 @@ import type {
   MeshChannel,
   MeshWaypoint,
   MeshGroup,
+  MeshTraceResult,
   NeighborInfoSnapshot,
   MeshStoreForwardRouter,
   ChannelRole,
@@ -181,6 +182,54 @@ export class MeshDatabase {
         color      TEXT NOT NULL,
         created_at INTEGER NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS trace_results (
+        id            TEXT PRIMARY KEY,
+        target_id     TEXT NOT NULL,
+        started_at    INTEGER NOT NULL,
+        completed_at  INTEGER,
+        status        TEXT NOT NULL,
+        route_json    TEXT NOT NULL,
+        route_back_json TEXT NOT NULL,
+        error_message TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_trace_results_started_at ON trace_results(started_at DESC);
+
+      CREATE TABLE IF NOT EXISTS range_test_observations (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender_id   TEXT NOT NULL,
+        sender_lat  REAL,
+        sender_lng  REAL,
+        seq         INTEGER,
+        snr         REAL,
+        rssi        REAL,
+        text        TEXT,
+        timestamp   INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_rtobs_timestamp ON range_test_observations(timestamp DESC);
+      CREATE INDEX IF NOT EXISTS idx_rtobs_sender ON range_test_observations(sender_id, timestamp DESC);
+
+      CREATE TABLE IF NOT EXISTS blocked_nodes (
+        node_id    TEXT PRIMARY KEY,
+        blocked_at INTEGER NOT NULL
+      );
+
+      -- Per-node online/offline session history. One row per online window:
+      -- online_at fires when we observe traffic from a previously-stale node;
+      -- offline_at fires when the staleness check trips. Used to compute uptime
+      -- %, average session length, and peak-hours-online for relay scheduling
+      -- (Route Intel) and for the Dashboard's per-node uptime widget.
+      CREATE TABLE IF NOT EXISTS node_sessions (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        node_id     TEXT NOT NULL,
+        online_at   INTEGER NOT NULL,
+        offline_at  INTEGER
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_node_sessions_node_id ON node_sessions(node_id, online_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_node_sessions_open ON node_sessions(node_id) WHERE offline_at IS NULL;
     `);
 
     // Additive migrations for older DBs. SQLite throws if the column already
@@ -199,6 +248,8 @@ export class MeshDatabase {
     addColumnIfMissing('messages', 'packet_id INTEGER');
     addColumnIfMissing('messages', 'reply_to INTEGER');
     addColumnIfMissing('messages', 'is_reaction INTEGER NOT NULL DEFAULT 0');
+    addColumnIfMissing('messages', 'delivery_ms INTEGER');
+    addColumnIfMissing('channels', 'position_precision INTEGER');
 
     // FTS5 full-text search index over messages.text. We use external content
     // (the `messages` table is the canonical source) and triggers to keep them
@@ -390,6 +441,299 @@ export class MeshDatabase {
   }
 
   // ---------------------------------------------------------------------
+  // Traceroute results (history survives restart)
+  // ---------------------------------------------------------------------
+  upsertTraceResult(t: MeshTraceResult) {
+    this.db.prepare(`
+      INSERT INTO trace_results (id, target_id, started_at, completed_at, status, route_json, route_back_json, error_message)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        completed_at    = excluded.completed_at,
+        status          = excluded.status,
+        route_json      = excluded.route_json,
+        route_back_json = excluded.route_back_json,
+        error_message   = excluded.error_message
+    `).run(
+      t.id,
+      t.targetId,
+      t.startedAt,
+      t.completedAt ?? null,
+      t.status,
+      JSON.stringify(t.route),
+      JSON.stringify(t.routeBack),
+      t.errorMessage ?? null,
+    );
+    this.pruneTraceResults();
+  }
+
+  loadTraceResults(limit = 200): MeshTraceResult[] {
+    const rows = this.db.prepare(`
+      SELECT id, target_id, started_at, completed_at, status, route_json, route_back_json, error_message
+      FROM trace_results
+      ORDER BY started_at DESC
+      LIMIT ?
+    `).all(limit) as Array<{
+      id: string; target_id: string; started_at: number; completed_at: number | null;
+      status: string; route_json: string; route_back_json: string; error_message: string | null;
+    }>;
+    return rows.map(r => ({
+      id: r.id,
+      targetId: r.target_id,
+      startedAt: r.started_at,
+      completedAt: r.completed_at ?? undefined,
+      status: r.status as MeshTraceResult['status'],
+      route: safeParse<MeshTraceResult['route']>(r.route_json) ?? [],
+      routeBack: safeParse<MeshTraceResult['routeBack']>(r.route_back_json) ?? [],
+      errorMessage: r.error_message ?? undefined,
+    }));
+  }
+
+  /** Keep at most the most recent 500 traces to bound the table. */
+  private pruneTraceResults() {
+    this.db.exec(`
+      DELETE FROM trace_results
+      WHERE id IN (
+        SELECT id FROM trace_results
+        ORDER BY started_at DESC
+        LIMIT -1 OFFSET 500
+      )
+    `);
+  }
+
+  // ---------------------------------------------------------------------
+  // Range Test observations (coverage map data)
+  // ---------------------------------------------------------------------
+  insertRangeTestObservation(obs: {
+    senderId: string;
+    senderLat?: number | null;
+    senderLng?: number | null;
+    seq?: number | null;
+    snr?: number | null;
+    rssi?: number | null;
+    text?: string | null;
+    timestamp: number;
+  }) {
+    this.db.prepare(`
+      INSERT INTO range_test_observations
+        (sender_id, sender_lat, sender_lng, seq, snr, rssi, text, timestamp)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      obs.senderId,
+      obs.senderLat ?? null,
+      obs.senderLng ?? null,
+      obs.seq ?? null,
+      obs.snr ?? null,
+      obs.rssi ?? null,
+      obs.text ?? null,
+      obs.timestamp,
+    );
+    this.pruneRangeTestObservations();
+  }
+
+  /** Return raw observations from the most recent `windowMs` window. */
+  getRangeTestObservations(windowMs?: number, limit = 5000): Array<{
+    id: number;
+    senderId: string;
+    senderLat: number | null;
+    senderLng: number | null;
+    seq: number | null;
+    snr: number | null;
+    rssi: number | null;
+    text: string | null;
+    timestamp: number;
+  }> {
+    const sql = windowMs && windowMs > 0
+      ? `SELECT * FROM range_test_observations WHERE timestamp >= ? ORDER BY timestamp DESC LIMIT ?`
+      : `SELECT * FROM range_test_observations ORDER BY timestamp DESC LIMIT ?`;
+    const params: any[] = windowMs && windowMs > 0
+      ? [Date.now() - windowMs, limit]
+      : [limit];
+    const rows = this.db.prepare(sql).all(...params) as Array<{
+      id: number; sender_id: string; sender_lat: number | null; sender_lng: number | null;
+      seq: number | null; snr: number | null; rssi: number | null; text: string | null;
+      timestamp: number;
+    }>;
+    return rows.map(r => ({
+      id: r.id,
+      senderId: r.sender_id,
+      senderLat: r.sender_lat,
+      senderLng: r.sender_lng,
+      seq: r.seq,
+      snr: r.snr,
+      rssi: r.rssi,
+      text: r.text,
+      timestamp: r.timestamp,
+    }));
+  }
+
+  /** Bound the table to the most recent 5000 observations. */
+  private pruneRangeTestObservations() {
+    this.db.exec(`
+      DELETE FROM range_test_observations
+      WHERE id IN (
+        SELECT id FROM range_test_observations
+        ORDER BY timestamp DESC
+        LIMIT -1 OFFSET 5000
+      )
+    `);
+  }
+
+  // ---------------------------------------------------------------------
+  // Blocked nodes (server-side block list — visible to every client)
+  // ---------------------------------------------------------------------
+  loadBlockedNodes(): string[] {
+    const rows = this.db.prepare(`
+      SELECT node_id FROM blocked_nodes ORDER BY blocked_at ASC
+    `).all() as Array<{ node_id: string }>;
+    return rows.map(r => r.node_id);
+  }
+
+  addBlockedNode(nodeId: string): boolean {
+    const result = this.db.prepare(`
+      INSERT OR IGNORE INTO blocked_nodes (node_id, blocked_at)
+      VALUES (?, ?)
+    `).run(nodeId, Date.now());
+    return Number((result as any).changes ?? 0) > 0;
+  }
+
+  removeBlockedNode(nodeId: string): boolean {
+    const result = this.db.prepare(`
+      DELETE FROM blocked_nodes WHERE node_id = ?
+    `).run(nodeId);
+    return Number((result as any).changes ?? 0) > 0;
+  }
+
+  // ---------------------------------------------------------------------
+  // Node sessions (online/offline transition history)
+  // ---------------------------------------------------------------------
+
+  /**
+   * Record that we just observed a node go online. If there's already an open
+   * session (offline_at IS NULL) for this node, this is a no-op so we don't
+   * generate spurious overlapping sessions on duplicate "online" events.
+   */
+  openNodeSession(nodeId: string, onlineAt: number): void {
+    const existingOpen = this.db.prepare(`
+      SELECT id FROM node_sessions WHERE node_id = ? AND offline_at IS NULL LIMIT 1
+    `).get(nodeId);
+    if (existingOpen) return;
+    this.db.prepare(`
+      INSERT INTO node_sessions (node_id, online_at) VALUES (?, ?)
+    `).run(nodeId, onlineAt);
+  }
+
+  /**
+   * Close the most-recently-opened still-open session for this node by setting
+   * offline_at. No-op if no open session exists (e.g. server restart while node
+   * was already offline).
+   */
+  closeNodeSession(nodeId: string, offlineAt: number): void {
+    this.db.prepare(`
+      UPDATE node_sessions
+         SET offline_at = ?
+       WHERE id = (SELECT id FROM node_sessions WHERE node_id = ? AND offline_at IS NULL ORDER BY online_at DESC LIMIT 1)
+    `).run(offlineAt, nodeId);
+  }
+
+  /**
+   * Sessions for a single node within the given time window (epoch ms cutoff).
+   * Sessions that overlap the cutoff are returned with their original
+   * online_at — the caller is expected to clamp display ranges as needed.
+   */
+  getNodeSessions(nodeId: string, sinceMs?: number, limit = 1000): Array<{ onlineAt: number; offlineAt: number | null }> {
+    const since = sinceMs ?? 0;
+    const rows = this.db.prepare(`
+      SELECT online_at, offline_at FROM node_sessions
+       WHERE node_id = ?
+         AND (offline_at IS NULL OR offline_at >= ?)
+       ORDER BY online_at DESC
+       LIMIT ?
+    `).all(nodeId, since, limit) as Array<{ online_at: number; offline_at: number | null }>;
+    return rows.map(r => ({ onlineAt: r.online_at, offlineAt: r.offline_at }));
+  }
+
+  /** Bound the table; keep at most the most recent N sessions across all nodes. */
+  pruneNodeSessions(maxRows = 100_000) {
+    this.db.exec(`
+      DELETE FROM node_sessions
+      WHERE id IN (
+        SELECT id FROM node_sessions ORDER BY online_at DESC LIMIT -1 OFFSET ${Math.max(1, maxRows | 0)}
+      )
+    `);
+  }
+
+  /**
+   * Close any session that's still marked open at the given cutoff. Called on
+   * bridge boot to flush sessions that were left dangling by a previous crash
+   * or restart. Sets `offline_at = cutoffMs` for every still-open row.
+   */
+  closeOrphanedSessions(cutoffMs: number): number {
+    const result = this.db.prepare(`
+      UPDATE node_sessions SET offline_at = ? WHERE offline_at IS NULL
+    `).run(cutoffMs);
+    return Number((result as any).changes ?? 0);
+  }
+
+  /**
+   * Roll up a per-node uptime summary across the given window. Returns one row
+   * per node that's been seen in the window, including aggregate session
+   * length stats and a 24-element peak-hours histogram (UTC hours).
+   */
+  computeNodeUptime(windowMs: number, nowMs = Date.now()): Array<{
+    nodeId: string;
+    sessions: number;
+    onlineMs: number;
+    avgSessionMs: number | null;
+    peakHourCounts: number[];   // length 24, hour-of-day → ms-online-this-hour
+    lastOnlineAt: number | null;
+  }> {
+    const sinceMs = nowMs - windowMs;
+    const rows = this.db.prepare(`
+      SELECT node_id, online_at, offline_at FROM node_sessions
+       WHERE (offline_at IS NULL OR offline_at >= ?)
+         AND online_at <= ?
+    `).all(sinceMs, nowMs) as Array<{ node_id: string; online_at: number; offline_at: number | null }>;
+
+    type Acc = { sessions: number; onlineMs: number; sumMs: number; peak: number[]; lastOnlineAt: number };
+    const byNode = new Map<string, Acc>();
+    for (const r of rows) {
+      const start = Math.max(r.online_at, sinceMs);
+      const end = Math.min(r.offline_at ?? nowMs, nowMs);
+      if (end <= start) continue;
+      const dur = end - start;
+
+      let acc = byNode.get(r.node_id);
+      if (!acc) {
+        acc = { sessions: 0, onlineMs: 0, sumMs: 0, peak: new Array(24).fill(0), lastOnlineAt: 0 };
+        byNode.set(r.node_id, acc);
+      }
+      acc.sessions += 1;
+      acc.onlineMs += dur;
+      acc.sumMs += dur;
+      if (end > acc.lastOnlineAt) acc.lastOnlineAt = end;
+
+      // Distribute the session's duration across the hour-of-day buckets it
+      // crosses. We sample at minute granularity to keep the math simple.
+      const minutes = Math.ceil(dur / 60_000);
+      for (let i = 0; i < minutes; i++) {
+        const t = start + i * 60_000;
+        if (t >= end) break;
+        const hr = new Date(t).getUTCHours();
+        acc.peak[hr] += Math.min(60_000, end - t);
+      }
+    }
+
+    return Array.from(byNode.entries()).map(([nodeId, a]) => ({
+      nodeId,
+      sessions: a.sessions,
+      onlineMs: a.onlineMs,
+      avgSessionMs: a.sessions ? a.sumMs / a.sessions : null,
+      peakHourCounts: a.peak,
+      lastOnlineAt: a.lastOnlineAt || null,
+    }));
+  }
+
+  // ---------------------------------------------------------------------
   // Store & Forward routers
   // ---------------------------------------------------------------------
   upsertStoreForwardRouter(r: MeshStoreForwardRouter) {
@@ -555,8 +899,8 @@ export class MeshDatabase {
       INSERT OR REPLACE INTO messages (
         id, from_id, to_id, channel, text, timestamp, hop_limit,
         rx_snr, rx_rssi, hops_json, status, error_code, is_own,
-        packet_id, reply_to, is_reaction
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        packet_id, reply_to, is_reaction, delivery_ms
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       msg.id,
       msg.from,
@@ -574,6 +918,7 @@ export class MeshDatabase {
       typeof msg.packetId === 'number' ? msg.packetId : null,
       typeof msg.replyTo === 'number' ? msg.replyTo : null,
       msg.isReaction ? 1 : 0,
+      typeof msg.deliveryMs === 'number' ? msg.deliveryMs : null,
     );
     this.pruneMessages();
   }
@@ -582,7 +927,7 @@ export class MeshDatabase {
     const rows = this.db.prepare(`
       SELECT id, from_id, to_id, channel, text, timestamp, hop_limit,
              rx_snr, rx_rssi, hops_json, status, error_code, is_own,
-             packet_id, reply_to, is_reaction
+             packet_id, reply_to, is_reaction, delivery_ms
       FROM messages
       ORDER BY timestamp DESC
       LIMIT ?
@@ -592,6 +937,7 @@ export class MeshDatabase {
       rx_snr: number | null; rx_rssi: number | null; hops_json: string | null;
       status: string | null; error_code: number | null; is_own: number;
       packet_id: number | null; reply_to: number | null; is_reaction: number;
+      delivery_ms: number | null;
     }>;
 
     return rows.reverse().map(r => ({
@@ -611,6 +957,7 @@ export class MeshDatabase {
       packetId: r.packet_id ?? undefined,
       replyTo: r.reply_to ?? undefined,
       isReaction: r.is_reaction ? true : undefined,
+      deliveryMs: r.delivery_ms ?? undefined,
     }) as MeshMessage);
   }
 
@@ -620,6 +967,12 @@ export class MeshDatabase {
         SELECT id FROM messages ORDER BY timestamp DESC LIMIT -1 OFFSET ?
       )
     `).run(MAX_MESSAGES);
+  }
+
+  /** Delete messages older than the given epoch-ms cutoff. Returns rows removed. */
+  pruneMessagesOlderThan(cutoffMs: number): number {
+    const result = this.db.prepare(`DELETE FROM messages WHERE timestamp < ?`).run(cutoffMs);
+    return Number((result as any).changes ?? 0);
   }
 
   // ---------------------------------------------------------------------
@@ -672,15 +1025,16 @@ export class MeshDatabase {
   // ---------------------------------------------------------------------
   upsertChannel(ch: MeshChannel) {
     this.db.prepare(`
-      INSERT INTO channels (idx, name, role, psk_b64, uplink, downlink, updated_at)
-      VALUES (@idx, @name, @role, @psk_b64, @uplink, @downlink, @updated_at)
+      INSERT INTO channels (idx, name, role, psk_b64, uplink, downlink, position_precision, updated_at)
+      VALUES (@idx, @name, @role, @psk_b64, @uplink, @downlink, @position_precision, @updated_at)
       ON CONFLICT(idx) DO UPDATE SET
-        name       = excluded.name,
-        role       = excluded.role,
-        psk_b64    = excluded.psk_b64,
-        uplink     = excluded.uplink,
-        downlink   = excluded.downlink,
-        updated_at = excluded.updated_at
+        name               = excluded.name,
+        role               = excluded.role,
+        psk_b64            = excluded.psk_b64,
+        uplink             = excluded.uplink,
+        downlink           = excluded.downlink,
+        position_precision = excluded.position_precision,
+        updated_at         = excluded.updated_at
     `).run({
       idx: ch.index,
       name: ch.name,
@@ -688,6 +1042,7 @@ export class MeshDatabase {
       psk_b64: ch.pskBase64,
       uplink: ch.uplinkEnabled ? 1 : 0,
       downlink: ch.downlinkEnabled ? 1 : 0,
+      position_precision: ch.positionPrecision ?? null,
       updated_at: Date.now(),
     });
   }
@@ -696,6 +1051,7 @@ export class MeshDatabase {
     const rows = this.db.prepare(`SELECT * FROM channels ORDER BY idx`).all() as Array<{
       idx: number; name: string; role: string;
       psk_b64: string; uplink: number; downlink: number;
+      position_precision: number | null;
     }>;
     return rows.map(r => ({
       index: r.idx,
@@ -704,6 +1060,7 @@ export class MeshDatabase {
       pskBase64: r.psk_b64,
       uplinkEnabled: !!r.uplink,
       downlinkEnabled: !!r.downlink,
+      positionPrecision: r.position_precision ?? undefined,
     }));
   }
 

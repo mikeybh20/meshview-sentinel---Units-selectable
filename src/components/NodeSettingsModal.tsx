@@ -149,7 +149,7 @@ export function NodeSettingsModal({ node, onClose }: NodeSettingsModalProps) {
           <div className="flex gap-3">
             <button 
               onClick={onClose}
-              className="px-4 py-2 text-sm font-bold uppercase tracking-widest hover:text-white transition-colors"
+              className="px-4 py-2 text-sm font-bold uppercase tracking-widest hover:text-brand-ink transition-colors"
             >
               Cancel
             </button>

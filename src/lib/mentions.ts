@@ -10,15 +10,28 @@ export interface MentionMatch {
 export interface ParsedMessageSegment {
   type: 'text' | 'mention';
   text: string;
+  /** Resolved node for direct mentions (`@shortname` or `@!hex`). */
   node?: Node;
+  /**
+   * True when the mention is a channel-wide convention (`@everyone`, `@all`,
+   * `@channel`) — these don't resolve to a specific node and should always be
+   * treated as if every member of the current channel was mentioned.
+   * UI-side: render distinct from regular mentions and skip click-to-DM.
+   * Notification-side: trigger the "you were mentioned" path for every recipient.
+   */
+  channelWide?: boolean;
 }
 
 const MENTION_RE = /@(![\da-fA-F]{8}|[A-Za-z0-9_-]{1,12})/g;
 
+/** Channel-wide handles. These don't map to any node; they target the whole channel audience. */
+const CHANNEL_WIDE_HANDLES = new Set(['everyone', 'all', 'channel']);
+
 /**
  * Split a message body into text + mention segments. Mentions resolve to a
- * node by either short-name (case-insensitive) or `!hex` id. Unknown handles
- * stay as plain text so we don't visually mark random `@`-words as mentions.
+ * node by either short-name (case-insensitive) or `!hex` id, OR to a channel-
+ * wide convention (`@everyone`, `@all`, `@channel`). Unknown handles stay as
+ * plain text so we don't visually mark random `@`-words as mentions.
  */
 export function parseMentions(body: string, nodes: Node[]): ParsedMessageSegment[] {
   if (!body) return [{ type: 'text', text: body }];
@@ -38,16 +51,25 @@ export function parseMentions(body: string, nodes: Node[]): ParsedMessageSegment
   MENTION_RE.lastIndex = 0;
   while ((match = MENTION_RE.exec(body)) !== null) {
     const handle = match[1];
-    const node = handle.startsWith('!')
-      ? byId.get(handle.toLowerCase())
-      : byShort.get(handle.toLowerCase());
+    const handleLower = handle.toLowerCase();
 
-    if (!node) continue; // unknown — leave as plain text
+    let segment: ParsedMessageSegment | null = null;
+    if (CHANNEL_WIDE_HANDLES.has(handleLower)) {
+      segment = { type: 'mention', text: match[0], channelWide: true };
+    } else if (handle.startsWith('!')) {
+      const node = byId.get(handleLower);
+      if (node) segment = { type: 'mention', text: match[0], node };
+    } else {
+      const node = byShort.get(handleLower);
+      if (node) segment = { type: 'mention', text: match[0], node };
+    }
+
+    if (!segment) continue; // unknown — leave as plain text
 
     if (match.index > lastIndex) {
       segments.push({ type: 'text', text: body.slice(lastIndex, match.index) });
     }
-    segments.push({ type: 'mention', text: match[0], node });
+    segments.push(segment);
     lastIndex = match.index + match[0].length;
   }
 
@@ -61,9 +83,20 @@ export function parseMentions(body: string, nodes: Node[]): ParsedMessageSegment
   return segments;
 }
 
-/** Returns true if `localNodeId` is mentioned in `body` (by short-name or hex). */
+/**
+ * Returns true if `localNode` should be considered "mentioned" by `body`.
+ * Triggers on:
+ *   - `@<localShortName>` (case-insensitive)
+ *   - `@!<localHexId>`
+ *   - `@everyone` / `@all` / `@channel` (channel-wide — every recipient sees themselves as mentioned)
+ */
 export function isMentioned(body: string, localNode: Node | undefined): boolean {
-  if (!localNode || !body) return false;
-  const segments = parseMentions(body, [localNode]);
-  return segments.some(s => s.type === 'mention' && s.node?.id === localNode.id);
+  if (!body) return false;
+  const segments = parseMentions(body, localNode ? [localNode] : []);
+  return segments.some(s =>
+    s.type === 'mention' && (
+      s.channelWide === true ||
+      (localNode !== undefined && s.node?.id === localNode.id)
+    )
+  );
 }

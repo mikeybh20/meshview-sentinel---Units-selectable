@@ -27,6 +27,12 @@ export interface Channel {
   pskBase64: string;        // raw PSK as base64 ('' = none, 'AQ==' single-byte = default)
   uplinkEnabled: boolean;
   downlinkEnabled: boolean;
+  /**
+   * Per-channel position precision (ChannelSettings.module_settings.position_precision).
+   * 0 = position broadcasts disabled on this channel, 32 = full precision.
+   * `undefined` = not yet read; the firmware default (32) applies.
+   */
+  positionPrecision?: number;
 }
 
 export interface SensorData {
@@ -109,6 +115,13 @@ export interface Message {
   replyTo?: number;
   /** True if this is a reaction (Data.emoji != 0). The text holds the emoji. */
   isReaction?: boolean;
+  /**
+   * Round-trip latency from send-time to ACK in milliseconds. Captured at the
+   * moment we receive the firmware ACK or QueueStatus success for messages we
+   * sent (and synthesized by the simulator). Undefined for inbound messages
+   * and messages where no ACK was ever observed.
+   */
+  deliveryMs?: number;
 }
 
 export interface RadioEvent {
@@ -181,9 +194,133 @@ export interface NeighborInfoModuleConfig {
   lastReadAt: number;
 }
 
+export interface RangeTestModuleConfig {
+  enabled: boolean;
+  /** Sender broadcast interval (seconds). 0 = receive-only mode. */
+  senderIntervalSecs: number;
+  /** Persist results to flash on the radio (CSV log). */
+  save: boolean;
+  /** Epoch ms when this config was last read from the radio. */
+  lastReadAt: number;
+}
+
+export interface TelemetryModuleConfig {
+  /** Device metrics broadcast interval (seconds). 0 = firmware default. */
+  deviceUpdateIntervalSecs: number;
+  /** Whether environment-sensor telemetry (BME280 etc.) is enabled. */
+  environmentEnabled: boolean;
+  /** Environment-sensor broadcast interval (seconds). 0 = firmware default. */
+  environmentUpdateIntervalSecs: number;
+  /** Whether power-monitor telemetry (INA219/INA260) is enabled. */
+  powerEnabled: boolean;
+  /** Power-monitor broadcast interval (seconds). 0 = firmware default. */
+  powerUpdateIntervalSecs: number;
+  /** Epoch ms when this config was last read from the radio. */
+  lastReadAt: number;
+}
+
+export interface DetectionSensorModuleConfig {
+  enabled: boolean;
+  minimumBroadcastSecs: number;
+  stateBroadcastSecs: number;
+  sendBell: boolean;
+  name: string;
+  monitorPin: number;
+  detectionTriggeredHigh: boolean;
+  usePullup: boolean;
+  /** Epoch ms when this config was last read from the radio. */
+  lastReadAt: number;
+}
+
+export interface AudioModuleConfig {
+  codec2Enabled: boolean;
+  pttPin: number;
+  bitrate: number;
+  i2sWs: number;
+  i2sSd: number;
+  i2sDin: number;
+  i2sSck: number;
+  /** Epoch ms when this config was last read from the radio. */
+  lastReadAt: number;
+}
+
+export interface MqttModuleConfig {
+  enabled: boolean;
+  address: string;
+  username: string;
+  password: string;
+  encryptionEnabled: boolean;
+  jsonEnabled: boolean;
+  tlsEnabled: boolean;
+  /** MQTT topic root, e.g. "msh/US/2/e/". */
+  root: string;
+  /** Use the connected client (this app) as the MQTT proxy instead of the radio's own WiFi. */
+  proxyToClientEnabled: boolean;
+  /** Publish positions to the public Meshtastic map. */
+  mapReportingEnabled: boolean;
+  /** Opaque MapReportSettings sub-message base64'd. Echoed verbatim on save. */
+  mapReportSettingsRaw: string | null;
+  /** Epoch ms when this config was last read from the radio. */
+  lastReadAt: number;
+}
+
+export interface ExternalNotificationModuleConfig {
+  enabled: boolean;
+  outputMs: number;
+  output: number;
+  active: boolean;
+  alertMessage: boolean;
+  alertBell: boolean;
+  usePwm: boolean;
+  outputVibra: number;
+  outputBuzzer: number;
+  alertMessageVibra: boolean;
+  alertMessageBuzzer: boolean;
+  alertBellVibra: boolean;
+  alertBellBuzzer: boolean;
+  nagTimeout: number;
+  useI2sAsBuzzer: boolean;
+  /** Epoch ms when this config was last read from the radio. */
+  lastReadAt: number;
+}
+
+export interface StoreForwardLocalConfig {
+  enabled: boolean;
+  /** When true, the local radio acts as an S&F router/server. */
+  isServer: boolean;
+  heartbeat: boolean;
+  /** Max records to retain (router only). 0 = firmware default. */
+  records: number;
+  /** Max records replayed per CLIENT_HISTORY request (router only). 0 = firmware default. */
+  historyReturnMax: number;
+  /** Time window in minutes a CLIENT_HISTORY request may ask for (router only). 0 = firmware default. */
+  historyReturnWindow: number;
+  /** Epoch ms when this config was last read from the radio. */
+  lastReadAt: number;
+}
+
 export interface LocalModuleConfigSnapshot {
   /** Authoritative NeighborInfo config; undefined until the first readback completes. */
   neighborInfo?: NeighborInfoModuleConfig;
+  /** Authoritative Range Test config; undefined until the first readback completes. */
+  rangeTest?: RangeTestModuleConfig;
+  /** Authoritative Telemetry-module config; undefined until the first readback completes. */
+  telemetry?: TelemetryModuleConfig;
+  /** Authoritative Store & Forward module config (local radio's S&F role / params). */
+  storeForward?: StoreForwardLocalConfig;
+  /** Authoritative External Notification module config (buzzer / LED / vibra alerts). */
+  externalNotification?: ExternalNotificationModuleConfig;
+  /** Authoritative MQTT module config (broker / auth / encryption / topic). */
+  mqtt?: MqttModuleConfig;
+  /** Authoritative Detection Sensor module config (GPIO state broadcasts). */
+  detectionSensor?: DetectionSensorModuleConfig;
+  /** Authoritative Audio module config (Codec2 voice over LoRa). */
+  audio?: AudioModuleConfig;
+  /** Live state of timed surveys (Range Test sender / NeighborInfo cadence). */
+  activeSurveys?: {
+    rangeTestExpiresAt: number | null;
+    neighborInfoExpiresAt: number | null;
+  };
 }
 
 export interface StoreForwardRouter {

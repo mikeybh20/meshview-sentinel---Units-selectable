@@ -1,7 +1,9 @@
 import React, { useEffect, useState } from 'react';
-import { X, Save, Plus, Trash2, Activity, AlertTriangle } from 'lucide-react';
+import { X, Save, Plus, Trash2, Activity, AlertTriangle, Share2, Check, Copy } from 'lucide-react';
+import { QRCodeSVG } from 'qrcode.react';
 import { Channel, ChannelRole } from '../types';
 import { meshDataService } from '../services/meshDataService';
+import { buildChannelShareUrl } from '../lib/channelShare';
 
 interface ChannelsModalProps {
   onClose: () => void;
@@ -29,10 +31,70 @@ function newRandomPsk(): string {
   return btoa(bin);
 }
 
+/**
+ * Per-channel position-precision presets. Higher `bits` = more precise. Each
+ * dropped bit roughly doubles the on-the-air uncertainty radius. The labels
+ * mirror what the official Meshtastic clients show, so operators get matching
+ * vocabulary across tools.
+ *
+ *  0  = position broadcasts disabled on this channel
+ *  32 = full precision (firmware default)
+ */
+const POSITION_PRECISION_PRESETS: Array<{ bits: number; label: string }> = [
+  { bits: 32, label: 'Full precision (default)' },
+  { bits: 19, label: '~ 1.6 km · neighborhood' },
+  { bits: 17, label: '~ 6.4 km · small city' },
+  { bits: 14, label: '~ 51 km · region' },
+  { bits: 11, label: '~ 410 km · state-wide' },
+  { bits: 0,  label: 'Disabled · do not share location' },
+];
+
+function PositionPrecisionPicker({
+  value,
+  onChange,
+}: {
+  value: number | undefined;
+  onChange: (v: number) => void;
+}) {
+  // `undefined` falls back to the firmware default (32) for display purposes.
+  const effective = typeof value === 'number' ? value : 32;
+  const isPreset = POSITION_PRECISION_PRESETS.some(p => p.bits === effective);
+  return (
+    <div className="flex flex-col gap-1">
+      <label className="text-[9px] uppercase font-bold tracking-widest text-brand-muted flex items-center justify-between">
+        <span>Position Precision</span>
+        <span className="text-[8px] mono-text text-brand-muted normal-case tracking-tight" title="ChannelSettings.module_settings.position_precision">
+          bits = {effective}
+        </span>
+      </label>
+      <select
+        value={isPreset ? String(effective) : 'custom'}
+        onChange={e => {
+          const v = e.target.value;
+          if (v !== 'custom') onChange(parseInt(v, 10));
+        }}
+        className="w-full bg-brand-line/50 border border-brand-line rounded px-2 py-1.5 text-xs focus:outline-none focus:border-brand-accent"
+      >
+        {POSITION_PRECISION_PRESETS.map(p => (
+          <option key={p.bits} value={p.bits}>{p.label}</option>
+        ))}
+        {!isPreset && <option value="custom">Custom: {effective} bits</option>}
+      </select>
+      <p className="text-[10px] text-brand-muted leading-snug mt-0.5">
+        Controls how precisely your radio broadcasts its location on this channel.
+        {effective === 0 && <> <span className="text-brand-warning font-bold">Off:</span> position will not be sent here at all.</>}
+        {effective > 0 && effective < 32 && <> Lower-precision peers see a <span className="text-brand-warning font-bold">fuzzed coordinate</span> instead of your exact lat/lng — useful on broadcast / public channels.</>}
+        {effective === 32 && <> Other nodes see your exact GPS coordinate. Pick a lower precision on public channels for privacy.</>}
+      </p>
+    </div>
+  );
+}
+
 export function ChannelsModal({ onClose }: ChannelsModalProps) {
   const [channels, setChannels] = useState<Channel[]>(() => meshDataService.getChannels());
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showShare, setShowShare] = useState(false);
 
   useEffect(() => {
     // Refresh from latest snapshot when the modal opens
@@ -127,7 +189,7 @@ export function ChannelsModal({ onClose }: ChannelsModalProps) {
                 </div>
                 <button
                   onClick={() => handleRemove(ch.index)}
-                  className="text-brand-muted hover:text-red-400 p-1 rounded transition-colors"
+                  className="text-brand-muted hover:text-brand-error p-1 rounded transition-colors"
                   title="Remove channel"
                 >
                   <Trash2 size={14} />
@@ -207,11 +269,16 @@ export function ChannelsModal({ onClose }: ChannelsModalProps) {
                   </label>
                 </div>
                 {(ch.uplinkEnabled || ch.downlinkEnabled) && (
-                  <p className="text-[9px] text-emerald-400 mono-text uppercase mt-0.5">
+                  <p className="text-[9px] text-brand-accent mono-text uppercase mt-0.5">
                     Active: {ch.uplinkEnabled ? '↑' : '·'}{ch.downlinkEnabled ? '↓' : '·'}
                   </p>
                 )}
               </div>
+
+              <PositionPrecisionPicker
+                value={ch.positionPrecision}
+                onChange={v => updateChannel(ch.index, { positionPrecision: v })}
+              />
             </div>
           ))}
 
@@ -226,29 +293,115 @@ export function ChannelsModal({ onClose }: ChannelsModalProps) {
           )}
 
           {error && (
-            <div className="flex items-start gap-2 text-xs text-red-400 bg-red-500/10 border border-red-500/30 rounded p-2">
+            <div className="flex items-start gap-2 text-xs text-brand-error bg-brand-error/10 border border-brand-error/30 rounded p-2">
               <AlertTriangle size={14} className="flex-shrink-0 mt-0.5" />
               <span>{error}</span>
             </div>
           )}
         </div>
 
-        <div className="p-4 border-t border-brand-line flex justify-end gap-3 bg-brand-line/10">
+        <div className="p-4 border-t border-brand-line flex justify-between items-center gap-3 bg-brand-line/10">
           <button
-            onClick={onClose}
-            className="px-4 py-2 text-sm font-bold uppercase tracking-widest hover:text-white transition-colors"
-            disabled={saving}
+            onClick={() => setShowShare(true)}
+            disabled={sortedActive.length === 0}
+            title={sortedActive.length === 0 ? 'No channels to share yet' : 'Generate a Meshtastic-compatible QR + URL for these channels'}
+            className="flex items-center gap-2 px-3 py-2 text-xs font-bold uppercase tracking-widest text-brand-muted hover:text-brand-accent border border-brand-line hover:border-brand-accent/50 rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
           >
-            Cancel
+            <Share2 size={14} />
+            Share via QR
           </button>
-          <button
-            onClick={handleSave}
-            disabled={saving}
-            className={`flex items-center gap-2 bg-brand-accent text-black px-6 py-2 rounded text-sm font-bold uppercase tracking-widest hover:brightness-110 transition-all ${saving ? 'opacity-50 cursor-not-allowed' : ''}`}
-          >
-            {saving ? <Activity size={16} className="animate-spin" /> : <Save size={16} />}
-            {saving ? 'Writing to radio...' : 'Save & Commit'}
+          <div className="flex items-center gap-3">
+            <button
+              onClick={onClose}
+              className="px-4 py-2 text-sm font-bold uppercase tracking-widest hover:text-brand-ink transition-colors"
+              disabled={saving}
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleSave}
+              disabled={saving}
+              className={`flex items-center gap-2 bg-brand-accent text-black px-6 py-2 rounded text-sm font-bold uppercase tracking-widest hover:brightness-110 transition-all ${saving ? 'opacity-50 cursor-not-allowed' : ''}`}
+            >
+              {saving ? <Activity size={16} className="animate-spin" /> : <Save size={16} />}
+              {saving ? 'Writing to radio...' : 'Save & Commit'}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {showShare && (
+        <ChannelShareQrOverlay
+          channels={sortedActive}
+          onClose={() => setShowShare(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+/** Modal-on-modal: shows the QR + URL for the active channel set. */
+function ChannelShareQrOverlay({ channels, onClose }: { channels: Channel[]; onClose: () => void }) {
+  const url = React.useMemo(() => buildChannelShareUrl(channels), [channels]);
+  const [copied, setCopied] = React.useState(false);
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch { /* ignore */ }
+  };
+
+  return (
+    <div
+      className="fixed inset-0 bg-brand-bg/80 backdrop-blur-md z-[300] flex items-center justify-center p-6"
+      onClick={onClose}
+    >
+      <div
+        onClick={e => e.stopPropagation()}
+        className="technical-panel w-full max-w-md bg-brand-surface border border-brand-accent/40 overflow-hidden"
+      >
+        <div className="p-4 border-b border-brand-line flex items-center justify-between bg-brand-line/10">
+          <div>
+            <h3 className="text-base font-bold tracking-tight uppercase text-brand-ink">Share Channel Set</h3>
+            <p className="text-[10px] text-brand-muted mono-text uppercase">
+              {channels.length} channel{channels.length === 1 ? '' : 's'} · scannable by every Meshtastic client
+            </p>
+          </div>
+          <button onClick={onClose} className="p-1 hover:bg-brand-line rounded-full transition-colors">
+            <X size={20} />
           </button>
+        </div>
+
+        <div className="p-6 flex flex-col items-center gap-4">
+          <div className="bg-white p-3 rounded-lg">
+            <QRCodeSVG value={url} size={224} level="M" />
+          </div>
+
+          <div className="w-full">
+            <p className="text-[10px] uppercase font-bold text-brand-muted mb-1">Share URL</p>
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                readOnly
+                value={url}
+                onClick={e => (e.target as HTMLInputElement).select()}
+                className="flex-1 bg-brand-line border border-brand-line rounded px-2 py-1.5 text-[10px] mono-text text-brand-ink truncate"
+              />
+              <button
+                onClick={handleCopy}
+                className="flex items-center gap-1 px-2 py-1.5 rounded border border-brand-line hover:border-brand-accent/50 hover:bg-brand-accent/10 text-[10px] font-bold uppercase tracking-widest text-brand-muted hover:text-brand-accent transition-colors"
+              >
+                {copied ? <Check size={12} className="text-brand-accent" /> : <Copy size={12} />}
+                {copied ? 'Copied' : 'Copy'}
+              </button>
+            </div>
+          </div>
+
+          <p className="text-[10px] text-brand-muted leading-snug">
+            Anyone scanning this code (or opening the URL) on a Meshtastic client will be prompted to import the channel set, including PSKs and module settings. Treat it like a password — it grants full access to your private channels.
+          </p>
         </div>
       </div>
     </div>

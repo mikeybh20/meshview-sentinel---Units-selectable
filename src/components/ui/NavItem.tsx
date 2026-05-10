@@ -16,7 +16,7 @@ export function NavItem({ active, onClick, icon, label }: { active: boolean, onC
       {active && (
         <motion.div 
           layoutId="sidebar-active"
-          className="absolute left-0 w-1 h-6 bg-black rounded-r-full md:hidden"
+          className="absolute left-0 w-1 h-6 bg-brand-accent rounded-r-full md:hidden"
         />
       )}
     </button>

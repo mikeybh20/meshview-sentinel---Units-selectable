@@ -196,7 +196,7 @@ export function TelemetryChart({ nodeId, limit = 200 }: TelemetryChartProps) {
       </div>
 
       {/* Chart body */}
-      <div className="h-44 bg-black/40 rounded border border-brand-line/50 p-2">
+      <div className="h-44 bg-brand-bg/40 rounded border border-brand-line/50 p-2">
         {loading && samples.length === 0 ? (
           <div className="h-full flex items-center justify-center text-brand-muted">
             <Loader2 size={16} className="animate-spin" />
@@ -238,7 +238,7 @@ export function TelemetryChart({ nodeId, limit = 200 }: TelemetryChartProps) {
               )}
               <Tooltip
                 contentStyle={{
-                  background: '#020617',
+                  background: 'var(--color-brand-bg)',
                   border: '1px solid #1e293b',
                   borderRadius: '6px',
                   fontSize: '11px',

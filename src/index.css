@@ -7,9 +7,32 @@
   --color-brand-muted: #64748b; /* slate-500 */
   --color-brand-accent: #10b981; /* emerald-500 */
   --color-brand-warning: #f59e0b; /* amber-500 */
+  --color-brand-error: #ef4444;   /* red-500 */
+  --color-brand-info: #06b6d4;    /* cyan-500 */
   --color-brand-line: #1e293b; /* slate-800 */
-  
+
   --font-mono: 'JetBrains Mono', 'Courier New', Courier, monospace;
+}
+
+/* ----------------------------------------------------------------------------
+ * Light theme (data-theme="light" set on <html>)
+ *
+ * NOTE: many components currently use hardcoded `bg-slate-800`, `text-slate-400`
+ * etc. — those won't flip with this override. This first pass swaps the
+ * brand-* palette so body, sidebar, panels, and main surfaces respond. Modal
+ * surfaces and Settings cards still need a follow-up cleanup to use brand-*
+ * tokens before they'll fully adapt.
+ * -------------------------------------------------------------------------- */
+:root[data-theme="light"] {
+  --color-brand-bg: #f8fafc;        /* slate-50 — page background */
+  --color-brand-surface: #ffffff;    /* white — panels */
+  --color-brand-ink: #0f172a;        /* slate-900 — primary text */
+  --color-brand-muted: #475569;      /* slate-600 — secondary text (slightly darker than dark-mode muted to keep contrast on light bg) */
+  --color-brand-accent: #059669;     /* emerald-600 — accent (darker for AA contrast on light bg) */
+  --color-brand-warning: #d97706;    /* amber-600 */
+  --color-brand-error: #dc2626;      /* red-600 — darker for light-bg contrast */
+  --color-brand-info: #0891b2;       /* cyan-600 */
+  --color-brand-line: #cbd5e1;       /* slate-300 — borders / dividers */
 }
 
 @layer base {

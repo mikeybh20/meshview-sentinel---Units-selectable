@@ -22,7 +22,267 @@ import { cn } from '../../lib/utils';
 import { StatCard } from '../ui/StatCard';
 import { TelemetryItem } from '../ui/TelemetryItem';
 import { SensorWidget } from '../SensorWidget';
-import { TelemetryChart } from '../TelemetryChart';
+import { simulator } from '../../services/meshtasticSimulator';
+// TelemetryChart pulls in `recharts` (~120 KB). Lazy-load so the chart only
+// gets fetched when a node detail panel actually surfaces it.
+const TelemetryChart = React.lazy(() =>
+  import('../TelemetryChart').then(m => ({ default: m.TelemetryChart }))
+);
+
+const API_BASE = import.meta.env.VITE_API_URL || '';
+
+interface NodeUptimeStats {
+  nodeId: string;
+  nodeName: string;
+  sessions: number;
+  onlineMs: number;
+  avgSessionMs: number | null;
+  uptimePercent: number;
+  lastOnlineAt: number | null;
+  peakHourCounts: number[];
+  currentlyOnline: boolean;
+}
+
+const UPTIME_WINDOW_OPTIONS: Array<{ value: number; label: string }> = [
+  { value: 24 * 3600_000,      label: '24h' },
+  { value: 7 * 24 * 3600_000,  label: '7d' },
+  { value: 30 * 24 * 3600_000, label: '30d' },
+];
+
+function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 1000) return `${Math.round(ms)} ms`;
+  const s = ms / 1000;
+  if (s < 60) return `${s.toFixed(0)} s`;
+  const m = s / 60;
+  if (m < 60) return `${m.toFixed(1)} min`;
+  const h = m / 60;
+  if (h < 24) return `${h.toFixed(1)} h`;
+  return `${(h / 24).toFixed(1)} d`;
+}
+
+function formatTimeAgo(ts: number): string {
+  const diff = Date.now() - ts;
+  if (diff < 60_000) return 'just now';
+  if (diff < 3600_000) return `${Math.floor(diff / 60_000)}m ago`;
+  if (diff < 86400_000) return `${Math.floor(diff / 3600_000)}h ago`;
+  return `${Math.floor(diff / 86400_000)}d ago`;
+}
+
+/**
+ * Compute per-node uptime stats from a list of `{ onlineAt, offlineAt }`
+ * sessions. Same shape the server-side `/api/mesh/route-intel/uptime` endpoint
+ * returns, so the widget can render either source uniformly. Used in
+ * simulator mode where there's no server table to query.
+ */
+function computeUptimeFromSessions(
+  nodeId: string,
+  sessions: Array<{ onlineAt: number; offlineAt: number | null }>,
+  windowMs: number,
+  nowMs = Date.now(),
+): Omit<NodeUptimeStats, 'nodeName' | 'currentlyOnline'> {
+  const sinceMs = nowMs - windowMs;
+  const peak = new Array(24).fill(0);
+  let onlineMs = 0;
+  let sessionCount = 0;
+  let sumMs = 0;
+  let lastOnlineAt: number | null = null;
+  for (const s of sessions) {
+    if (s.offlineAt != null && s.offlineAt < sinceMs) continue;
+    if (s.onlineAt > nowMs) continue;
+    const start = Math.max(s.onlineAt, sinceMs);
+    const end = Math.min(s.offlineAt ?? nowMs, nowMs);
+    if (end <= start) continue;
+    const dur = end - start;
+    sessionCount += 1;
+    onlineMs += dur;
+    sumMs += dur;
+    if (end > (lastOnlineAt ?? 0)) lastOnlineAt = end;
+
+    const minutes = Math.ceil(dur / 60_000);
+    for (let i = 0; i < minutes; i++) {
+      const t = start + i * 60_000;
+      if (t >= end) break;
+      peak[new Date(t).getUTCHours()] += Math.min(60_000, end - t);
+    }
+  }
+  return {
+    nodeId,
+    sessions: sessionCount,
+    onlineMs,
+    avgSessionMs: sessionCount ? sumMs / sessionCount : null,
+    peakHourCounts: peak,
+    lastOnlineAt,
+    uptimePercent: windowMs > 0 ? Math.min(100, (onlineMs / windowMs) * 100) : 0,
+  };
+}
+
+/**
+ * Per-node uptime panel. In live mode fetches `/api/mesh/route-intel/uptime`
+ * (server-side `node_sessions` table). In simulator mode reads the
+ * simulator's in-memory session history directly. Either way, displays
+ * uptime % over the chosen window, session count, avg session length,
+ * last-online timestamp, and a 24-hour peak-hours histogram (UTC).
+ */
+function NodeUptimeWidget({ nodeId, currentlyOnline, dataSource }: {
+  nodeId: string;
+  currentlyOnline: boolean;
+  dataSource: 'live' | 'simulator';
+}) {
+  const [windowMs, setWindowMs] = React.useState<number>(24 * 3600_000);
+  const [stats, setStats] = React.useState<NodeUptimeStats | null>(null);
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    let cancelled = false;
+
+    // Simulator mode — compute from the in-memory session list. Re-run on a
+    // 5 s tick so the widget updates as the simulator generates more data.
+    if (dataSource === 'simulator') {
+      const refresh = () => {
+        const all = simulator.getUptimeHistory();
+        const ours = all.filter(s => s.nodeId === nodeId);
+        const computed = computeUptimeFromSessions(nodeId, ours, windowMs);
+        if (!cancelled) {
+          setStats({ ...computed, nodeName: nodeId, currentlyOnline });
+          setLoading(false);
+          setError(null);
+        }
+      };
+      refresh();
+      const t = setInterval(refresh, 5000);
+      return () => { cancelled = true; clearInterval(t); };
+    }
+
+    // Live mode — server-backed.
+    setLoading(true);
+    setError(null);
+    fetch(`${API_BASE}/api/mesh/route-intel/uptime?nodeId=${encodeURIComponent(nodeId)}&windowMs=${windowMs}`)
+      .then(async r => {
+        if (!r.ok) {
+          const body = await r.json().catch(() => ({}));
+          throw new Error(body.error || `HTTP ${r.status}`);
+        }
+        return r.json() as Promise<{ results: NodeUptimeStats[] }>;
+      })
+      .then(body => {
+        if (cancelled) return;
+        setStats(body.results[0] ?? null);
+        setLoading(false);
+      })
+      .catch(err => {
+        if (cancelled) return;
+        setError(err.message || 'Uptime fetch failed');
+        setLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [nodeId, windowMs, dataSource, currentlyOnline]);
+
+  // Find the peak hour for the highlighted callout
+  const peakHour = stats && stats.peakHourCounts.length === 24
+    ? stats.peakHourCounts.reduce((bestIdx, v, i, arr) => v > arr[bestIdx] ? i : bestIdx, 0)
+    : null;
+  const maxHourMs = stats ? Math.max(1, ...stats.peakHourCounts) : 1;
+
+  return (
+    <div className="bg-brand-bg/40 rounded border border-brand-line/50 p-3">
+      <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center gap-2">
+          <span className={cn('w-1.5 h-1.5 rounded-full', currentlyOnline ? 'bg-brand-accent animate-pulse' : 'bg-brand-muted')} />
+          <span className="text-[10px] font-bold uppercase tracking-widest text-brand-muted">Uptime &amp; availability</span>
+        </div>
+        <div className="flex bg-brand-line/40 rounded overflow-hidden border border-brand-line">
+          {UPTIME_WINDOW_OPTIONS.map(opt => (
+            <button
+              key={opt.value}
+              onClick={() => setWindowMs(opt.value)}
+              className={cn(
+                'text-[9px] font-bold uppercase px-2 py-0.5 transition-colors',
+                windowMs === opt.value ? 'bg-brand-accent text-black' : 'text-brand-muted hover:text-brand-ink',
+              )}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {loading && !stats ? (
+        <div className="flex items-center gap-2 text-[10px] text-brand-muted py-2">
+          <Loader2 size={12} className="animate-spin" /> Loading session history…
+        </div>
+      ) : error ? (
+        <div className="text-[10px] text-brand-error">Uptime fetch failed: {error}</div>
+      ) : !stats ? (
+        <div className="text-[10px] text-brand-muted italic py-2">
+          No session history yet for this window. Sessions are recorded every time a node transitions online or offline; new nodes need at least one such transition before stats appear.
+        </div>
+      ) : (
+        <div className="space-y-2">
+          <div className="grid grid-cols-4 gap-2">
+            <div className="text-center">
+              <div className={cn(
+                'text-base font-bold mono-text',
+                stats.uptimePercent >= 80 ? 'text-brand-accent'
+                : stats.uptimePercent >= 50 ? 'text-brand-warning'
+                : 'text-brand-error',
+              )}>
+                {stats.uptimePercent.toFixed(0)}%
+              </div>
+              <div className="text-[8px] uppercase tracking-widest text-brand-muted mt-0.5">Uptime</div>
+            </div>
+            <div className="text-center">
+              <div className="text-base font-bold mono-text text-brand-ink">{stats.sessions}</div>
+              <div className="text-[8px] uppercase tracking-widest text-brand-muted mt-0.5">Sessions</div>
+            </div>
+            <div className="text-center">
+              <div className="text-base font-bold mono-text text-brand-ink">
+                {stats.avgSessionMs != null ? formatDuration(stats.avgSessionMs) : '—'}
+              </div>
+              <div className="text-[8px] uppercase tracking-widest text-brand-muted mt-0.5">Avg session</div>
+            </div>
+            <div className="text-center">
+              <div className="text-base font-bold mono-text text-brand-ink">
+                {stats.lastOnlineAt ? formatTimeAgo(stats.lastOnlineAt) : '—'}
+              </div>
+              <div className="text-[8px] uppercase tracking-widest text-brand-muted mt-0.5">Last online</div>
+            </div>
+          </div>
+
+          {/* Peak-hours histogram */}
+          {stats.peakHourCounts.some(v => v > 0) && (
+            <div>
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-[9px] uppercase font-bold tracking-widest text-brand-muted">Peak hours (UTC)</span>
+                {peakHour !== null && (
+                  <span className="text-[9px] mono-text text-brand-accent font-bold">
+                    Peak {peakHour.toString().padStart(2, '0')}:00
+                  </span>
+                )}
+              </div>
+              <div className="flex items-end gap-px h-10">
+                {stats.peakHourCounts.map((ms, hr) => {
+                  const fraction = maxHourMs > 0 ? ms / maxHourMs : 0;
+                  return (
+                    <div
+                      key={hr}
+                      className="flex-1 bg-brand-accent/30 hover:bg-brand-accent/60 transition-colors rounded-sm relative group"
+                      style={{ height: `${Math.max(2, fraction * 100)}%` }}
+                      title={`${hr.toString().padStart(2, '0')}:00 — ${formatDuration(ms)} online`}
+                    />
+                  );
+                })}
+              </div>
+              <div className="flex justify-between text-[8px] mono-text text-brand-muted mt-0.5">
+                <span>00</span><span>06</span><span>12</span><span>18</span><span>23</span>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 // Maryland home base — same fallback as the main MapView so a fresh DB with
 // no positioned nodes lands on the operator's actual region instead of the
@@ -56,18 +316,18 @@ function DashboardMapWidget({ nodes }: { nodes: Node[] }) {
     return 5;
   }, [positioned.length]);
 
-  // Use a remount key so the map re-centers when the first real position arrives.
-  // Without this, pigeon-maps holds the previous defaultCenter forever.
+  // Track whether the user has manually panned/zoomed. Until they do, we keep
+  // re-snapping to the derived center as the node set evolves — that way an
+  // initial fallback / simulator-seeded view is overwritten as soon as the
+  // live nodes arrive. Once the user interacts, we stop overriding their view.
   const [center, setCenter] = React.useState(derivedCenter);
   const [zoom, setZoom] = React.useState(derivedZoom);
-  const hasSnapped = React.useRef(false);
+  const userInteractedRef = React.useRef(false);
   React.useEffect(() => {
-    if (!hasSnapped.current && positioned.length > 0) {
-      hasSnapped.current = true;
-      setCenter(derivedCenter);
-      setZoom(derivedZoom);
-    }
-  }, [derivedCenter, derivedZoom, positioned.length]);
+    if (userInteractedRef.current) return;
+    setCenter(derivedCenter);
+    setZoom(derivedZoom);
+  }, [derivedCenter, derivedZoom]);
 
   return (
     <div className="technical-panel h-[360px] overflow-hidden relative">
@@ -75,7 +335,13 @@ function DashboardMapWidget({ nodes }: { nodes: Node[] }) {
         <Map
           center={center}
           zoom={zoom}
-          onBoundsChanged={({ center: c, zoom: z }) => { setCenter(c); setZoom(z); }}
+          onBoundsChanged={({ center: c, zoom: z, initial }) => {
+            // pigeon-maps fires onBoundsChanged once on mount with `initial: true`;
+            // only treat user-driven changes (drag/zoom) as real interaction.
+            if (!initial) userInteractedRef.current = true;
+            setCenter(c);
+            setZoom(z);
+          }}
         >
           {positioned.map(node => (
             <Marker
@@ -109,6 +375,13 @@ interface DashboardViewProps {
   onToggleFavorite: (nodeId: string, favorite: boolean) => void;
   groups: Group[];
   onAssignGroup: (nodeId: string, groupId: string | undefined) => void;
+  /**
+   * 'live' = the bridge is reading from a real radio (uptime stats fetched
+   * from /api/mesh/route-intel/uptime). 'simulator' = the in-browser simulator
+   * is generating data, and the uptime widget should source its session
+   * history from the simulator instead.
+   */
+  dataSource: 'live' | 'simulator';
 }
 
 export function DashboardView({
@@ -126,6 +399,7 @@ export function DashboardView({
   onToggleFavorite,
   groups,
   onAssignGroup,
+  dataSource,
 }: DashboardViewProps) {
   // Bulk-selection state for the NODE_LIST table. Lives here as transient UI
   // state — no need to lift to App.tsx since other views don't use it.
@@ -216,12 +490,12 @@ export function DashboardView({
     <>
       <div className="flex items-center justify-between mb-6">
          <div>
-           <h2 className="text-xl font-bold tracking-tight text-white">NETWORK OVERVIEW</h2>
+           <h2 className="text-xl font-bold tracking-tight text-brand-ink">NETWORK OVERVIEW</h2>
            <p className="text-xs text-brand-muted mono-text uppercase">Real-time mesh diagnostics</p>
          </div>
          <button 
            onClick={() => setIsEditingDashboard(true)}
-           className="flex items-center gap-2 px-3 py-1.5 rounded bg-brand-line/50 border border-brand-line hover:border-brand-accent transition-all text-[10px] font-bold uppercase tracking-widest text-brand-muted hover:text-white"
+           className="flex items-center gap-2 px-3 py-1.5 rounded bg-brand-line/50 border border-brand-line hover:border-brand-accent transition-all text-[10px] font-bold uppercase tracking-widest text-brand-muted hover:text-brand-ink"
          >
            <LayoutTemplate size={14} />
            Customize Dashboard
@@ -437,7 +711,7 @@ export function DashboardView({
                       <button
                         onClick={clearSelection}
                         title="Clear selection"
-                        className="text-brand-muted hover:text-white p-1 rounded transition-colors"
+                        className="text-brand-muted hover:text-brand-ink p-1 rounded transition-colors"
                       >
                         <X size={14} />
                       </button>
@@ -538,8 +812,25 @@ export function DashboardView({
                         </div>
                       </div>
 
-                      {/* Time-series telemetry chart — battery, signal, environment */}
-                      <TelemetryChart nodeId={selectedNode.id} />
+                      {/* Time-series telemetry chart — battery, signal, environment.
+                          Lazy-loaded; recharts is heavy. */}
+                      <React.Suspense fallback={
+                        <div className="h-44 bg-brand-bg/40 rounded border border-brand-line/50 flex items-center justify-center">
+                          <Loader2 size={16} className="animate-spin text-brand-muted" />
+                        </div>
+                      }>
+                        <TelemetryChart nodeId={selectedNode.id} />
+                      </React.Suspense>
+
+                      {/* Per-node uptime / availability stats sourced from the
+                          `node_sessions` table. Not all nodes have enough history
+                          to show meaningful peak hours yet — the widget gracefully
+                          degrades when we have no observations in the window. */}
+                      <NodeUptimeWidget
+                        nodeId={selectedNode.id}
+                        currentlyOnline={selectedNode.online}
+                        dataSource={dataSource}
+                      />
                     </div>
                   ) : (
                     <div className="h-full flex flex-col items-center justify-center text-center space-y-4 opacity-50">

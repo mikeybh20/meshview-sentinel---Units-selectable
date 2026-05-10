@@ -100,18 +100,18 @@ export function WaypointEditorModal({ initial, isEditing, onSave, onDelete, onCl
   return (
     <div className="fixed inset-0 bg-brand-bg/85 backdrop-blur-md z-[200] flex items-center justify-center p-6">
       <div
-        className="rounded-lg border border-emerald-500/30 w-full max-w-md overflow-hidden flex flex-col max-h-[90vh]"
-        style={{ background: '#020617', boxShadow: '0 20px 60px rgba(0,0,0,0.7)' }}
+        className="rounded-lg border border-brand-accent/30 w-full max-w-md overflow-hidden flex flex-col max-h-[90vh]"
+        style={{ background: 'var(--color-brand-bg)', boxShadow: '0 20px 60px rgba(0,0,0,0.7)' }}
       >
         {/* Header */}
-        <div className="px-5 py-3 border-b border-slate-800 flex items-center justify-between">
+        <div className="px-5 py-3 border-b border-brand-line flex items-center justify-between">
           <div className="flex items-center gap-2.5">
-            <MapPin size={16} className="text-emerald-400" />
-            <h3 className="text-sm font-bold tracking-tight uppercase text-white">
+            <MapPin size={16} className="text-brand-accent" />
+            <h3 className="text-sm font-bold tracking-tight uppercase text-brand-ink">
               {isEditing ? 'Edit Waypoint' : 'Drop Waypoint'}
             </h3>
           </div>
-          <button onClick={onClose} className="p-1 text-slate-400 hover:text-white hover:bg-slate-800 rounded transition-colors">
+          <button onClick={onClose} className="p-1 text-brand-muted hover:text-brand-ink hover:bg-brand-line rounded transition-colors">
             <X size={18} />
           </button>
         </div>
@@ -119,28 +119,28 @@ export function WaypointEditorModal({ initial, isEditing, onSave, onDelete, onCl
         {/* Body */}
         <div className="flex-1 overflow-y-auto p-5 space-y-4">
           {/* Position */}
-          <div className="bg-slate-800/60 border border-slate-700 rounded px-3 py-2">
-            <p className="text-[9px] uppercase font-semibold text-slate-400 mb-0.5">Position</p>
-            <p className="text-xs mono-text text-slate-200">
+          <div className="bg-brand-line/60 border border-brand-line rounded px-3 py-2">
+            <p className="text-[9px] uppercase font-semibold text-brand-muted mb-0.5">Position</p>
+            <p className="text-xs mono-text text-brand-ink">
               {initial.lat.toFixed(5)}, {initial.lng.toFixed(5)}
             </p>
           </div>
 
           {/* Icon picker */}
           <div className="space-y-1.5">
-            <label className="text-[10px] uppercase font-bold text-slate-400">Icon</label>
+            <label className="text-[10px] uppercase font-bold text-brand-muted">Icon</label>
             <div className="flex items-center gap-2">
               <button
                 type="button"
                 onClick={() => setShowPicker(p => !p)}
-                className="w-12 h-12 flex items-center justify-center text-2xl bg-slate-800 border border-slate-700 rounded hover:border-emerald-500/50 transition-colors"
+                className="w-12 h-12 flex items-center justify-center text-2xl bg-brand-line border border-brand-line rounded hover:border-brand-accent/50 transition-colors"
               >
                 {codepointToEmoji(icon) || '📍'}
               </button>
-              <p className="text-[10px] text-slate-500">Click to change</p>
+              <p className="text-[10px] text-brand-muted">Click to change</p>
             </div>
             {showPicker && (
-              <div className="rounded overflow-hidden border border-slate-700">
+              <div className="rounded overflow-hidden border border-brand-line">
                 <EmojiPicker
                   theme={Theme.DARK}
                   emojiStyle={EmojiStyle.NATIVE}
@@ -160,37 +160,37 @@ export function WaypointEditorModal({ initial, isEditing, onSave, onDelete, onCl
 
           {/* Name */}
           <div className="space-y-1.5">
-            <label className="text-[10px] uppercase font-bold text-slate-400">Name</label>
+            <label className="text-[10px] uppercase font-bold text-brand-muted">Name</label>
             <input
               type="text"
               value={name}
               onChange={e => setName(e.target.value)}
               placeholder="e.g. Trailhead, Repeater Site"
               maxLength={30}
-              className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500/50"
+              className="w-full bg-brand-line border border-brand-line rounded px-3 py-2 text-sm text-brand-ink placeholder-slate-500 focus:outline-none focus:border-brand-accent/50"
             />
           </div>
 
           {/* Description */}
           <div className="space-y-1.5">
-            <label className="text-[10px] uppercase font-bold text-slate-400">Description</label>
+            <label className="text-[10px] uppercase font-bold text-brand-muted">Description</label>
             <textarea
               value={description}
               onChange={e => setDescription(e.target.value)}
               placeholder="Optional notes"
               rows={3}
               maxLength={100}
-              className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500/50 resize-none"
+              className="w-full bg-brand-line border border-brand-line rounded px-3 py-2 text-sm text-brand-ink placeholder-slate-500 focus:outline-none focus:border-brand-accent/50 resize-none"
             />
           </div>
 
           {/* Expire */}
           <div className="space-y-1.5">
-            <label className="text-[10px] uppercase font-bold text-slate-400">Expires</label>
+            <label className="text-[10px] uppercase font-bold text-brand-muted">Expires</label>
             <select
               value={expirePreset}
               onChange={e => setExpirePreset(e.target.value as ExpirePreset)}
-              className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-white focus:outline-none focus:border-emerald-500/50"
+              className="w-full bg-brand-line border border-brand-line rounded px-3 py-2 text-sm text-brand-ink focus:outline-none focus:border-brand-accent/50"
             >
               {EXPIRE_OPTIONS.map(o => (
                 <option key={o.value} value={o.value}>{o.label}</option>
@@ -206,24 +206,24 @@ export function WaypointEditorModal({ initial, isEditing, onSave, onDelete, onCl
               onChange={e => setLockedToSelf(e.target.checked)}
               className="w-4 h-4 accent-emerald-500"
             />
-            <span className="text-xs text-slate-200">Only I can edit or delete this waypoint</span>
+            <span className="text-xs text-brand-ink">Only I can edit or delete this waypoint</span>
           </label>
         </div>
 
         {/* Footer */}
-        <div className="px-5 py-3 border-t border-slate-800 flex items-center justify-between gap-2">
+        <div className="px-5 py-3 border-t border-brand-line flex items-center justify-between gap-2">
           {isEditing && onDelete ? (
             confirmDelete ? (
               <div className="flex items-center gap-2">
                 <button
                   onClick={async () => { await onDelete(); }}
-                  className="text-xs font-bold uppercase tracking-widest text-red-400 hover:text-red-300 px-2 py-1.5"
+                  className="text-xs font-bold uppercase tracking-widest text-brand-error hover:text-brand-error px-2 py-1.5"
                 >
                   Confirm
                 </button>
                 <button
                   onClick={() => setConfirmDelete(false)}
-                  className="text-xs text-slate-400 hover:text-white px-2 py-1.5"
+                  className="text-xs text-brand-muted hover:text-brand-ink px-2 py-1.5"
                 >
                   Cancel
                 </button>
@@ -231,7 +231,7 @@ export function WaypointEditorModal({ initial, isEditing, onSave, onDelete, onCl
             ) : (
               <button
                 onClick={() => setConfirmDelete(true)}
-                className="flex items-center gap-1.5 text-xs font-bold uppercase tracking-widest text-red-400 hover:text-red-300 px-2 py-1.5"
+                className="flex items-center gap-1.5 text-xs font-bold uppercase tracking-widest text-brand-error hover:text-brand-error px-2 py-1.5"
               >
                 <Trash2 size={12} />
                 Delete
@@ -242,14 +242,14 @@ export function WaypointEditorModal({ initial, isEditing, onSave, onDelete, onCl
           <div className="flex items-center gap-2">
             <button
               onClick={onClose}
-              className="text-xs font-bold uppercase tracking-widest text-slate-400 hover:text-white px-3 py-1.5"
+              className="text-xs font-bold uppercase tracking-widest text-brand-muted hover:text-brand-ink px-3 py-1.5"
             >
               Cancel
             </button>
             <button
               onClick={handleSave}
               disabled={isSaving}
-              className="flex items-center gap-1.5 bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/50 text-emerald-300 hover:text-emerald-200 text-xs font-bold uppercase tracking-widest rounded px-3 py-1.5 transition-colors disabled:opacity-50"
+              className="flex items-center gap-1.5 bg-brand-accent/20 hover:bg-brand-accent/30 border border-brand-accent/50 text-brand-accent hover:text-emerald-200 text-xs font-bold uppercase tracking-widest rounded px-3 py-1.5 transition-colors disabled:opacity-50"
             >
               <Save size={12} />
               {isSaving ? 'Saving...' : 'Save'}

@@ -4,21 +4,18 @@
  */
 
 import React from 'react';
-import { 
-  LayoutDashboard, 
-  Map as MapIcon, 
-  MessageSquare, 
-  Settings, 
-  Activity, 
-  Signal, 
-  History, 
+import {
+  LayoutDashboard,
+  Map as MapIcon,
+  MessageSquare,
+  Settings,
+  Activity,
+  Signal,
+  History,
   Star,
   Search,
   Plus,
   FileDown,
-  FileUp,
-  Globe,
-  TrendingUp,
   Radio,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
@@ -30,6 +27,7 @@ import { IncomingContactToast } from './components/IncomingContactToast';
 import { useMeshNotifications } from './hooks/useMeshNotifications';
 import { parseDeepLinkFromHash, clearHash, DeepLink } from './lib/deepLink';
 import { useBlockList } from './hooks/useBlockList';
+import { useTheme } from './hooks/useTheme';
 import { Node, Message, RadioEvent, Group, WidgetConfig, UnitSystem, Channel, Waypoint, TraceResult, NeighborInfoSnapshot, StoreForwardRouter, LocalModuleConfigSnapshot } from './types';
 import { cn } from './lib/utils';
 import { TopologyView } from './components/TopologyView';
@@ -48,13 +46,13 @@ import { MapView } from './components/views/MapView';
 import { MessagesView } from './components/views/MessagesView';
 import { LogsView } from './components/views/LogsView';
 import { MatrixView } from './components/views/MatrixView';
-import { RouteIntelView } from './components/views/RouteIntelView';
 
 export default function App() {
+  const theme = useTheme();
   const [nodes, setNodes] = React.useState<Node[]>([]);
   const [messages, setMessages] = React.useState<Message[]>([]);
   const [events, setEvents] = React.useState<RadioEvent[]>([]);
-  const [activeTab, setActiveTab] = React.useState<'dashboard' | 'map' | 'messages' | 'logs' | 'matrix' | 'topology' | 'recipe' | 'routes'>('dashboard');
+  const [activeTab, setActiveTab] = React.useState<'dashboard' | 'map' | 'messages' | 'logs' | 'matrix' | 'topology' | 'recipe'>('dashboard');
   const [selectedNodeId, setSelectedNodeId] = React.useState<string | null>(null);
   const [configuringNodeId, setConfiguringNodeId] = React.useState<string | null>(null);
   const [showExportModal, setShowExportModal] = React.useState(false);
@@ -313,7 +311,7 @@ export default function App() {
     } else {
       // Simulator path: keep client-side state for development
       const newGroup: Group = {
-        id: Math.random().toString(36).substr(2, 9),
+        id: Math.random().toString(36).substring(2, 11),
         name,
         color: newGroupColor,
       };
@@ -333,6 +331,15 @@ export default function App() {
       setNodes(prev => prev.map(n => n.groupId === groupId ? { ...n, groupId: undefined } : n));
     }
     if (selectedGroupId === groupId) setSelectedGroupId('all');
+  };
+
+  const handleRenameGroup = async (groupId: string, name: string) => {
+    if (dataSource === 'live') {
+      const r = await meshDataService.updateGroup(groupId, { name });
+      if (!r.ok) console.error('updateGroup failed:', r.error);
+    } else {
+      setGroups(prev => prev.map(g => g.id === groupId ? { ...g, name } : g));
+    }
   };
 
   const assignNodeToGroup = async (nodeId: string, groupId?: string) => {
@@ -397,14 +404,8 @@ export default function App() {
             icon={<Activity size={20} />}
             label="Topology"
           />
-          <NavItem 
-            active={activeTab === 'routes'} 
-            onClick={() => setActiveTab('routes')}
-            icon={<TrendingUp size={20} />}
-            label="Route Intel"
-          />
-          <NavItem 
-            active={activeTab === 'recipe'} 
+          <NavItem
+            active={activeTab === 'recipe'}
             onClick={() => setActiveTab('recipe')}
             icon={<FileDown size={20} />}
             label="Recipe Guide"
@@ -416,13 +417,13 @@ export default function App() {
               className={cn(
                 "w-full h-10 flex items-center justify-center md:justify-start gap-3 px-3 rounded-lg transition-all group",
                 dataSource === 'live' 
-                  ? "text-emerald-400 bg-emerald-500/10 hover:bg-emerald-500/20" 
+                  ? "text-brand-accent bg-brand-accent/10 hover:bg-brand-accent/20" 
                   : "text-brand-muted hover:bg-brand-line/10 hover:text-brand-accent"
               )}
             >
               <Radio size={20} className={cn(
                 "flex-shrink-0 transition-colors",
-                dataSource === 'live' ? "text-emerald-400" : "group-hover:text-brand-accent",
+                dataSource === 'live' ? "text-brand-accent" : "group-hover:text-brand-accent",
                 radioConnected && dataSource === 'live' && "animate-pulse"
               )} />
               <div className="hidden md:flex flex-col items-start overflow-hidden">
@@ -435,7 +436,7 @@ export default function App() {
                 </span>
                 <span className={cn(
                   "text-[8px] uppercase truncate leading-none mt-1",
-                  dataSource === 'live' && radioConnected ? "text-emerald-400" : "text-brand-muted"
+                  dataSource === 'live' && radioConnected ? "text-brand-accent" : "text-brand-muted"
                 )}>
                   {dataSource === 'live'
                     ? (radioConnected
@@ -488,6 +489,7 @@ export default function App() {
                       handleDeleteGroup(group.id);
                     }
                   }}
+                  onRename={(name) => handleRenameGroup(group.id, name)}
                 />
               ))}
             </div>
@@ -516,11 +518,13 @@ export default function App() {
       {/* Main Content */}
       <main className="flex-1 flex flex-col relative overflow-hidden">
         {/* Header */}
-        <header className="h-16 border-b border-brand-line flex items-center justify-between px-6 bg-brand-bg/80 backdrop-blur-sm z-40">
+        <header className="h-16 border-b border-brand-line flex items-center justify-between gap-2 px-3 sm:px-6 bg-brand-bg/80 backdrop-blur-sm z-40">
           <div className="flex items-center gap-6">
             <div className="flex items-baseline gap-2">
               <span className="text-2xl font-light">{activeTab.toUpperCase()}</span>
-              <span className="text-xs text-brand-muted mono-text tracking-widest hidden sm:inline">v2.4.0-STABLE</span>
+              <span className="text-xs text-brand-muted mono-text tracking-widest hidden sm:inline" title="Application version">
+                v{__APP_VERSION__}
+              </span>
             </div>
           </div>
 
@@ -535,10 +539,39 @@ export default function App() {
                 onChange={(e) => setSearchQuery(e.target.value)}
               />
             </div>
-            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-brand-line/30 border border-brand-line">
-              <Signal size={14} className="text-brand-accent" />
-              <span className="text-xs font-medium mono-text">MQTT: ONLINE</span>
-            </div>
+            {(() => {
+              // Truthful MQTT status pill. Three states:
+              //   active   — local radio's MQTT module is enabled (authoritative readback)
+              //   observed — module disabled or unread, but at least one peer has been
+              //              seen via the MQTT bridge in the last 30 min
+              //   off      — neither (no MQTT traffic, no module enable)
+              const cutoff = Date.now() - 30 * 60 * 1000;
+              const moduleEnabled = !!localModuleConfig.mqtt?.enabled;
+              const observed = nodes.some(n => n.lastVia === 'mqtt' && n.lastSeen >= cutoff);
+              const state: 'active' | 'observed' | 'off' =
+                moduleEnabled ? 'active' : observed ? 'observed' : 'off';
+              const label =
+                state === 'active'   ? 'MQTT: ACTIVE' :
+                state === 'observed' ? 'MQTT: OBSERVED' :
+                                       'MQTT: OFF';
+              const tone =
+                state === 'active'   ? 'text-brand-accent' :
+                state === 'observed' ? 'text-brand-warning' :
+                                       'text-brand-muted';
+              const title =
+                state === 'active'   ? 'Local radio\'s MQTT module is enabled (per its admin readback). Per-channel uplink/downlink toggles still live in Channels.' :
+                state === 'observed' ? 'MQTT module not enabled here, but at least one peer has reached us via an MQTT bridge in the last 30 minutes.' :
+                                       'No MQTT activity. Configure the local module in Settings → Modules → MQTT, or wait for an MQTT-bridged peer to appear.';
+              return (
+                <div
+                  className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-brand-line/30 border border-brand-line"
+                  title={title}
+                >
+                  <Signal size={14} className={tone} />
+                  <span className={cn('text-xs font-medium mono-text', tone)}>{label}</span>
+                </div>
+              );
+            })()}
           </div>
         </header>
 
@@ -577,7 +610,7 @@ export default function App() {
                           onClick={() => setNewGroupColor(c)}
                           className={cn(
                             "w-7 h-7 rounded-full transition-all border-2",
-                            newGroupColor === c ? "border-white scale-110" : "border-transparent hover:border-brand-muted"
+                            newGroupColor === c ? "border-brand-ink scale-110" : "border-transparent hover:border-brand-muted"
                           )}
                           style={{ backgroundColor: c }}
                           title={c}
@@ -644,6 +677,7 @@ export default function App() {
                   }}
                   groups={groups}
                   onAssignGroup={(nodeId, groupId) => assignNodeToGroup(nodeId, groupId)}
+                  dataSource={dataSource}
                 />
               </motion.div>
             )}
@@ -791,18 +825,6 @@ export default function App() {
               </motion.div>
             )}
 
-            {activeTab === 'routes' && (
-              <motion.div 
-                key="routes"
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -10 }}
-                className="p-6 h-full overflow-hidden"
-              >
-                <RouteIntelView nodes={nodes} />
-              </motion.div>
-            )}
-
             {activeTab === 'recipe' && (
               <motion.div 
                 key="recipe"
@@ -882,6 +904,9 @@ export default function App() {
               setNotificationPermission={setNotificationPermission}
               unitSystem={unitSystem}
               setUnitSystem={setUnitSystem}
+              themePreference={theme.preference}
+              setThemePreference={theme.setPreference}
+              appliedTheme={theme.applied}
               onOpenExport={() => setShowExportModal(true)}
               onOpenImport={() => setShowImportModal(true)}
               blockedNodeIds={blockList.blocked}

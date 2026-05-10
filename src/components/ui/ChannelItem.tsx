@@ -16,7 +16,7 @@ export function ChannelItem({ name, active, count, isDM, isPkc, lastMsg, onClick
           {isPkc && (
             <Lock
               size={10}
-              className="text-emerald-400 flex-shrink-0"
+              className="text-brand-accent flex-shrink-0"
               aria-label="PKC encrypted"
             >
               <title>PKC encrypted</title>

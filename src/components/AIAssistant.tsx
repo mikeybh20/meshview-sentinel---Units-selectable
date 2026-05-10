@@ -23,7 +23,20 @@ export function AIAssistant({ nodes, messages, events }: AIAssistantProps) {
   const [input, setInput] = React.useState('');
   const [chatHistory, setChatHistory] = React.useState<ChatMessage[]>([]);
   const [isLoading, setIsLoading] = React.useState(false);
+  const [redactPii, setRedactPii] = React.useState(false);
   const scrollRef = React.useRef<HTMLDivElement>(null);
+  const API_BASE = import.meta.env.VITE_API_URL || '';
+
+  // Read the operator's redaction preference from the AI config when the
+  // assistant first opens. We deliberately re-fetch on each open (cheap, and
+  // means a Settings change is picked up without a hard reload).
+  React.useEffect(() => {
+    if (!isOpen) return;
+    fetch(`${API_BASE}/api/ai/config`)
+      .then(r => r.ok ? r.json() : null)
+      .then(cfg => { if (cfg && typeof cfg.redactPii === 'boolean') setRedactPii(cfg.redactPii); })
+      .catch(() => { /* fall back to non-redacted */ });
+  }, [isOpen, API_BASE]);
 
   React.useEffect(() => {
     if (scrollRef.current) {
@@ -45,7 +58,7 @@ export function AIAssistant({ nodes, messages, events }: AIAssistantProps) {
     setIsLoading(true);
 
     try {
-      const response = await geminiService.askAssistant(input, { nodes, messages, events });
+      const response = await geminiService.askAssistant(input, { nodes, messages, events }, { redactPii });
       const assistantMsg: ChatMessage = {
         role: 'assistant',
         content: response || "I'm sorry, I couldn't process that request.",
@@ -72,7 +85,7 @@ export function AIAssistant({ nodes, messages, events }: AIAssistantProps) {
       >
         <Bot size={24} className="group-hover:rotate-12 transition-transform" />
         <div className="absolute -top-1 -right-1">
-          <Sparkles size={14} className="text-white animate-pulse" />
+          <Sparkles size={14} className="text-brand-ink animate-pulse" />
         </div>
       </button>
     );
@@ -93,7 +106,17 @@ export function AIAssistant({ nodes, messages, events }: AIAssistantProps) {
             <Bot size={18} className="text-brand-accent" />
           </div>
           <div>
-            <h3 className="text-sm font-bold uppercase tracking-widest leading-none">Net-AI Assistant</h3>
+            <div className="flex items-center gap-1.5">
+              <h3 className="text-sm font-bold uppercase tracking-widest leading-none">Net-AI Assistant</h3>
+              {redactPii && (
+                <span
+                  className="text-[8px] mono-text uppercase font-bold tracking-widest text-brand-warning bg-brand-warning/15 border border-brand-warning/40 rounded px-1 py-0.5"
+                  title="PII redaction is on — only aggregate counts are sent to the AI provider. Toggle in Settings → AI."
+                >
+                  Redacted
+                </span>
+              )}
+            </div>
             {!isMinimized && <span className="text-[9px] text-brand-accent animate-pulse">SYSTEM ONLINE</span>}
           </div>
         </div>
@@ -151,7 +174,7 @@ export function AIAssistant({ nodes, messages, events }: AIAssistantProps) {
               )}>
                 <div className={cn(
                   "p-2 rounded-lg shrink-0",
-                  msg.role === 'user' ? "bg-brand-line text-white" : "bg-brand-accent/10 border border-brand-accent/20 text-brand-accent"
+                  msg.role === 'user' ? "bg-brand-line text-brand-ink" : "bg-brand-accent/10 border border-brand-accent/20 text-brand-accent"
                 )}>
                   {msg.role === 'user' ? <User size={14} /> : <Bot size={14} />}
                 </div>

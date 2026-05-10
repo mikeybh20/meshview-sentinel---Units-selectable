@@ -4,6 +4,7 @@ import { Node as MeshNode, NeighborInfoSnapshot, NeighborInfoModuleConfig, Group
 import { cn } from '../lib/utils';
 import { Search, Maximize2 } from 'lucide-react';
 import { hexToRgba } from '../lib/color';
+import { roleLabel, hardwareLabel } from '../lib/meshEnums';
 
 /** localStorage key prefix for persisting drag positions per node id. */
 const TOPOLOGY_LAYOUT_STORAGE_KEY = 'mesh.topologyLayout';
@@ -87,6 +88,7 @@ export function TopologyView({
   const onNodeSelectRef = React.useRef(onNodeSelect);
   const [focusedNodeId, setFocusedNodeId] = React.useState<string | null>(null);
   const [hoveredNodeId, setHoveredNodeId] = React.useState<string | null>(null);
+  const [hoverPos, setHoverPos] = React.useState<{ x: number; y: number } | null>(null);
   const [isFocusMode, setIsFocusMode] = React.useState(false);
   const [searchQuery, setSearchQuery] = React.useState('');
   const [searchResults, setSearchResults] = React.useState<MeshNode[]>([]);
@@ -222,11 +224,24 @@ export function TopologyView({
       }
     }
 
+    // Force simulation tuning notes:
+    //  - `distanceMax` bounds the charge force to the nearest ~350 px so we get
+    //    Barnes-Hut-with-cutoff behavior. Without this, every node attracts every
+    //    other node every tick, which is O(N²) and visibly stutters past ~120 nodes.
+    //  - `alphaDecay` was the default 0.0228 (settles in ~300 ticks); 0.045 cuts
+    //    that to ~150 ticks — perceptibly faster on a 134-node mesh, and the
+    //    final layout difference is invisible.
+    //  - `velocityDecay` 0.55 (was default 0.4) damps the bouncy oscillation that
+    //    otherwise persists for several seconds when many nodes are near-overlap.
+    //  - `forceManyBody` strength reduced -500 → -380 to compensate for the cutoff.
+    //  - `forceCollide.iterations` 1 (was default 1; explicit) keeps collide cheap.
     const simulation = d3.forceSimulation<Node>(graphData.nodes)
       .force('link', d3.forceLink<Node, Link>(graphData.links).id(d => d.id).distance(140).strength(0.6))
-      .force('charge', d3.forceManyBody().strength(-500))
+      .force('charge', d3.forceManyBody().strength(-380).distanceMax(350))
       .force('center', d3.forceCenter(width / 2, height / 2))
-      .force('collision', d3.forceCollide().radius(36));
+      .force('collision', d3.forceCollide().radius(36).iterations(1))
+      .alphaDecay(0.045)
+      .velocityDecay(0.55);
 
     // ---- Edges ----
     const link = container.append('g').attr('class', 'links')
@@ -280,8 +295,20 @@ export function TopologyView({
           );
         }
       })
-      .on('mouseenter', (_event, d: any) => { setHoveredNodeId(d.id); })
-      .on('mouseleave', () => { setHoveredNodeId(null); })
+      .on('mouseenter', (event: MouseEvent, d: any) => {
+        setHoveredNodeId(d.id);
+        if (svgRef.current) {
+          const rect = svgRef.current.getBoundingClientRect();
+          setHoverPos({ x: event.clientX - rect.left, y: event.clientY - rect.top });
+        }
+      })
+      .on('mousemove', (event: MouseEvent) => {
+        if (svgRef.current) {
+          const rect = svgRef.current.getBoundingClientRect();
+          setHoverPos({ x: event.clientX - rect.left, y: event.clientY - rect.top });
+        }
+      })
+      .on('mouseleave', () => { setHoveredNodeId(null); setHoverPos(null); })
       .call(d3.drag<SVGGElement, Node>()
         .on('start', (event, d: any) => {
           if (!event.active) simulation.alphaTarget(0.3).restart();
@@ -526,9 +553,84 @@ export function TopologyView({
   const niStateAuthoritative = !!neighborInfoConfig;
   const niIntervalSecs = neighborInfoConfig?.updateIntervalSecs ?? localNiSnapshot?.intervalSecs ?? 0;
 
+  // First-connect race: NodeInfo for the local node arrives a few seconds after
+  // the serial port opens. Until we know `localNodeId` we can't tell whether the
+  // banner should say "NOT BROADCASTING" — and in that brief window it would
+  // wrongly accuse a healthy radio. Suppress the negative state for the first
+  // ~6 s after a `localNodeId === null` mount so it shows "Identifying…" instead.
+  const [identifying, setIdentifying] = React.useState(localNodeId == null);
+  React.useEffect(() => {
+    if (localNodeId) { setIdentifying(false); return; }
+    setIdentifying(true);
+    const t = setTimeout(() => setIdentifying(false), 6000);
+    return () => clearTimeout(t);
+  }, [localNodeId]);
+
   return (
     <div className="w-full h-full relative overflow-hidden bg-brand-bg/20 rounded-xl border border-brand-line">
       <svg ref={svgRef} className="w-full h-full" />
+
+      {/* Hover tooltip — follows cursor when hovering a topology node */}
+      {hoveredNodeId && hoverPos && (() => {
+        const node = nodes.find(n => n.id === hoveredNodeId);
+        if (!node) return null;
+        const minutesSince = Math.floor((Date.now() - node.lastSeen) / 60000);
+        const lastSeenText = minutesSince < 1 ? 'just now' :
+          minutesSince < 60 ? `${minutesSince}m ago` :
+          minutesSince < 1440 ? `${Math.floor(minutesSince / 60)}h ago` :
+          `${Math.floor(minutesSince / 1440)}d ago`;
+        const role = roleLabel(node.role, true);
+        const hw = hardwareLabel(node.hwModel);
+        const groupName = groups.find(g => g.id === node.groupId)?.name;
+        const svgW = svgRef.current?.clientWidth ?? 0;
+        const svgH = svgRef.current?.clientHeight ?? 0;
+        // Flip the tooltip to the cursor's other side near the edges so it stays visible.
+        const flipX = hoverPos.x > svgW - 240;
+        const flipY = hoverPos.y > svgH - 160;
+        const left = flipX ? hoverPos.x - 12 - 220 : hoverPos.x + 18;
+        const top = flipY ? hoverPos.y - 12 - 140 : hoverPos.y + 14;
+        return (
+          <div
+            className="absolute z-20 pointer-events-none technical-panel bg-brand-bg/95 backdrop-blur-md p-2.5 min-w-[200px] max-w-[260px] shadow-lg"
+            style={{ left, top }}
+          >
+            <div className="flex items-center gap-2 mb-1.5">
+              {node.shortName && (
+                <span className="text-[9px] mono-text text-brand-accent bg-brand-accent/10 border border-brand-accent/30 px-1 py-0.5 rounded shrink-0">
+                  {node.shortName}
+                </span>
+              )}
+              <span className="text-xs font-bold truncate">{node.name}</span>
+              <span className={cn("w-1.5 h-1.5 rounded-full shrink-0 ml-auto", node.online ? 'bg-brand-accent' : 'bg-brand-muted')} />
+            </div>
+            <div className="text-[10px] mono-text text-brand-muted truncate">
+              {node.id}{hw ? ` · ${hw}` : ''}
+            </div>
+            <div className="mt-1.5 grid grid-cols-2 gap-x-2 gap-y-0.5 text-[10px] mono-text">
+              <span className="text-brand-muted">Last seen</span>
+              <span className="text-brand-ink text-right">{lastSeenText}</span>
+              {role && (<><span className="text-brand-muted">Role</span><span className="text-brand-ink text-right">{role}</span></>)}
+              {node.isLicensed && (<><span className="text-brand-muted">Licensed</span><span className="text-brand-warning text-right">LIC</span></>)}
+              {node.lastVia === 'mqtt' && (<><span className="text-brand-muted">Via</span><span className="text-brand-info text-right">MQTT</span></>)}
+              {node.telemetry && (
+                <>
+                  {typeof node.telemetry.battery === 'number' && node.telemetry.battery > 0 && (
+                    <><span className="text-brand-muted">Battery</span><span className="text-brand-ink text-right">{Math.round(node.telemetry.battery)}%</span></>
+                  )}
+                  {typeof node.telemetry.snr === 'number' && node.telemetry.snr !== 0 && (
+                    <><span className="text-brand-muted">SNR</span><span className="text-brand-ink text-right">{node.telemetry.snr.toFixed(1)} dB</span></>
+                  )}
+                  {typeof node.telemetry.rssi === 'number' && node.telemetry.rssi !== 0 && (
+                    <><span className="text-brand-muted">RSSI</span><span className="text-brand-ink text-right">{Math.round(node.telemetry.rssi)} dBm</span></>
+                  )}
+                </>
+              )}
+              {groupName && (<><span className="text-brand-muted">Group</span><span className="text-brand-ink text-right truncate">{groupName}</span></>)}
+              {node.favorite && (<><span className="text-brand-muted">Favorite</span><span className="text-brand-warning text-right">★</span></>)}
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Camera controls — fit-to-view + reset layout */}
       <div className="absolute top-4 right-72 z-10 flex items-center gap-1 pointer-events-auto">
@@ -599,15 +701,15 @@ export function TopologyView({
         <h4 className="text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-2">Topology Legend</h4>
         <div className="space-y-1.5">
           <div className="flex items-center gap-2">
-            <div className="w-3 h-3 rounded-full bg-emerald-500/30 border-2 border-emerald-400" />
+            <div className="w-3 h-3 rounded-full bg-brand-accent/30 border-2 border-emerald-400" />
             <span className="text-[9px] mono-text uppercase">Home / Online</span>
           </div>
           <div className="flex items-center gap-2">
-            <div className="w-3 h-3 rounded-full bg-amber-500/20 border-2 border-amber-400" />
+            <div className="w-3 h-3 rounded-full bg-brand-warning/20 border-2 border-amber-400" />
             <span className="text-[9px] mono-text uppercase">Favorite</span>
           </div>
           <div className="flex items-center gap-2">
-            <div className="w-3 h-3 rounded-full bg-slate-700 border-2 border-slate-500" />
+            <div className="w-3 h-3 rounded-full bg-brand-line border-2 border-brand-muted" />
             <span className="text-[9px] mono-text uppercase">Offline</span>
           </div>
           <div className="flex items-center gap-2 pt-1 border-t border-brand-line">
@@ -615,7 +717,7 @@ export function TopologyView({
             <span className="text-[9px] mono-text uppercase">NeighborInfo Link</span>
           </div>
           <div className="flex items-center gap-2">
-            <div className="w-4 h-0.5 bg-emerald-500/50" style={{ borderTop: '1px dashed' }} />
+            <div className="w-4 h-0.5 bg-brand-accent/50" style={{ borderTop: '1px dashed' }} />
             <span className="text-[9px] mono-text uppercase">Inferred Link</span>
           </div>
         </div>
@@ -634,12 +736,12 @@ export function TopologyView({
             <span className="text-brand-muted"> NeighborInfo links{edgeCount > neighborEdgeCount ? ` · ${edgeCount - neighborEdgeCount} inferred` : ''}</span>
           </p>
           {edgeCount === 0 && (
-            <p className="text-[9px] text-amber-400 leading-snug">
+            <p className="text-[9px] text-brand-warning leading-snug">
               No edges yet. Topology fills in as nodes report (NeighborInfo packets every few minutes when the module is enabled).
             </p>
           )}
           {usingInferredEdges && (
-            <p className="text-[9px] text-amber-400/80 leading-snug">
+            <p className="text-[9px] text-brand-warning/80 leading-snug">
               Showing inferred home-base links — enable the NeighborInfo module on your radio for accurate topology.
             </p>
           )}
@@ -649,19 +751,33 @@ export function TopologyView({
               <div className="flex items-center justify-between gap-2">
                 <div className="flex items-center gap-1.5">
                   <span
-                    className={`w-1.5 h-1.5 rounded-full ${niLocallyActive ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'}`}
-                    title={niLocallyActive ? 'Local radio is broadcasting NeighborInfo' : 'No NeighborInfo broadcasts observed from local radio yet'}
+                    className={`w-1.5 h-1.5 rounded-full ${
+                      identifying ? 'bg-brand-warning animate-pulse'
+                      : niLocallyActive ? 'bg-brand-accent animate-pulse'
+                      : 'bg-brand-muted'
+                    }`}
+                    title={
+                      identifying ? 'Waiting for the radio to report its node id (MyNodeInfo)'
+                      : niLocallyActive ? 'Local radio is broadcasting NeighborInfo'
+                      : 'No NeighborInfo broadcasts observed from local radio yet'
+                    }
                   />
                   <span className="text-[9px] font-bold uppercase tracking-widest text-brand-muted">
                     NeighborInfo:
                   </span>
-                  <span className={`text-[9px] font-bold mono-text ${niLocallyActive ? 'text-emerald-400' : 'text-slate-400'}`}>
-                    {niLocallyActive
-                      ? `ACTIVE${niIntervalSecs ? ` · ${Math.round(niIntervalSecs / 60)}min` : ''}`
-                      : niStateAuthoritative ? 'DISABLED' : 'NOT BROADCASTING'}
+                  <span className={`text-[9px] font-bold mono-text ${
+                    identifying ? 'text-brand-warning'
+                    : niLocallyActive ? 'text-brand-accent'
+                    : 'text-brand-muted'
+                  }`}>
+                    {identifying
+                      ? 'IDENTIFYING…'
+                      : niLocallyActive
+                        ? `ACTIVE${niIntervalSecs ? ` · ${Math.round(niIntervalSecs / 60)}min` : ''}`
+                        : niStateAuthoritative ? 'DISABLED' : 'NOT BROADCASTING'}
                   </span>
-                  {!niStateAuthoritative && canConfigureRadio && (
-                    <span title="Inferred from observed traffic (no admin readback yet)" className="text-[8px] text-slate-500 italic">
+                  {!identifying && !niStateAuthoritative && canConfigureRadio && (
+                    <span title="Inferred from observed traffic (no admin readback yet)" className="text-[8px] text-brand-muted italic">
                       inferred
                     </span>
                   )}
@@ -678,7 +794,7 @@ export function TopologyView({
                       else setNiResult({ kind: 'error', text: r.error ?? 'Disable failed' });
                     }}
                     disabled={niBusy}
-                    className="text-[9px] font-bold uppercase tracking-widest bg-red-500/10 hover:bg-red-500/20 border border-red-500/40 text-red-300 hover:text-red-200 rounded px-2 py-1 transition-colors disabled:opacity-50 pointer-events-auto"
+                    className="text-[9px] font-bold uppercase tracking-widest bg-brand-error/10 hover:bg-brand-error/20 border border-brand-error/40 text-brand-error hover:text-red-200 rounded px-2 py-1 transition-colors disabled:opacity-50 pointer-events-auto"
                   >
                     {niBusy ? 'Disabling…' : 'Disable'}
                   </button>
@@ -701,7 +817,7 @@ export function TopologyView({
                 )}
               </div>
               {niResult && (
-                <p className={`text-[9px] leading-snug ${niResult.kind === 'ok' ? 'text-emerald-400' : 'text-red-400'}`}>
+                <p className={`text-[9px] leading-snug ${niResult.kind === 'ok' ? 'text-brand-accent' : 'text-brand-error'}`}>
                   {niResult.text}
                 </p>
               )}

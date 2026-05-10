@@ -7,7 +7,21 @@
 import { EventEmitter } from 'events';
 import { SerialPort } from 'serialport';
 import * as net from 'net';
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
 import { meshDb, type MeshDatabase } from './database.js';
+
+const __filename_local = fileURLToPath(import.meta.url);
+const __dirname_local = dirname(__filename_local);
+/**
+ * On-disk cache of the local radio's module config snapshot. Lets us preserve
+ * the operator's configured values across container rebuilds even when the
+ * firmware doesn't reply to the post-boot admin readback (some firmware
+ * versions silently ignore self-admin reads). The actual radio config in flash
+ * is always authoritative — this file is best-effort.
+ */
+const LOCAL_MODULE_CONFIG_PATH = join(__dirname_local, '..', 'data', 'local-module-config.json');
 
 // ---- App data types (mirrored from src/types.ts for server use) ----
 
@@ -78,6 +92,13 @@ export interface MeshMessage {
   replyTo?: number;
   /** True if this message is a tapback/reaction (Data.emoji != 0). The text holds the emoji. */
   isReaction?: boolean;
+  /**
+   * Wall-clock latency between the operator's send and the radio's ACK
+   * (in ms). Captured at the moment we receive the ROUTING ACK or QueueStatus
+   * success for a message we sent. Undefined for messages where we never
+   * observed an ACK or for inbound messages.
+   */
+  deliveryMs?: number;
 }
 
 export interface MeshEvent {
@@ -104,6 +125,14 @@ export interface MeshChannel {
   pskBase64: string;        // raw PSK bytes encoded as base64
   uplinkEnabled: boolean;
   downlinkEnabled: boolean;
+  /**
+   * Per-channel position precision (ChannelSettings.module_settings.position_precision).
+   * Number of high-order coordinate bits the firmware will share when broadcasting positions
+   * on this channel. 0 = position sharing disabled on this channel; 32 = full precision;
+   * intermediate values fuzz to a coarser grid (each bit ≈ doubles the uncertainty radius).
+   * `undefined` = not yet read from the radio (treat as firmware default = 32).
+   */
+  positionPrecision?: number;
 }
 
 export interface MeshWaypoint {
@@ -167,9 +196,176 @@ export interface NeighborInfoModuleConfig {
   lastReadAt: number;
 }
 
+export interface RangeTestModuleConfig {
+  /** True if the Range Test module is enabled at all (sender or receiver). */
+  enabled: boolean;
+  /** Send interval in seconds. 0 = receive-only mode. Firmware default: 0. */
+  senderIntervalSecs: number;
+  /** Persist results to flash (the radio's CSV log). */
+  save: boolean;
+  /** Epoch ms when this config was last read from the radio. */
+  lastReadAt: number;
+}
+
+export interface TelemetryModuleConfig {
+  /** Device metrics (battery, voltage, ch util) broadcast interval (s). 0 = firmware default. */
+  deviceUpdateIntervalSecs: number;
+  /** True if the radio publishes environment-sensor telemetry (BME280, etc.). */
+  environmentEnabled: boolean;
+  /** Environment-sensor broadcast interval (s). 0 = firmware default. */
+  environmentUpdateIntervalSecs: number;
+  /** True if the radio publishes power-monitor telemetry (INA219/INA260). */
+  powerEnabled: boolean;
+  /** Power-monitor broadcast interval (s). 0 = firmware default. */
+  powerUpdateIntervalSecs: number;
+  /** Epoch ms when this config was last read from the radio. */
+  lastReadAt: number;
+}
+
+export interface DetectionSensorModuleConfig {
+  /** True if the Detection Sensor module is enabled. */
+  enabled: boolean;
+  /** Minimum seconds between broadcasts even if state changes (rate limit). */
+  minimumBroadcastSecs: number;
+  /** Periodic state broadcast interval in seconds (0 = no periodic broadcast). */
+  stateBroadcastSecs: number;
+  /** Send the bell character (^G) so it triggers external-notification alerts. */
+  sendBell: boolean;
+  /** Operator-friendly sensor name shown in broadcast messages. */
+  name: string;
+  /** GPIO pin being monitored for state changes. */
+  monitorPin: number;
+  /** True = detection triggers when pin reads HIGH; false = LOW (active-low). */
+  detectionTriggeredHigh: boolean;
+  /** Enable the MCU's internal pull-up resistor on the monitor pin. */
+  usePullup: boolean;
+  /** Epoch ms when this config was last read from the radio. */
+  lastReadAt: number;
+}
+
+export interface AudioModuleConfig {
+  /** Codec2 voice over LoRa enabled. */
+  codec2Enabled: boolean;
+  /** PTT (push-to-talk) GPIO pin. */
+  pttPin: number;
+  /** Codec2 mode/bitrate variant (uint32 enum). */
+  bitrate: number;
+  /** I2S word-select GPIO pin. */
+  i2sWs: number;
+  /** I2S serial-data GPIO pin. */
+  i2sSd: number;
+  /** I2S DOUT GPIO pin. */
+  i2sDin: number;
+  /** I2S serial-clock GPIO pin. */
+  i2sSck: number;
+  /** Epoch ms when this config was last read from the radio. */
+  lastReadAt: number;
+}
+
+export interface MqttModuleConfig {
+  /** Master enable for the MQTT module on the local radio. */
+  enabled: boolean;
+  /** Broker hostname/IP, e.g. "mqtt.meshtastic.org" or "192.168.1.10". Empty = use firmware default. */
+  address: string;
+  /** Broker username (blank = anonymous). */
+  username: string;
+  /** Broker password (blank = anonymous). */
+  password: string;
+  /** Encrypt MQTT payloads with the per-channel PSK before publish (recommended). */
+  encryptionEnabled: boolean;
+  /** Publish unencrypted JSON for IoT-bridge consumers (mutually exclusive with encryption in practice). */
+  jsonEnabled: boolean;
+  /** Use TLS to the broker. */
+  tlsEnabled: boolean;
+  /** Topic prefix, e.g. "msh/US/2/e/". Empty = firmware default. */
+  root: string;
+  /** Radio uses the connected client (this app's bridge or a phone) to reach MQTT, instead of its own WiFi. */
+  proxyToClientEnabled: boolean;
+  /** Publish positions to the public Meshtastic map. */
+  mapReportingEnabled: boolean;
+  /** Opaque MapReportSettings submessage — captured raw from readback so we can echo it on save without dropping bits we don't model. */
+  mapReportSettingsRaw: string | null;
+  /** Epoch ms when this config was last read from the radio. */
+  lastReadAt: number;
+}
+
+export interface ExternalNotificationModuleConfig {
+  /** True if the External Notification module is enabled. */
+  enabled: boolean;
+  /** Alert duration in milliseconds (how long the buzzer / LED stays on per alert). */
+  outputMs: number;
+  /** Generic alert GPIO pin (firmware default; board-specific). */
+  output: number;
+  /** Whether the alert pin is active-high (true) or active-low (false). */
+  active: boolean;
+  /** Alert on any text message. */
+  alertMessage: boolean;
+  /** Alert only on the bell character (^G) inside text messages. */
+  alertBell: boolean;
+  /** Use PWM output instead of digital high/low. */
+  usePwm: boolean;
+  /** Vibration motor GPIO pin. */
+  outputVibra: number;
+  /** Buzzer GPIO pin (separate from generic output). */
+  outputBuzzer: number;
+  /** Vibrate on text message. */
+  alertMessageVibra: boolean;
+  /** Buzzer on text message. */
+  alertMessageBuzzer: boolean;
+  /** Vibrate on bell character. */
+  alertBellVibra: boolean;
+  /** Buzzer on bell character. */
+  alertBellBuzzer: boolean;
+  /** Keep nagging for this many seconds until the user dismisses on the radio. */
+  nagTimeout: number;
+  /** Drive an I2S amplifier as the buzzer (advanced hardware option). */
+  useI2sAsBuzzer: boolean;
+  /** Epoch ms when this config was last read from the radio. */
+  lastReadAt: number;
+}
+
+export interface StoreForwardLocalConfig {
+  /** True if the Store & Forward module is enabled (as client or server). */
+  enabled: boolean;
+  /** True if this radio acts as an S&F router/server (buffers traffic + replays on request). */
+  isServer: boolean;
+  /** Emit periodic heartbeat announcing as router. Only meaningful when isServer=true. */
+  heartbeat: boolean;
+  /** Max records to retain in the buffer (router only). 0 = firmware default. */
+  records: number;
+  /** Max records replayed per CLIENT_HISTORY request (router only). 0 = firmware default. */
+  historyReturnMax: number;
+  /** Time window in minutes a CLIENT_HISTORY request may ask for (router only). 0 = firmware default. */
+  historyReturnWindow: number;
+  /** Epoch ms when this config was last read from the radio. */
+  lastReadAt: number;
+}
+
 export interface LocalModuleConfigSnapshot {
   /** Authoritative NeighborInfo config read from the radio via admin readback. */
   neighborInfo?: NeighborInfoModuleConfig;
+  /** Authoritative Range Test config read from the radio via admin readback. */
+  rangeTest?: RangeTestModuleConfig;
+  /** Authoritative Telemetry-module config read from the radio via admin readback. */
+  telemetry?: TelemetryModuleConfig;
+  /** Authoritative Store & Forward module config (local radio's S&F role / params). */
+  storeForward?: StoreForwardLocalConfig;
+  /** Authoritative External Notification module config (buzzer / LED / vibra alerts). */
+  externalNotification?: ExternalNotificationModuleConfig;
+  /** Authoritative MQTT module config (broker URL / auth / encryption / topic). */
+  mqtt?: MqttModuleConfig;
+  /** Authoritative Detection Sensor module config (GPIO state broadcasts). */
+  detectionSensor?: DetectionSensorModuleConfig;
+  /** Authoritative Audio module config (Codec2 voice over LoRa). */
+  audio?: AudioModuleConfig;
+  /**
+   * Active timed surveys: epoch-ms restore deadlines for any module currently
+   * running an accelerated cadence. `null` for any module that's not in survey mode.
+   */
+  activeSurveys?: {
+    rangeTestExpiresAt: number | null;
+    neighborInfoExpiresAt: number | null;
+  };
 }
 
 export interface MeshStoreForwardRouter {
@@ -249,6 +445,13 @@ export class MeshtasticSerialBridge extends EventEmitter {
   private _connected = false;
   private localNodeId: string | null = null;
   private localNodeNum: number = 0;
+  /**
+   * Firmware version string the radio reports about itself, e.g. "2.5.13.55c2c5b".
+   * Sourced from MyNodeInfo.firmware_version (older firmware) or
+   * FromRadio.metadata.firmware_version (newer firmware via DeviceMetadata).
+   */
+  private localFirmwareVersion: string | null = null;
+  private localRebootCount: number | null = null;
   private channels = new Map<number, MeshChannel>();
   private waypoints = new Map<number, MeshWaypoint>();
   private traces = new Map<string, MeshTraceResult>();
@@ -262,8 +465,23 @@ export class MeshtasticSerialBridge extends EventEmitter {
   private localModuleConfig: LocalModuleConfigSnapshot = {};
   /** Operator-defined node groups (for organizing the mesh into Field Team / Logistics / etc.). */
   private groups = new Map<string, MeshGroup>();
+  // ---- Timed module surveys ----
+  // A "survey" temporarily reconfigures a module to a faster cadence to
+  // accelerate coverage / topology discovery, then restores the previous
+  // config after a fixed duration. State is in-memory only — if the server
+  // restarts mid-survey, the radio keeps the survey config until the operator
+  // explicitly reverts via Save.
+  private rangeTestSurveyTimer: ReturnType<typeof setTimeout> | null = null;
+  private rangeTestSurveyExpiresAt: number | null = null;
+  private rangeTestSurveyOriginal: Omit<RangeTestModuleConfig, 'lastReadAt'> | null = null;
+  private neighborInfoSurveyTimer: ReturnType<typeof setTimeout> | null = null;
+  private neighborInfoSurveyExpiresAt: number | null = null;
+  private neighborInfoSurveyOriginal: Omit<NeighborInfoModuleConfig, 'lastReadAt'> | null = null;
+
   /** Hours to keep events around. Set via setEventRetention(). */
   private eventRetentionHours: number = 24;
+  /** Hours to keep messages around (parallel to events). 0 = keep all (count-cap only). */
+  private messageRetentionHours: number = 0;
   private retentionPruneTimer: ReturnType<typeof setInterval> | null = null;
   private db: MeshDatabase = meshDb();
 
@@ -324,6 +542,30 @@ export class MeshtasticSerialBridge extends EventEmitter {
       const persistedGroups = this.db.loadGroups();
       for (const g of persistedGroups) this.groups.set(g.id, g);
 
+      const persistedTraces = this.db.loadTraceResults();
+      for (const t of persistedTraces) this.traces.set(t.id, t);
+
+      // Boot-time session cleanup: any sessions still flagged "open" are
+      // orphans from a previous bridge process that crashed or was restarted
+      // mid-session. Close them at "now minus stale threshold" so the
+      // computed uptime reflects roughly when the node would have actually
+      // gone stale, not how long the bridge was down. New observations after
+      // this point start fresh sessions.
+      this.db.closeOrphanedSessions(Date.now() - this.staleThresholdMs);
+
+      // Hydrate the local-radio module config snapshot from disk. This is
+      // best-effort: when the radio replies to the post-boot admin readback,
+      // those authoritative values overwrite whatever we restored here. When
+      // the radio doesn't reply (some firmware versions don't), the operator
+      // still sees their last-known configuration in the UI rather than
+      // a blank "Reading…" state.
+      const persistedModuleConfig = this.loadLocalModuleConfigFromDisk();
+      if (persistedModuleConfig) {
+        this.localModuleConfig = persistedModuleConfig;
+        const keys = Object.keys(persistedModuleConfig).filter(k => k !== 'activeSurveys').join(', ') || 'none';
+        console.log(`[MeshtasticSerial] Hydrated local module config from disk (${keys})`);
+      }
+
       const s = this.db.stats();
       console.log(
         `[MeshtasticSerial] Hydrated from DB — nodes:${s.nodes} messages:${s.messages} events:${s.events} channels:${s.channels} telemetry:${s.telemetry}`
@@ -331,6 +573,50 @@ export class MeshtasticSerialBridge extends EventEmitter {
     } catch (err: any) {
       console.error('[MeshtasticSerial] DB hydration failed:', err.message);
     }
+  }
+
+  /**
+   * Read the local-module-config snapshot from disk, if it exists. Returns
+   * `null` on first boot, parse error, or file-system error — the caller
+   * starts with an empty snapshot and the first admin readback (or operator
+   * save) repopulates it.
+   */
+  private loadLocalModuleConfigFromDisk(): LocalModuleConfigSnapshot | null {
+    try {
+      if (!existsSync(LOCAL_MODULE_CONFIG_PATH)) return null;
+      const raw = readFileSync(LOCAL_MODULE_CONFIG_PATH, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        // Strip the ephemeral `activeSurveys` block — surveys are timer-driven
+        // and don't carry over a server restart (the radio keeps the survey
+        // config in flash; our timer-based restore doesn't).
+        const { activeSurveys: _drop, ...rest } = parsed as LocalModuleConfigSnapshot;
+        void _drop;
+        return rest as LocalModuleConfigSnapshot;
+      }
+    } catch (err: any) {
+      console.warn('[MeshtasticSerial] Failed to load local module config from disk:', err.message);
+    }
+    return null;
+  }
+
+  /**
+   * Persist the operator-modeled module config to disk. Emits the SSE update
+   * event in the same call so callers don't have to remember both. The
+   * `activeSurveys` field is excluded — its values are server-process-local.
+   */
+  private updateLocalModuleConfig() {
+    try {
+      const dir = dirname(LOCAL_MODULE_CONFIG_PATH);
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      // Don't persist the ephemeral surveys block.
+      const { activeSurveys: _drop, ...persistable } = this.localModuleConfig;
+      void _drop;
+      writeFileSync(LOCAL_MODULE_CONFIG_PATH, JSON.stringify(persistable, null, 2), 'utf-8');
+    } catch (err: any) {
+      console.error('[MeshtasticSerial] localModuleConfig persist failed:', err.message);
+    }
+    this.emit('localModuleConfigUpdate', this.localModuleConfig);
   }
 
   // How long before marking a node offline (ms)
@@ -467,7 +753,13 @@ export class MeshtasticSerialBridge extends EventEmitter {
 
   /** Authoritative module config last read from the local radio via admin readback. */
   getLocalModuleConfig(): LocalModuleConfigSnapshot {
-    return { ...this.localModuleConfig };
+    return {
+      ...this.localModuleConfig,
+      activeSurveys: {
+        rangeTestExpiresAt: this.rangeTestSurveyExpiresAt,
+        neighborInfoExpiresAt: this.neighborInfoSurveyExpiresAt,
+      },
+    };
   }
 
   /** Local node hex id (e.g. "!aabbccdd") if known, null otherwise. */
@@ -477,6 +769,16 @@ export class MeshtasticSerialBridge extends EventEmitter {
 
   getLocalNodeNum(): number {
     return this.localNodeNum;
+  }
+
+  /** Firmware version string the radio has reported about itself, if any. */
+  getLocalFirmwareVersion(): string | null {
+    return this.localFirmwareVersion;
+  }
+
+  /** Reboot count from MyNodeInfo (uptime / stability hint), if reported. */
+  getLocalRebootCount(): number | null {
+    return this.localRebootCount;
   }
 
   /** Connect to a serial port */
@@ -871,6 +1173,7 @@ export class MeshtasticSerialBridge extends EventEmitter {
         // FromRadio field numbers (meshtastic mesh.proto):
         //   2 = packet (MeshPacket), 3 = my_info (MyNodeInfo),
         //   4 = node_info (NodeInfo), 7 = config_complete_id,
+        //   8 = metadata (DeviceMetadata, newer firmware),
         //   10 = channel (Channel), 11 = queue_status (QueueStatus)
         if (fieldNumber === 2) {
           this.handleMeshPacket(subBuf);
@@ -878,6 +1181,8 @@ export class MeshtasticSerialBridge extends EventEmitter {
           this.handleMyInfo(subBuf);
         } else if (fieldNumber === 4) {
           this.handleNodeInfo(subBuf);
+        } else if (fieldNumber === 8) {
+          this.handleDeviceMetadata(subBuf);
         } else if (fieldNumber === 10) {
           this.handleChannel(subBuf);
         } else if (fieldNumber === 11) {
@@ -904,7 +1209,14 @@ export class MeshtasticSerialBridge extends EventEmitter {
     return { value, bytesRead };
   }
 
-  /** Parse a MyNodeInfo submessage to learn the local radio's node number */
+  /**
+   * Parse a MyNodeInfo submessage. We capture:
+   *  - my_node_num   (field 1, varint)         — sets localNodeId / localNodeNum
+   *  - firmware_version (field 4, string)      — older firmware reports it here
+   *  - reboot_count  (field 8, varint)         — uptime / stability hint
+   * Newer firmware moves firmware_version into FromRadio.metadata (DeviceMetadata);
+   * we handle that elsewhere. Whichever path arrives first wins.
+   */
   private handleMyInfo(buf: Buffer) {
     let offset = 0;
     while (offset < buf.length) {
@@ -916,7 +1228,6 @@ export class MeshtasticSerialBridge extends EventEmitter {
       if (wireType === 0) {
         const { value, bytesRead } = this.readVarint(buf, offset);
         offset += bytesRead;
-        // MyNodeInfo field 1 = my_node_num
         if (fieldNumber === 1 && value > 0) {
           const id = nodeIdToHex(value);
           if (this.localNodeId !== id) {
@@ -925,20 +1236,74 @@ export class MeshtasticSerialBridge extends EventEmitter {
             console.log(`[MeshtasticSerial] Local node identified as ${id}`);
 
             // Read the local module configs once we know the local node id.
-            // This populates the authoritative state used by the UI's
-            // "NeighborInfo: ACTIVE/OFF" indicator. Local admin only — no LoRa cost.
             setTimeout(() => {
               this.requestNeighborInfoConfig().catch(() => { /* best-effort */ });
+              this.requestRangeTestConfig().catch(() => { /* best-effort */ });
+              this.requestTelemetryConfig().catch(() => { /* best-effort */ });
+              this.requestStoreForwardConfig().catch(() => { /* best-effort */ });
+              this.requestExternalNotificationConfig().catch(() => { /* best-effort */ });
+              this.requestMqttConfig().catch(() => { /* best-effort */ });
+              this.requestDetectionSensorConfig().catch(() => { /* best-effort */ });
+              this.requestAudioConfig().catch(() => { /* best-effort */ });
             }, 500);
           }
+        } else if (fieldNumber === 8) {
+          this.localRebootCount = value;
         }
       } else if (wireType === 2) {
         const { value: len, bytesRead } = this.readVarint(buf, offset);
         offset += bytesRead;
+        const slice = buf.subarray(offset, offset + len);
         offset += len;
+        if (fieldNumber === 4) {
+          // MyNodeInfo.firmware_version (older firmware path)
+          const fw = slice.toString('utf-8').trim();
+          if (fw && this.localFirmwareVersion !== fw) {
+            this.localFirmwareVersion = fw;
+            console.log(`[MeshtasticSerial] Firmware version: ${fw}`);
+          }
+        }
       } else {
         break;
       }
+    }
+  }
+
+  /**
+   * Parse a DeviceMetadata submessage. Fields per mesh.proto:
+   *   1 = firmware_version (string)
+   *   2 = device_state_version (uint32)
+   *   3 = canShutdown (bool)
+   *   4 = role (Role enum)
+   *   5 = position_flags (uint32)
+   *   6 = hw_model (HardwareModel enum)
+   *   7 = has_remote_hardware (bool)
+   * Newer firmware advertises this via FromRadio.metadata (field 8).
+   */
+  private handleDeviceMetadata(buf: Buffer) {
+    let offset = 0;
+    while (offset < buf.length) {
+      const tag = buf[offset++];
+      const fieldNumber = tag >> 3;
+      const wireType = tag & 0x07;
+      if (wireType === 2) {
+        const { value: len, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        const slice = buf.subarray(offset, offset + len);
+        offset += len;
+        if (fieldNumber === 1) {
+          const fw = slice.toString('utf-8').trim();
+          if (fw && this.localFirmwareVersion !== fw) {
+            this.localFirmwareVersion = fw;
+            console.log(`[MeshtasticSerial] Firmware version (DeviceMetadata): ${fw}`);
+          }
+        }
+      } else if (wireType === 0) {
+        const { bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+      } else if (wireType === 5) {
+        offset += 4;
+      } else { break; }
     }
   }
 
@@ -980,6 +1345,7 @@ export class MeshtasticSerialBridge extends EventEmitter {
     let pskBase64 = '';
     let uplink = false;
     let downlink = false;
+    let positionPrecision: number | undefined;
 
     if (settingsBuf) {
       let so = 0;
@@ -1001,6 +1367,25 @@ export class MeshtasticSerialBridge extends EventEmitter {
           so += len;
           if (fn === 2) pskBase64 = sub.toString('base64');
           else if (fn === 3) name = sub.toString('utf-8');
+          else if (fn === 7) {
+            // ModuleSettings sub-message — currently we only read position_precision (field 1).
+            let mo = 0;
+            while (mo < sub.length) {
+              const mTag = sub[mo++];
+              const mFn = mTag >> 3;
+              const mWt = mTag & 0x07;
+              if (mWt === 0) {
+                const { value: mVal, bytesRead: mBR } = this.readVarint(sub, mo);
+                mo += mBR;
+                if (mFn === 1) positionPrecision = mVal;
+              } else if (mWt === 2) {
+                const { value: mLen, bytesRead: mBR } = this.readVarint(sub, mo);
+                mo += mBR + mLen;
+              } else if (mWt === 5) {
+                mo += 4;
+              } else { break; }
+            }
+          }
         } else if (wt === 5) {
           so += 4;
         } else {
@@ -1016,6 +1401,7 @@ export class MeshtasticSerialBridge extends EventEmitter {
       pskBase64,
       uplinkEnabled: uplink,
       downlinkEnabled: downlink,
+      positionPrecision,
     };
     this.channels.set(index, ch);
     try { this.db.upsertChannel(ch); } catch (e: any) {
@@ -1091,11 +1477,21 @@ export class MeshtasticSerialBridge extends EventEmitter {
         ...(role !== undefined ? { role } : {}),
       };
       node.lastSeen = Date.now();
+      const wasOnline = !!existing?.online;
       node.online = true;
 
       const isNew = !this.nodes.has(nodeId);
       const hadKey = !!existing?.publicKey;
       this.upsertNode(node);
+
+      // Record online transition for uptime tracking. Skip for the local node
+      // (it's always online by definition while the serial port is open).
+      // openNodeSession is a no-op if a session is already open for this node,
+      // so duplicate NodeInfo arrivals during a continuous online window are safe.
+      if (nodeId !== this.localNodeId && (!wasOnline || isNew)) {
+        try { this.db.openNodeSession(nodeId, Date.now()); }
+        catch (e: any) { console.error('[MeshtasticSerial] openNodeSession failed:', e.message); }
+      }
 
       if (isNew) {
         this.addEvent('NODE_JOINED', nodeId, `${node.name} discovered on mesh`);
@@ -1296,13 +1692,33 @@ export class MeshtasticSerialBridge extends EventEmitter {
         break;
       case PORT_RANGE_TEST_APP: {
         // RangeTest packets are typically text payloads ("seq 12345") used to
-        // probe coverage. Log as an event with RX signal so the user can
-        // correlate distance with reception quality in the event log.
+        // probe coverage. Log as an event for the live stream AND persist a
+        // coverage observation (sender + their last-known position + RX signal).
         const text = payloadBuf.toString('utf-8').slice(0, 60);
-        const rxLabel = rxRssi || rxSnr
-          ? ` (snr=${(rxSnr / 4).toFixed(1)}dB rssi=${rxRssi ? -rxRssi : '?'}dBm)`
+        const seqMatch = /seq\s+(\d+)/i.exec(text);
+        const seq = seqMatch ? Number(seqMatch[1]) : null;
+        const snrDb = rxSnr ? rxSnr / 4 : null;
+        const rssiDbm = rxRssi ? -rxRssi : null;
+        const rxLabel = rssiDbm != null || snrDb != null
+          ? ` (snr=${(snrDb ?? 0).toFixed(1)}dB rssi=${rssiDbm ?? '?'}dBm)`
           : '';
         this.addEvent('TELEMETRY', fromId, `Range test ${text}${rxLabel}`);
+
+        const senderNode = this.nodes.get(fromId);
+        try {
+          this.db.insertRangeTestObservation({
+            senderId: fromId,
+            senderLat: senderNode?.position?.lat ?? null,
+            senderLng: senderNode?.position?.lng ?? null,
+            seq,
+            snr: snrDb,
+            rssi: rssiDbm,
+            text,
+            timestamp: Date.now(),
+          });
+        } catch (e: any) {
+          console.error('[MeshtasticSerial] range test obs persist failed:', e.message);
+        }
         break;
       }
       case PORT_STORE_FORWARD_APP:
@@ -1561,6 +1977,7 @@ export class MeshtasticSerialBridge extends EventEmitter {
       routeBack: [],
     };
     this.traces.set(requestId, trace);
+    this.persistTrace(trace);
 
     const timer = setTimeout(() => {
       const t = this.traces.get(requestId);
@@ -1570,6 +1987,7 @@ export class MeshtasticSerialBridge extends EventEmitter {
       t.errorMessage = `No response within ${Math.round(timeoutMs / 1000)}s`;
       this.pendingTraces.delete(packetId);
       console.log(`[MeshtasticSerial] TRACE timeout for ${targetId} (req=${requestId})`);
+      this.persistTrace(t);
       this.emit('traceUpdate', { ...t });
     }, timeoutMs);
     this.pendingTraces.set(packetId, { requestId, timer });
@@ -1586,9 +2004,16 @@ export class MeshtasticSerialBridge extends EventEmitter {
       trace.status = 'error';
       trace.completedAt = Date.now();
       trace.errorMessage = err instanceof Error ? err.message : String(err);
+      this.persistTrace(trace);
       this.emit('traceUpdate', { ...trace });
       throw err;
     }
+  }
+
+  /** Persist a trace result to SQLite so traces survive server restart. */
+  private persistTrace(trace: MeshTraceResult) {
+    try { this.db.upsertTraceResult(trace); }
+    catch (err: any) { console.error('[MeshtasticSerial] persistTrace failed:', err.message); }
   }
 
   /** Build a TRACEROUTE_APP request packet with want_response=true. */
@@ -1657,6 +2082,7 @@ export class MeshtasticSerialBridge extends EventEmitter {
       `out=[${trace.route.map(h => h.nodeId).join('→') || 'direct'}] ` +
       `back=[${trace.routeBack.map(h => h.nodeId).join('→') || 'direct'}]`
     );
+    this.persistTrace(trace);
     this.emit('traceUpdate', { ...trace });
   }
 
@@ -2203,6 +2629,9 @@ export class MeshtasticSerialBridge extends EventEmitter {
     if (msg) {
       msg.status = status;
       msg.errorCode = errorCode;
+      // Only stamp deliveryMs on success — failed messages don't represent
+      // a meaningful round-trip latency.
+      if (status === 'acked') msg.deliveryMs = Math.max(0, Date.now() - msg.timestamp);
       this.persistMessage(msg);
     }
     this.emit('ackUpdate', pending.msgId, status, errorCode);
@@ -2263,6 +2692,7 @@ export class MeshtasticSerialBridge extends EventEmitter {
       const msg = this.messages.find(m => m.id === pending.msgId);
       if (msg) {
         msg.status = 'acked';
+        msg.deliveryMs = Math.max(0, Date.now() - msg.timestamp);
         this.persistMessage(msg);
       }
       this.emit('ackUpdate', pending.msgId, 'acked', 0);
@@ -2297,6 +2727,7 @@ export class MeshtasticSerialBridge extends EventEmitter {
           clearTimeout(pending.timer);
           this.pendingAcks.delete(incomingPacketId);
           existing.status = 'acked';
+          existing.deliveryMs = Math.max(0, Date.now() - existing.timestamp);
           this.persistMessage(existing);
           this.emit('ackUpdate', existing.id, 'acked', 0);
           console.log(`[MeshtasticSerial] Echo ACK (by id=${incomingPacketId}) → ${existing.id}`);
@@ -2311,6 +2742,7 @@ export class MeshtasticSerialBridge extends EventEmitter {
           clearTimeout(pending.timer);
           this.pendingAcks.delete(packetId);
           existing.status = 'acked';
+          existing.deliveryMs = Math.max(0, Date.now() - existing.timestamp);
           this.persistMessage(existing);
           this.emit('ackUpdate', existing.id, 'acked', 0);
           console.log(`[MeshtasticSerial] Echo ACK (by text) for "${text.substring(0, 30)}" → ${existing.id}`);
@@ -2586,6 +3018,11 @@ export class MeshtasticSerialBridge extends EventEmitter {
         node.online = false;
         this.upsertNode(node);
         this.addEvent('NODE_LOST', id, `${node.name} went offline (stale)`);
+        // Close the session for uptime tracking. Use lastSeen as the close
+        // time — it's a more accurate "when did the node actually go away"
+        // than `now` (which is up to staleThresholdMs late).
+        try { this.db.closeNodeSession(id, node.lastSeen); }
+        catch (e: any) { console.error('[MeshtasticSerial] closeNodeSession failed:', e.message); }
       }
     }
   }
@@ -2714,6 +3151,13 @@ export class MeshtasticSerialBridge extends EventEmitter {
     }
     settingsParts.push(this.encodeTagBool(5, ch.uplinkEnabled));
     settingsParts.push(this.encodeTagBool(6, ch.downlinkEnabled));
+    // Only emit ModuleSettings (field 7) when the operator has set a precision —
+    // sending an empty submessage would clobber any unmodelled fields the firmware
+    // already has set (e.g. is_client_muted).
+    if (typeof ch.positionPrecision === 'number') {
+      const moduleSettings = this.encodeTagVarint(1, Math.max(0, Math.min(32, Math.floor(ch.positionPrecision))));
+      settingsParts.push(this.encodeTagLen(7, moduleSettings));  // module_settings
+    }
     const settings = Buffer.concat(settingsParts);
 
     // Channel { index:1, settings:2, role:3 }
@@ -2800,7 +3244,7 @@ export class MeshtasticSerialBridge extends EventEmitter {
       transmitOverLora,
       lastReadAt: Date.now(),
     };
-    this.emit('localModuleConfigUpdate', this.localModuleConfig);
+    this.updateLocalModuleConfig();
 
     // Still try to read the config back. If the firmware does respond, the
     // optimistic state above gets overwritten with the real values.
@@ -2811,6 +3255,20 @@ export class MeshtasticSerialBridge extends EventEmitter {
 
   /** ModuleConfigType enum value for NeighborInfo (mesh.proto). */
   private static readonly MODULE_CFG_NEIGHBORINFO = 9;
+  /** ModuleConfigType enum value for Range Test (mesh.proto). */
+  private static readonly MODULE_CFG_RANGE_TEST = 4;
+  /** ModuleConfigType enum value for Telemetry (mesh.proto). */
+  private static readonly MODULE_CFG_TELEMETRY = 5;
+  /** ModuleConfigType enum value for Store & Forward (mesh.proto). */
+  private static readonly MODULE_CFG_STORE_FORWARD = 3;
+  /** ModuleConfigType enum value for External Notification (mesh.proto). */
+  private static readonly MODULE_CFG_EXTERNAL_NOTIFICATION = 2;
+  /** ModuleConfigType enum value for MQTT (mesh.proto). */
+  private static readonly MODULE_CFG_MQTT = 0;
+  /** ModuleConfigType enum value for Detection Sensor (mesh.proto). */
+  private static readonly MODULE_CFG_DETECTION_SENSOR = 11;
+  /** ModuleConfigType enum value for Audio (mesh.proto). */
+  private static readonly MODULE_CFG_AUDIO = 7;
 
   /**
    * Ask the local radio for its current NeighborInfo module config. The reply
@@ -2825,6 +3283,652 @@ export class MeshtasticSerialBridge extends EventEmitter {
     const adminPayload = this.encodeTagVarint(3, MeshtasticSerialBridge.MODULE_CFG_NEIGHBORINFO);
     this.sendAdminMessage(adminPayload);
     console.log('[MeshtasticSerial] Requested NeighborInfo module config readback');
+  }
+
+  // ---- Range Test module --------------------------------------------------
+
+  /**
+   * Build AdminMessage { set_module_config: ModuleConfig { range_test: ... } }.
+   * Field numbers per mesh.proto:
+   *   ModuleConfig.range_test = 5 (length-delim RangeTestConfig)
+   *   RangeTestConfig: 1=enabled (bool), 2=sender (uint32 secs), 3=save (bool)
+   * sender=0 with enabled=true = receive-only; sender>0 = transmit at that cadence.
+   */
+  private buildAdminSetRangeTestConfig(opts: {
+    enabled: boolean;
+    senderIntervalSecs: number;
+    save: boolean;
+  }): Buffer {
+    const rtCfg = Buffer.concat([
+      this.encodeTagBool(1, opts.enabled),
+      this.encodeTagVarint(2, Math.max(0, Math.floor(opts.senderIntervalSecs))),
+      this.encodeTagBool(3, opts.save),
+    ]);
+    const moduleConfig = this.encodeTagLen(5, rtCfg);    // ModuleConfig.range_test
+    return this.encodeTagLen(34, moduleConfig);          // AdminMessage.set_module_config
+  }
+
+  /**
+   * Public: configure the Range Test module on the local radio. The Range Test
+   * sender broadcasts numbered "seq N" packets every `senderIntervalSecs`, and
+   * other meshmates log them — the SNR/RSSI of those receptions is how operators
+   * map mesh coverage. Receive-only mode (senderIntervalSecs=0) is the polite
+   * default; configure a positive interval only when actively running a test.
+   */
+  async setRangeTestConfig(opts: {
+    enabled: boolean;
+    senderIntervalSecs?: number;
+    save?: boolean;
+  }): Promise<void> {
+    if (!this.isLinkOpen()) throw new Error('Radio not connected');
+    if (!this.localNodeNum) throw new Error('Local node not yet identified — try again in a moment');
+
+    const senderIntervalSecs = opts.senderIntervalSecs ?? 0;
+    const save = opts.save ?? false;
+
+    this.sendAdminMessage(this.buildAdminSetRangeTestConfig({
+      enabled: opts.enabled,
+      senderIntervalSecs,
+      save,
+    }));
+    await new Promise(r => setTimeout(r, 80));
+    this.sendAdminMessage(this.buildAdminCommit());
+
+    const senderText = senderIntervalSecs > 0 ? `every ${senderIntervalSecs}s` : 'receive-only';
+    console.log(`[MeshtasticSerial] Range Test module ${opts.enabled ? 'ENABLED' : 'DISABLED'} (${senderText}, save=${save})`);
+    this.addEvent('TELEMETRY', this.localNodeId || '!local',
+      `Range Test module ${opts.enabled ? `enabled (${senderText})` : 'disabled'}`);
+
+    // Optimistic local update — same pattern as NeighborInfo. Some firmware
+    // builds don't reply to the readback, so this guarantees the UI has a
+    // baseline; the actual readback (if any) overwrites with authoritative state.
+    this.localModuleConfig.rangeTest = {
+      enabled: opts.enabled,
+      senderIntervalSecs,
+      save,
+      lastReadAt: Date.now(),
+    };
+    this.updateLocalModuleConfig();
+
+    setTimeout(() => { this.requestRangeTestConfig().catch(() => { /* best-effort */ }); }, 250);
+  }
+
+  async requestRangeTestConfig(): Promise<void> {
+    if (!this.isLinkOpen()) return;
+    if (!this.localNodeNum) return;
+    const adminPayload = this.encodeTagVarint(3, MeshtasticSerialBridge.MODULE_CFG_RANGE_TEST);
+    this.sendAdminMessage(adminPayload);
+    console.log('[MeshtasticSerial] Requested Range Test module config readback');
+  }
+
+  /**
+   * Start a timed Range Test sender survey. Captures the current Range Test
+   * config (so we can restore it cleanly), then enables the sender at the
+   * requested interval for `durationMinutes` minutes. When the timer fires
+   * the original config is re-applied. Returns the epoch ms at which the
+   * survey will auto-restore.
+   *
+   * If a survey is already running we cancel it first; the new survey overrides.
+   */
+  async startRangeTestSurvey(opts: { durationMinutes: number; senderIntervalSecs: number }): Promise<{ expiresAt: number }> {
+    if (!this.isLinkOpen()) throw new Error('Radio not connected');
+    if (!this.localNodeNum) throw new Error('Local node not yet identified');
+    const dur = Math.max(1, Math.min(120, Math.floor(opts.durationMinutes)));
+    const sender = Math.max(15, Math.min(3600, Math.floor(opts.senderIntervalSecs)));
+
+    if (this.rangeTestSurveyTimer) {
+      clearTimeout(this.rangeTestSurveyTimer);
+      this.rangeTestSurveyTimer = null;
+    }
+    // Capture the current config (or sane defaults if we don't have a readback)
+    const current = this.localModuleConfig.rangeTest;
+    if (current && !this.rangeTestSurveyOriginal) {
+      // Only capture once per active survey — re-arming shouldn't overwrite the
+      // captured baseline with the survey-fast config.
+      this.rangeTestSurveyOriginal = {
+        enabled: current.enabled,
+        senderIntervalSecs: current.senderIntervalSecs,
+        save: current.save,
+      };
+    } else if (!current && !this.rangeTestSurveyOriginal) {
+      this.rangeTestSurveyOriginal = { enabled: false, senderIntervalSecs: 0, save: false };
+    }
+
+    await this.setRangeTestConfig({ enabled: true, senderIntervalSecs: sender, save: current?.save ?? false });
+
+    const expiresAt = Date.now() + dur * 60_000;
+    this.rangeTestSurveyExpiresAt = expiresAt;
+
+    this.rangeTestSurveyTimer = setTimeout(() => {
+      void (async () => {
+        try {
+          const restore = this.rangeTestSurveyOriginal;
+          if (restore) {
+            await this.setRangeTestConfig(restore);
+          }
+          console.log('[MeshtasticSerial] Range Test survey ended — restored prior config');
+        } catch (err: any) {
+          console.error('[MeshtasticSerial] Range Test survey restore failed:', err.message);
+        } finally {
+          this.rangeTestSurveyTimer = null;
+          this.rangeTestSurveyExpiresAt = null;
+          this.rangeTestSurveyOriginal = null;
+          this.updateLocalModuleConfig();
+        }
+      })();
+    }, dur * 60_000);
+
+    console.log(`[MeshtasticSerial] Range Test survey started — sender every ${sender}s for ${dur}min, restores at ${new Date(expiresAt).toISOString()}`);
+    this.addEvent('TELEMETRY', this.localNodeId || '!local',
+      `Range Test survey: ${sender}s cadence for ${dur}min`);
+    this.updateLocalModuleConfig();
+    return { expiresAt };
+  }
+
+  async cancelRangeTestSurvey(): Promise<void> {
+    if (!this.rangeTestSurveyTimer) return;
+    clearTimeout(this.rangeTestSurveyTimer);
+    this.rangeTestSurveyTimer = null;
+    const restore = this.rangeTestSurveyOriginal;
+    this.rangeTestSurveyExpiresAt = null;
+    this.rangeTestSurveyOriginal = null;
+    if (restore) {
+      try {
+        await this.setRangeTestConfig(restore);
+        console.log('[MeshtasticSerial] Range Test survey cancelled — restored prior config');
+      } catch (err: any) {
+        console.error('[MeshtasticSerial] Range Test survey cancel-restore failed:', err.message);
+      }
+    }
+    this.updateLocalModuleConfig();
+  }
+
+  getRangeTestSurveyExpiresAt(): number | null {
+    return this.rangeTestSurveyExpiresAt;
+  }
+
+  /**
+   * NeighborInfo equivalent — shorten the broadcast interval for `durationMinutes`
+   * to map topology faster during a deployment, then restore. Same capture +
+   * restore semantics as the Range Test survey.
+   */
+  async startNeighborInfoSurvey(opts: { durationMinutes: number; intervalSecs: number }): Promise<{ expiresAt: number }> {
+    if (!this.isLinkOpen()) throw new Error('Radio not connected');
+    if (!this.localNodeNum) throw new Error('Local node not yet identified');
+    const dur = Math.max(1, Math.min(120, Math.floor(opts.durationMinutes)));
+    const interval = Math.max(60, Math.min(14400, Math.floor(opts.intervalSecs)));
+
+    if (this.neighborInfoSurveyTimer) {
+      clearTimeout(this.neighborInfoSurveyTimer);
+      this.neighborInfoSurveyTimer = null;
+    }
+
+    const current = this.localModuleConfig.neighborInfo;
+    if (current && !this.neighborInfoSurveyOriginal) {
+      this.neighborInfoSurveyOriginal = {
+        enabled: current.enabled,
+        updateIntervalSecs: current.updateIntervalSecs,
+        transmitOverLora: current.transmitOverLora,
+      };
+    } else if (!current && !this.neighborInfoSurveyOriginal) {
+      this.neighborInfoSurveyOriginal = { enabled: false, updateIntervalSecs: 14400, transmitOverLora: true };
+    }
+
+    await this.setNeighborInfoConfig({
+      enabled: true,
+      intervalSecs: interval,
+      transmitOverLora: current?.transmitOverLora ?? true,
+    });
+
+    const expiresAt = Date.now() + dur * 60_000;
+    this.neighborInfoSurveyExpiresAt = expiresAt;
+
+    this.neighborInfoSurveyTimer = setTimeout(() => {
+      void (async () => {
+        try {
+          const restore = this.neighborInfoSurveyOriginal;
+          if (restore) {
+            await this.setNeighborInfoConfig({
+              enabled: restore.enabled,
+              intervalSecs: restore.updateIntervalSecs,
+              transmitOverLora: restore.transmitOverLora,
+            });
+          }
+          console.log('[MeshtasticSerial] NeighborInfo survey ended — restored prior config');
+        } catch (err: any) {
+          console.error('[MeshtasticSerial] NeighborInfo survey restore failed:', err.message);
+        } finally {
+          this.neighborInfoSurveyTimer = null;
+          this.neighborInfoSurveyExpiresAt = null;
+          this.neighborInfoSurveyOriginal = null;
+          this.updateLocalModuleConfig();
+        }
+      })();
+    }, dur * 60_000);
+
+    console.log(`[MeshtasticSerial] NeighborInfo survey started — every ${interval}s for ${dur}min, restores at ${new Date(expiresAt).toISOString()}`);
+    this.addEvent('TELEMETRY', this.localNodeId || '!local',
+      `NeighborInfo survey: ${interval}s cadence for ${dur}min`);
+    this.updateLocalModuleConfig();
+    return { expiresAt };
+  }
+
+  async cancelNeighborInfoSurvey(): Promise<void> {
+    if (!this.neighborInfoSurveyTimer) return;
+    clearTimeout(this.neighborInfoSurveyTimer);
+    this.neighborInfoSurveyTimer = null;
+    const restore = this.neighborInfoSurveyOriginal;
+    this.neighborInfoSurveyExpiresAt = null;
+    this.neighborInfoSurveyOriginal = null;
+    if (restore) {
+      try {
+        await this.setNeighborInfoConfig({
+          enabled: restore.enabled,
+          intervalSecs: restore.updateIntervalSecs,
+          transmitOverLora: restore.transmitOverLora,
+        });
+      } catch (err: any) {
+        console.error('[MeshtasticSerial] NeighborInfo survey cancel-restore failed:', err.message);
+      }
+    }
+    this.updateLocalModuleConfig();
+  }
+
+  getNeighborInfoSurveyExpiresAt(): number | null {
+    return this.neighborInfoSurveyExpiresAt;
+  }
+
+  // ---- Telemetry module ---------------------------------------------------
+
+  /**
+   * Build AdminMessage { set_module_config: ModuleConfig { telemetry: ... } }.
+   * Field numbers per mesh.proto:
+   *   ModuleConfig.telemetry = 6 (length-delim TelemetryConfig)
+   *   TelemetryConfig: 1=device_update_interval, 2=environment_measurement_enabled,
+   *     3=environment_update_interval, 6=air_quality_enabled, 7=air_quality_interval,
+   *     8=power_measurement_enabled, 9=power_update_interval. Skipping screen flags.
+   */
+  private buildAdminSetTelemetryConfig(opts: {
+    deviceUpdateIntervalSecs: number;
+    environmentEnabled: boolean;
+    environmentUpdateIntervalSecs: number;
+    powerEnabled: boolean;
+    powerUpdateIntervalSecs: number;
+  }): Buffer {
+    const tCfg = Buffer.concat([
+      this.encodeTagVarint(1, Math.max(0, Math.floor(opts.deviceUpdateIntervalSecs))),
+      this.encodeTagBool(2, opts.environmentEnabled),
+      this.encodeTagVarint(3, Math.max(0, Math.floor(opts.environmentUpdateIntervalSecs))),
+      this.encodeTagBool(8, opts.powerEnabled),
+      this.encodeTagVarint(9, Math.max(0, Math.floor(opts.powerUpdateIntervalSecs))),
+    ]);
+    const moduleConfig = this.encodeTagLen(6, tCfg);     // ModuleConfig.telemetry
+    return this.encodeTagLen(34, moduleConfig);          // AdminMessage.set_module_config
+  }
+
+  /**
+   * Public: configure the Telemetry module on the local radio. Sets the
+   * broadcast intervals for device metrics (battery, voltage), environment
+   * sensors (BME280 etc.), and power monitors (INA219/INA260).
+   */
+  async setTelemetryConfig(opts: {
+    deviceUpdateIntervalSecs?: number;
+    environmentEnabled?: boolean;
+    environmentUpdateIntervalSecs?: number;
+    powerEnabled?: boolean;
+    powerUpdateIntervalSecs?: number;
+  }): Promise<void> {
+    if (!this.isLinkOpen()) throw new Error('Radio not connected');
+    if (!this.localNodeNum) throw new Error('Local node not yet identified — try again in a moment');
+
+    const merged = {
+      deviceUpdateIntervalSecs: opts.deviceUpdateIntervalSecs ?? 0,
+      environmentEnabled: opts.environmentEnabled ?? false,
+      environmentUpdateIntervalSecs: opts.environmentUpdateIntervalSecs ?? 0,
+      powerEnabled: opts.powerEnabled ?? false,
+      powerUpdateIntervalSecs: opts.powerUpdateIntervalSecs ?? 0,
+    };
+
+    this.sendAdminMessage(this.buildAdminSetTelemetryConfig(merged));
+    await new Promise(r => setTimeout(r, 80));
+    this.sendAdminMessage(this.buildAdminCommit());
+
+    console.log(`[MeshtasticSerial] Telemetry module configured (device=${merged.deviceUpdateIntervalSecs}s, env=${merged.environmentEnabled}/${merged.environmentUpdateIntervalSecs}s, power=${merged.powerEnabled}/${merged.powerUpdateIntervalSecs}s)`);
+    this.addEvent('TELEMETRY', this.localNodeId || '!local',
+      `Telemetry module configured (device every ${merged.deviceUpdateIntervalSecs || 'default'}s)`);
+
+    this.localModuleConfig.telemetry = { ...merged, lastReadAt: Date.now() };
+    this.updateLocalModuleConfig();
+
+    setTimeout(() => { this.requestTelemetryConfig().catch(() => { /* best-effort */ }); }, 250);
+  }
+
+  async requestTelemetryConfig(): Promise<void> {
+    if (!this.isLinkOpen()) return;
+    if (!this.localNodeNum) return;
+    const adminPayload = this.encodeTagVarint(3, MeshtasticSerialBridge.MODULE_CFG_TELEMETRY);
+    this.sendAdminMessage(adminPayload);
+    console.log('[MeshtasticSerial] Requested Telemetry module config readback');
+  }
+
+  // ---- Store & Forward module --------------------------------------------
+
+  /**
+   * Build AdminMessage { set_module_config: ModuleConfig { store_forward: ... } }.
+   * Field numbers per mesh.proto:
+   *   ModuleConfig.store_forward = 4 (length-delim StoreForwardConfig)
+   *   StoreForwardConfig: 1=enabled (bool), 2=heartbeat (bool), 3=records (uint32),
+   *     4=history_return_max (uint32), 5=history_return_window (uint32), 6=is_server (bool)
+   */
+  private buildAdminSetStoreForwardConfig(opts: {
+    enabled: boolean;
+    isServer: boolean;
+    heartbeat: boolean;
+    records: number;
+    historyReturnMax: number;
+    historyReturnWindow: number;
+  }): Buffer {
+    const sfCfg = Buffer.concat([
+      this.encodeTagBool(1, opts.enabled),
+      this.encodeTagBool(2, opts.heartbeat),
+      this.encodeTagVarint(3, Math.max(0, Math.floor(opts.records))),
+      this.encodeTagVarint(4, Math.max(0, Math.floor(opts.historyReturnMax))),
+      this.encodeTagVarint(5, Math.max(0, Math.floor(opts.historyReturnWindow))),
+      this.encodeTagBool(6, opts.isServer),
+    ]);
+    const moduleConfig = this.encodeTagLen(4, sfCfg);    // ModuleConfig.store_forward
+    return this.encodeTagLen(34, moduleConfig);          // AdminMessage.set_module_config
+  }
+
+  /**
+   * Public: configure the Store & Forward module on the local radio. When
+   * isServer is true, this radio acts as an S&F router (buffers traffic and
+   * replays it on `CLIENT_HISTORY` requests from peers). When false, the radio
+   * runs the module as a client only (the existing replay-request feature).
+   * Power requirement is real: routers should be on stable power, not battery.
+   */
+  async setStoreForwardConfig(opts: {
+    enabled: boolean;
+    isServer?: boolean;
+    heartbeat?: boolean;
+    records?: number;
+    historyReturnMax?: number;
+    historyReturnWindow?: number;
+  }): Promise<void> {
+    if (!this.isLinkOpen()) throw new Error('Radio not connected');
+    if (!this.localNodeNum) throw new Error('Local node not yet identified — try again in a moment');
+
+    const merged = {
+      enabled: opts.enabled,
+      isServer: opts.isServer ?? false,
+      heartbeat: opts.heartbeat ?? false,
+      records: opts.records ?? 0,
+      historyReturnMax: opts.historyReturnMax ?? 0,
+      historyReturnWindow: opts.historyReturnWindow ?? 0,
+    };
+
+    this.sendAdminMessage(this.buildAdminSetStoreForwardConfig(merged));
+    await new Promise(r => setTimeout(r, 80));
+    this.sendAdminMessage(this.buildAdminCommit());
+
+    const role = merged.enabled ? (merged.isServer ? 'router/server' : 'client') : 'disabled';
+    console.log(`[MeshtasticSerial] Store & Forward module ${role} (heartbeat=${merged.heartbeat}, records=${merged.records}, returnMax=${merged.historyReturnMax}, windowMin=${merged.historyReturnWindow})`);
+    this.addEvent('TELEMETRY', this.localNodeId || '!local',
+      `Store & Forward module ${role}`);
+
+    this.localModuleConfig.storeForward = { ...merged, lastReadAt: Date.now() };
+    this.updateLocalModuleConfig();
+
+    setTimeout(() => { this.requestStoreForwardConfig().catch(() => { /* best-effort */ }); }, 250);
+  }
+
+  async requestStoreForwardConfig(): Promise<void> {
+    if (!this.isLinkOpen()) return;
+    if (!this.localNodeNum) return;
+    const adminPayload = this.encodeTagVarint(3, MeshtasticSerialBridge.MODULE_CFG_STORE_FORWARD);
+    this.sendAdminMessage(adminPayload);
+    console.log('[MeshtasticSerial] Requested Store & Forward module config readback');
+  }
+
+  // ---- External Notification module --------------------------------------
+
+  /**
+   * Build AdminMessage { set_module_config: ModuleConfig { external_notification: ... } }.
+   * Field numbers per mesh.proto:
+   *   ModuleConfig.external_notification = 3 (length-delim ExternalNotificationConfig)
+   *   ExternalNotificationConfig: 1=enabled, 2=output_ms, 3=output, 4=active,
+   *     5=alert_message, 6=alert_bell, 7=use_pwm, 8=output_vibra, 9=output_buzzer,
+   *     10=alert_message_vibra, 11=alert_message_buzzer, 12=alert_bell_vibra,
+   *     13=alert_bell_buzzer, 14=nag_timeout, 15=use_i2s_as_buzzer
+   * The whole config is replaced on each write — we always send all fields so
+   * board-specific GPIO pin assignments survive an operator edit of the
+   * higher-level toggles.
+   */
+  private buildAdminSetExternalNotificationConfig(
+    cfg: Omit<ExternalNotificationModuleConfig, 'lastReadAt'>,
+  ): Buffer {
+    const enCfg = Buffer.concat([
+      this.encodeTagBool(1, cfg.enabled),
+      this.encodeTagVarint(2, Math.max(0, Math.floor(cfg.outputMs))),
+      this.encodeTagVarint(3, Math.max(0, Math.floor(cfg.output))),
+      this.encodeTagBool(4, cfg.active),
+      this.encodeTagBool(5, cfg.alertMessage),
+      this.encodeTagBool(6, cfg.alertBell),
+      this.encodeTagBool(7, cfg.usePwm),
+      this.encodeTagVarint(8, Math.max(0, Math.floor(cfg.outputVibra))),
+      this.encodeTagVarint(9, Math.max(0, Math.floor(cfg.outputBuzzer))),
+      this.encodeTagBool(10, cfg.alertMessageVibra),
+      this.encodeTagBool(11, cfg.alertMessageBuzzer),
+      this.encodeTagBool(12, cfg.alertBellVibra),
+      this.encodeTagBool(13, cfg.alertBellBuzzer),
+      this.encodeTagVarint(14, Math.max(0, Math.floor(cfg.nagTimeout))),
+      this.encodeTagBool(15, cfg.useI2sAsBuzzer),
+    ]);
+    const moduleConfig = this.encodeTagLen(3, enCfg);    // ModuleConfig.external_notification
+    return this.encodeTagLen(34, moduleConfig);          // AdminMessage.set_module_config
+  }
+
+  /**
+   * Public: configure the External Notification module on the local radio.
+   * Operator-facing knobs (the UI exposes these): enabled, alertMessage,
+   * alertBell, outputMs, nagTimeout. The remaining fields (GPIO pin
+   * assignments, PWM, I2S, vibra/buzzer routing) are passthrough — the caller
+   * is expected to merge new toggles with the previous readback so board
+   * configuration isn't reset.
+   */
+  async setExternalNotificationConfig(
+    cfg: Omit<ExternalNotificationModuleConfig, 'lastReadAt'>,
+  ): Promise<void> {
+    if (!this.isLinkOpen()) throw new Error('Radio not connected');
+    if (!this.localNodeNum) throw new Error('Local node not yet identified — try again in a moment');
+
+    this.sendAdminMessage(this.buildAdminSetExternalNotificationConfig(cfg));
+    await new Promise(r => setTimeout(r, 80));
+    this.sendAdminMessage(this.buildAdminCommit());
+
+    console.log(`[MeshtasticSerial] External Notification ${cfg.enabled ? 'ENABLED' : 'DISABLED'} (msg=${cfg.alertMessage} bell=${cfg.alertBell} ms=${cfg.outputMs} nag=${cfg.nagTimeout}s)`);
+    this.addEvent('TELEMETRY', this.localNodeId || '!local',
+      `External Notification module ${cfg.enabled ? 'enabled' : 'disabled'}`);
+
+    this.localModuleConfig.externalNotification = { ...cfg, lastReadAt: Date.now() };
+    this.updateLocalModuleConfig();
+
+    setTimeout(() => { this.requestExternalNotificationConfig().catch(() => { /* best-effort */ }); }, 250);
+  }
+
+  async requestExternalNotificationConfig(): Promise<void> {
+    if (!this.isLinkOpen()) return;
+    if (!this.localNodeNum) return;
+    const adminPayload = this.encodeTagVarint(3, MeshtasticSerialBridge.MODULE_CFG_EXTERNAL_NOTIFICATION);
+    this.sendAdminMessage(adminPayload);
+    console.log('[MeshtasticSerial] Requested External Notification module config readback');
+  }
+
+  // ---- MQTT module --------------------------------------------------------
+
+  /**
+   * Build AdminMessage { set_module_config: ModuleConfig { mqtt: ... } }.
+   * Field numbers per mesh.proto:
+   *   ModuleConfig.mqtt = 1 (length-delim MQTTConfig)
+   *   MQTTConfig: 1=enabled (bool), 2=address (string), 3=username (string),
+   *     4=password (string), 5=encryption_enabled (bool), 6=json_enabled (bool),
+   *     7=tls_enabled (bool), 8=root (string),
+   *     9=proxy_to_client_enabled (bool), 10=map_reporting_enabled (bool),
+   *     11=map_report_settings (sub-message). MapReportSettings is opaque to us;
+   *     we capture its raw bytes on readback and echo them on write so any
+   *     fields we don't model survive a round-trip.
+   */
+  private buildAdminSetMqttConfig(cfg: Omit<MqttModuleConfig, 'lastReadAt'>): Buffer {
+    const parts: Buffer[] = [
+      this.encodeTagBool(1, cfg.enabled),
+      this.encodeTagLen(2, Buffer.from(cfg.address || '', 'utf-8')),
+      this.encodeTagLen(3, Buffer.from(cfg.username || '', 'utf-8')),
+      this.encodeTagLen(4, Buffer.from(cfg.password || '', 'utf-8')),
+      this.encodeTagBool(5, cfg.encryptionEnabled),
+      this.encodeTagBool(6, cfg.jsonEnabled),
+      this.encodeTagBool(7, cfg.tlsEnabled),
+      this.encodeTagLen(8, Buffer.from(cfg.root || '', 'utf-8')),
+      this.encodeTagBool(9, cfg.proxyToClientEnabled),
+      this.encodeTagBool(10, cfg.mapReportingEnabled),
+    ];
+    if (cfg.mapReportSettingsRaw) {
+      // Round-trip the captured MapReportSettings sub-message verbatim.
+      parts.push(this.encodeTagLen(11, Buffer.from(cfg.mapReportSettingsRaw, 'base64')));
+    }
+    const mqttCfg = Buffer.concat(parts);
+    const moduleConfig = this.encodeTagLen(1, mqttCfg);   // ModuleConfig.mqtt
+    return this.encodeTagLen(34, moduleConfig);            // AdminMessage.set_module_config
+  }
+
+  /**
+   * Public: configure the MQTT module on the local radio. The radio's MQTT
+   * module bridges per-channel traffic (when each channel's uplink/downlink
+   * flag is set) to/from the configured broker. Setting is local-admin only;
+   * we don't run an MQTT client ourselves.
+   */
+  async setMqttConfig(cfg: Omit<MqttModuleConfig, 'lastReadAt'>): Promise<void> {
+    if (!this.isLinkOpen()) throw new Error('Radio not connected');
+    if (!this.localNodeNum) throw new Error('Local node not yet identified — try again in a moment');
+
+    this.sendAdminMessage(this.buildAdminSetMqttConfig(cfg));
+    await new Promise(r => setTimeout(r, 80));
+    this.sendAdminMessage(this.buildAdminCommit());
+
+    console.log(`[MeshtasticSerial] MQTT module ${cfg.enabled ? 'ENABLED' : 'DISABLED'} (broker=${cfg.address || 'default'} tls=${cfg.tlsEnabled} proxy=${cfg.proxyToClientEnabled} encryption=${cfg.encryptionEnabled} json=${cfg.jsonEnabled})`);
+    this.addEvent('TELEMETRY', this.localNodeId || '!local',
+      `MQTT module ${cfg.enabled ? 'enabled' : 'disabled'}${cfg.address ? ` (${cfg.address})` : ''}`);
+
+    this.localModuleConfig.mqtt = { ...cfg, lastReadAt: Date.now() };
+    this.updateLocalModuleConfig();
+
+    setTimeout(() => { this.requestMqttConfig().catch(() => { /* best-effort */ }); }, 250);
+  }
+
+  async requestMqttConfig(): Promise<void> {
+    if (!this.isLinkOpen()) return;
+    if (!this.localNodeNum) return;
+    const adminPayload = this.encodeTagVarint(3, MeshtasticSerialBridge.MODULE_CFG_MQTT);
+    this.sendAdminMessage(adminPayload);
+    console.log('[MeshtasticSerial] Requested MQTT module config readback');
+  }
+
+  // ---- Detection Sensor module --------------------------------------------
+
+  /**
+   * Build AdminMessage { set_module_config: ModuleConfig { detection_sensor: ... } }.
+   * Field numbers per mesh.proto:
+   *   ModuleConfig.detection_sensor = 12 (length-delim DetectionSensorConfig)
+   *   DetectionSensorConfig: 1=enabled, 2=minimum_broadcast_secs, 3=state_broadcast_secs,
+   *     4=send_bell, 5=name, 6=monitor_pin, 7=detection_triggered_high, 8=use_pullup
+   */
+  private buildAdminSetDetectionSensorConfig(cfg: Omit<DetectionSensorModuleConfig, 'lastReadAt'>): Buffer {
+    const dsCfg = Buffer.concat([
+      this.encodeTagBool(1, cfg.enabled),
+      this.encodeTagVarint(2, Math.max(0, Math.floor(cfg.minimumBroadcastSecs))),
+      this.encodeTagVarint(3, Math.max(0, Math.floor(cfg.stateBroadcastSecs))),
+      this.encodeTagBool(4, cfg.sendBell),
+      this.encodeTagLen(5, Buffer.from(cfg.name || '', 'utf-8')),
+      this.encodeTagVarint(6, Math.max(0, Math.floor(cfg.monitorPin))),
+      this.encodeTagBool(7, cfg.detectionTriggeredHigh),
+      this.encodeTagBool(8, cfg.usePullup),
+    ]);
+    const moduleConfig = this.encodeTagLen(12, dsCfg);   // ModuleConfig.detection_sensor
+    return this.encodeTagLen(34, moduleConfig);           // AdminMessage.set_module_config
+  }
+
+  async setDetectionSensorConfig(cfg: Omit<DetectionSensorModuleConfig, 'lastReadAt'>): Promise<void> {
+    if (!this.isLinkOpen()) throw new Error('Radio not connected');
+    if (!this.localNodeNum) throw new Error('Local node not yet identified — try again in a moment');
+
+    this.sendAdminMessage(this.buildAdminSetDetectionSensorConfig(cfg));
+    await new Promise(r => setTimeout(r, 80));
+    this.sendAdminMessage(this.buildAdminCommit());
+
+    console.log(`[MeshtasticSerial] Detection Sensor module ${cfg.enabled ? 'ENABLED' : 'DISABLED'} (pin=${cfg.monitorPin} active-${cfg.detectionTriggeredHigh ? 'high' : 'low'} pullup=${cfg.usePullup} name="${cfg.name}")`);
+    this.addEvent('TELEMETRY', this.localNodeId || '!local',
+      `Detection Sensor module ${cfg.enabled ? 'enabled' : 'disabled'}${cfg.name ? ` ("${cfg.name}")` : ''}`);
+
+    this.localModuleConfig.detectionSensor = { ...cfg, lastReadAt: Date.now() };
+    this.updateLocalModuleConfig();
+
+    setTimeout(() => { this.requestDetectionSensorConfig().catch(() => { /* best-effort */ }); }, 250);
+  }
+
+  async requestDetectionSensorConfig(): Promise<void> {
+    if (!this.isLinkOpen()) return;
+    if (!this.localNodeNum) return;
+    const adminPayload = this.encodeTagVarint(3, MeshtasticSerialBridge.MODULE_CFG_DETECTION_SENSOR);
+    this.sendAdminMessage(adminPayload);
+    console.log('[MeshtasticSerial] Requested Detection Sensor module config readback');
+  }
+
+  // ---- Audio module -------------------------------------------------------
+
+  /**
+   * Build AdminMessage { set_module_config: ModuleConfig { audio: ... } }.
+   * Field numbers per mesh.proto:
+   *   ModuleConfig.audio = 8 (length-delim AudioConfig)
+   *   AudioConfig: 1=codec2_enabled, 2=ptt_pin, 3=bitrate (Audio_Baud enum),
+   *     4=i2s_ws, 5=i2s_sd, 6=i2s_din, 7=i2s_sck
+   */
+  private buildAdminSetAudioConfig(cfg: Omit<AudioModuleConfig, 'lastReadAt'>): Buffer {
+    const aCfg = Buffer.concat([
+      this.encodeTagBool(1, cfg.codec2Enabled),
+      this.encodeTagVarint(2, Math.max(0, Math.floor(cfg.pttPin))),
+      this.encodeTagVarint(3, Math.max(0, Math.floor(cfg.bitrate))),
+      this.encodeTagVarint(4, Math.max(0, Math.floor(cfg.i2sWs))),
+      this.encodeTagVarint(5, Math.max(0, Math.floor(cfg.i2sSd))),
+      this.encodeTagVarint(6, Math.max(0, Math.floor(cfg.i2sDin))),
+      this.encodeTagVarint(7, Math.max(0, Math.floor(cfg.i2sSck))),
+    ]);
+    const moduleConfig = this.encodeTagLen(8, aCfg);     // ModuleConfig.audio
+    return this.encodeTagLen(34, moduleConfig);           // AdminMessage.set_module_config
+  }
+
+  async setAudioConfig(cfg: Omit<AudioModuleConfig, 'lastReadAt'>): Promise<void> {
+    if (!this.isLinkOpen()) throw new Error('Radio not connected');
+    if (!this.localNodeNum) throw new Error('Local node not yet identified — try again in a moment');
+
+    this.sendAdminMessage(this.buildAdminSetAudioConfig(cfg));
+    await new Promise(r => setTimeout(r, 80));
+    this.sendAdminMessage(this.buildAdminCommit());
+
+    console.log(`[MeshtasticSerial] Audio module codec2=${cfg.codec2Enabled} ptt=${cfg.pttPin} bitrate=${cfg.bitrate}`);
+    this.addEvent('TELEMETRY', this.localNodeId || '!local',
+      `Audio module ${cfg.codec2Enabled ? 'enabled (Codec2)' : 'disabled'}`);
+
+    this.localModuleConfig.audio = { ...cfg, lastReadAt: Date.now() };
+    this.updateLocalModuleConfig();
+
+    setTimeout(() => { this.requestAudioConfig().catch(() => { /* best-effort */ }); }, 250);
+  }
+
+  async requestAudioConfig(): Promise<void> {
+    if (!this.isLinkOpen()) return;
+    if (!this.localNodeNum) return;
+    const adminPayload = this.encodeTagVarint(3, MeshtasticSerialBridge.MODULE_CFG_AUDIO);
+    this.sendAdminMessage(adminPayload);
+    console.log('[MeshtasticSerial] Requested Audio module config readback');
   }
 
   /**
@@ -2884,7 +3988,49 @@ export class MeshtasticSerialBridge extends EventEmitter {
           const cfg = this.parseNeighborInfoConfigSub(sub);
           this.localModuleConfig.neighborInfo = { ...cfg, lastReadAt: Date.now() };
           console.log(`[MeshtasticSerial] NeighborInfo config readback: enabled=${cfg.enabled} interval=${cfg.updateIntervalSecs}s lora=${cfg.transmitOverLora}`);
-          this.emit('localModuleConfigUpdate', this.localModuleConfig);
+          this.updateLocalModuleConfig();
+        } else if (fieldNumber === 5) {
+          // ModuleConfig.range_test (RangeTestConfig)
+          const cfg = this.parseRangeTestConfigSub(sub);
+          this.localModuleConfig.rangeTest = { ...cfg, lastReadAt: Date.now() };
+          console.log(`[MeshtasticSerial] Range Test config readback: enabled=${cfg.enabled} sender=${cfg.senderIntervalSecs}s save=${cfg.save}`);
+          this.updateLocalModuleConfig();
+        } else if (fieldNumber === 6) {
+          // ModuleConfig.telemetry (TelemetryConfig)
+          const cfg = this.parseTelemetryConfigSub(sub);
+          this.localModuleConfig.telemetry = { ...cfg, lastReadAt: Date.now() };
+          console.log(`[MeshtasticSerial] Telemetry config readback: device=${cfg.deviceUpdateIntervalSecs}s env=${cfg.environmentEnabled}/${cfg.environmentUpdateIntervalSecs}s power=${cfg.powerEnabled}/${cfg.powerUpdateIntervalSecs}s`);
+          this.updateLocalModuleConfig();
+        } else if (fieldNumber === 4) {
+          // ModuleConfig.store_forward (StoreForwardConfig)
+          const cfg = this.parseStoreForwardConfigSub(sub);
+          this.localModuleConfig.storeForward = { ...cfg, lastReadAt: Date.now() };
+          console.log(`[MeshtasticSerial] Store & Forward config readback: enabled=${cfg.enabled} server=${cfg.isServer} heartbeat=${cfg.heartbeat} records=${cfg.records} returnMax=${cfg.historyReturnMax} windowMin=${cfg.historyReturnWindow}`);
+          this.updateLocalModuleConfig();
+        } else if (fieldNumber === 3) {
+          // ModuleConfig.external_notification (ExternalNotificationConfig)
+          const cfg = this.parseExternalNotificationConfigSub(sub);
+          this.localModuleConfig.externalNotification = { ...cfg, lastReadAt: Date.now() };
+          console.log(`[MeshtasticSerial] External Notification readback: enabled=${cfg.enabled} msg=${cfg.alertMessage} bell=${cfg.alertBell} ms=${cfg.outputMs} nag=${cfg.nagTimeout}s pin=${cfg.output}`);
+          this.updateLocalModuleConfig();
+        } else if (fieldNumber === 1) {
+          // ModuleConfig.mqtt (MQTTConfig)
+          const cfg = this.parseMqttConfigSub(sub);
+          this.localModuleConfig.mqtt = { ...cfg, lastReadAt: Date.now() };
+          console.log(`[MeshtasticSerial] MQTT config readback: enabled=${cfg.enabled} broker="${cfg.address || 'default'}" tls=${cfg.tlsEnabled} proxy=${cfg.proxyToClientEnabled} encryption=${cfg.encryptionEnabled} json=${cfg.jsonEnabled} root="${cfg.root || 'default'}" map=${cfg.mapReportingEnabled}`);
+          this.updateLocalModuleConfig();
+        } else if (fieldNumber === 12) {
+          // ModuleConfig.detection_sensor (DetectionSensorConfig)
+          const cfg = this.parseDetectionSensorConfigSub(sub);
+          this.localModuleConfig.detectionSensor = { ...cfg, lastReadAt: Date.now() };
+          console.log(`[MeshtasticSerial] Detection Sensor readback: enabled=${cfg.enabled} pin=${cfg.monitorPin} name="${cfg.name}" min=${cfg.minimumBroadcastSecs}s state=${cfg.stateBroadcastSecs}s bell=${cfg.sendBell}`);
+          this.updateLocalModuleConfig();
+        } else if (fieldNumber === 8) {
+          // ModuleConfig.audio (AudioConfig)
+          const cfg = this.parseAudioConfigSub(sub);
+          this.localModuleConfig.audio = { ...cfg, lastReadAt: Date.now() };
+          console.log(`[MeshtasticSerial] Audio readback: codec2=${cfg.codec2Enabled} ptt=${cfg.pttPin} bitrate=${cfg.bitrate}`);
+          this.updateLocalModuleConfig();
         }
       } else if (wireType === 0) {
         const { bytesRead } = this.readVarint(buf, offset);
@@ -2917,6 +4063,255 @@ export class MeshtasticSerialBridge extends EventEmitter {
       } else { break; }
     }
     return { enabled, updateIntervalSecs, transmitOverLora };
+  }
+
+  private parseRangeTestConfigSub(buf: Buffer): Omit<RangeTestModuleConfig, 'lastReadAt'> {
+    let enabled = false;
+    let senderIntervalSecs = 0;
+    let save = false;
+    let offset = 0;
+
+    while (offset < buf.length) {
+      const tag = buf[offset++];
+      const fieldNumber = tag >> 3;
+      const wireType = tag & 0x07;
+      if (wireType === 0) {
+        const { value, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (fieldNumber === 1) enabled = value !== 0;
+        else if (fieldNumber === 2) senderIntervalSecs = value;
+        else if (fieldNumber === 3) save = value !== 0;
+      } else { break; }
+    }
+    return { enabled, senderIntervalSecs, save };
+  }
+
+  private parseDetectionSensorConfigSub(buf: Buffer): Omit<DetectionSensorModuleConfig, 'lastReadAt'> {
+    let enabled = false;
+    let minimumBroadcastSecs = 0;
+    let stateBroadcastSecs = 0;
+    let sendBell = false;
+    let name = '';
+    let monitorPin = 0;
+    let detectionTriggeredHigh = false;
+    let usePullup = false;
+    let offset = 0;
+
+    while (offset < buf.length) {
+      const tag = buf[offset++];
+      const fieldNumber = tag >> 3;
+      const wireType = tag & 0x07;
+      if (wireType === 0) {
+        const { value, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (fieldNumber === 1) enabled = value !== 0;
+        else if (fieldNumber === 2) minimumBroadcastSecs = value;
+        else if (fieldNumber === 3) stateBroadcastSecs = value;
+        else if (fieldNumber === 4) sendBell = value !== 0;
+        else if (fieldNumber === 6) monitorPin = value;
+        else if (fieldNumber === 7) detectionTriggeredHigh = value !== 0;
+        else if (fieldNumber === 8) usePullup = value !== 0;
+      } else if (wireType === 2) {
+        const { value: len, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (offset + len > buf.length) break;
+        const slice = buf.subarray(offset, offset + len);
+        offset += len;
+        if (fieldNumber === 5) name = slice.toString('utf-8');
+      } else { break; }
+    }
+    return {
+      enabled, minimumBroadcastSecs, stateBroadcastSecs, sendBell,
+      name, monitorPin, detectionTriggeredHigh, usePullup,
+    };
+  }
+
+  private parseAudioConfigSub(buf: Buffer): Omit<AudioModuleConfig, 'lastReadAt'> {
+    let codec2Enabled = false;
+    let pttPin = 0;
+    let bitrate = 0;
+    let i2sWs = 0;
+    let i2sSd = 0;
+    let i2sDin = 0;
+    let i2sSck = 0;
+    let offset = 0;
+
+    while (offset < buf.length) {
+      const tag = buf[offset++];
+      const fieldNumber = tag >> 3;
+      const wireType = tag & 0x07;
+      if (wireType === 0) {
+        const { value, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (fieldNumber === 1) codec2Enabled = value !== 0;
+        else if (fieldNumber === 2) pttPin = value;
+        else if (fieldNumber === 3) bitrate = value;
+        else if (fieldNumber === 4) i2sWs = value;
+        else if (fieldNumber === 5) i2sSd = value;
+        else if (fieldNumber === 6) i2sDin = value;
+        else if (fieldNumber === 7) i2sSck = value;
+      } else { break; }
+    }
+    return { codec2Enabled, pttPin, bitrate, i2sWs, i2sSd, i2sDin, i2sSck };
+  }
+
+  private parseMqttConfigSub(buf: Buffer): Omit<MqttModuleConfig, 'lastReadAt'> {
+    let enabled = false;
+    let address = '';
+    let username = '';
+    let password = '';
+    let encryptionEnabled = false;
+    let jsonEnabled = false;
+    let tlsEnabled = false;
+    let root = '';
+    let proxyToClientEnabled = false;
+    let mapReportingEnabled = false;
+    let mapReportSettingsRaw: string | null = null;
+    let offset = 0;
+
+    while (offset < buf.length) {
+      const tag = buf[offset++];
+      const fieldNumber = tag >> 3;
+      const wireType = tag & 0x07;
+      if (wireType === 0) {
+        const { value, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (fieldNumber === 1) enabled = value !== 0;
+        else if (fieldNumber === 5) encryptionEnabled = value !== 0;
+        else if (fieldNumber === 6) jsonEnabled = value !== 0;
+        else if (fieldNumber === 7) tlsEnabled = value !== 0;
+        else if (fieldNumber === 9) proxyToClientEnabled = value !== 0;
+        else if (fieldNumber === 10) mapReportingEnabled = value !== 0;
+      } else if (wireType === 2) {
+        const { value: len, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (offset + len > buf.length) break;
+        const slice = buf.subarray(offset, offset + len);
+        offset += len;
+        if (fieldNumber === 2) address = slice.toString('utf-8');
+        else if (fieldNumber === 3) username = slice.toString('utf-8');
+        else if (fieldNumber === 4) password = slice.toString('utf-8');
+        else if (fieldNumber === 8) root = slice.toString('utf-8');
+        else if (fieldNumber === 11) mapReportSettingsRaw = slice.toString('base64');
+      } else { break; }
+    }
+    return {
+      enabled, address, username, password,
+      encryptionEnabled, jsonEnabled, tlsEnabled, root,
+      proxyToClientEnabled, mapReportingEnabled, mapReportSettingsRaw,
+    };
+  }
+
+  private parseExternalNotificationConfigSub(buf: Buffer): Omit<ExternalNotificationModuleConfig, 'lastReadAt'> {
+    let enabled = false;
+    let outputMs = 0;
+    let output = 0;
+    let active = false;
+    let alertMessage = false;
+    let alertBell = false;
+    let usePwm = false;
+    let outputVibra = 0;
+    let outputBuzzer = 0;
+    let alertMessageVibra = false;
+    let alertMessageBuzzer = false;
+    let alertBellVibra = false;
+    let alertBellBuzzer = false;
+    let nagTimeout = 0;
+    let useI2sAsBuzzer = false;
+    let offset = 0;
+
+    while (offset < buf.length) {
+      const tag = buf[offset++];
+      const fieldNumber = tag >> 3;
+      const wireType = tag & 0x07;
+      if (wireType === 0) {
+        const { value, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (fieldNumber === 1) enabled = value !== 0;
+        else if (fieldNumber === 2) outputMs = value;
+        else if (fieldNumber === 3) output = value;
+        else if (fieldNumber === 4) active = value !== 0;
+        else if (fieldNumber === 5) alertMessage = value !== 0;
+        else if (fieldNumber === 6) alertBell = value !== 0;
+        else if (fieldNumber === 7) usePwm = value !== 0;
+        else if (fieldNumber === 8) outputVibra = value;
+        else if (fieldNumber === 9) outputBuzzer = value;
+        else if (fieldNumber === 10) alertMessageVibra = value !== 0;
+        else if (fieldNumber === 11) alertMessageBuzzer = value !== 0;
+        else if (fieldNumber === 12) alertBellVibra = value !== 0;
+        else if (fieldNumber === 13) alertBellBuzzer = value !== 0;
+        else if (fieldNumber === 14) nagTimeout = value;
+        else if (fieldNumber === 15) useI2sAsBuzzer = value !== 0;
+      } else { break; }
+    }
+    return {
+      enabled, outputMs, output, active, alertMessage, alertBell, usePwm,
+      outputVibra, outputBuzzer, alertMessageVibra, alertMessageBuzzer,
+      alertBellVibra, alertBellBuzzer, nagTimeout, useI2sAsBuzzer,
+    };
+  }
+
+  private parseStoreForwardConfigSub(buf: Buffer): Omit<StoreForwardLocalConfig, 'lastReadAt'> {
+    let enabled = false;
+    let heartbeat = false;
+    let records = 0;
+    let historyReturnMax = 0;
+    let historyReturnWindow = 0;
+    let isServer = false;
+    let offset = 0;
+
+    while (offset < buf.length) {
+      const tag = buf[offset++];
+      const fieldNumber = tag >> 3;
+      const wireType = tag & 0x07;
+      if (wireType === 0) {
+        const { value, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (fieldNumber === 1) enabled = value !== 0;
+        else if (fieldNumber === 2) heartbeat = value !== 0;
+        else if (fieldNumber === 3) records = value;
+        else if (fieldNumber === 4) historyReturnMax = value;
+        else if (fieldNumber === 5) historyReturnWindow = value;
+        else if (fieldNumber === 6) isServer = value !== 0;
+      } else { break; }
+    }
+    return { enabled, isServer, heartbeat, records, historyReturnMax, historyReturnWindow };
+  }
+
+  private parseTelemetryConfigSub(buf: Buffer): Omit<TelemetryModuleConfig, 'lastReadAt'> {
+    let deviceUpdateIntervalSecs = 0;
+    let environmentEnabled = false;
+    let environmentUpdateIntervalSecs = 0;
+    let powerEnabled = false;
+    let powerUpdateIntervalSecs = 0;
+    let offset = 0;
+
+    while (offset < buf.length) {
+      const tag = buf[offset++];
+      const fieldNumber = tag >> 3;
+      const wireType = tag & 0x07;
+      if (wireType === 0) {
+        const { value, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (fieldNumber === 1) deviceUpdateIntervalSecs = value;
+        else if (fieldNumber === 2) environmentEnabled = value !== 0;
+        else if (fieldNumber === 3) environmentUpdateIntervalSecs = value;
+        else if (fieldNumber === 8) powerEnabled = value !== 0;
+        else if (fieldNumber === 9) powerUpdateIntervalSecs = value;
+        // Other fields (4, 5, 6, 7, 10) are screen / air-quality flags we don't surface.
+      } else if (wireType === 2) {
+        // Skip any unexpected length-delim fields.
+        const { value: len, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead + len;
+      } else { break; }
+    }
+    return {
+      deviceUpdateIntervalSecs,
+      environmentEnabled,
+      environmentUpdateIntervalSecs,
+      powerEnabled,
+      powerUpdateIntervalSecs,
+    };
   }
 
   /** Wrap an AdminMessage payload into Data → MeshPacket → ToRadio and send it. */
@@ -3028,22 +4423,53 @@ export class MeshtasticSerialBridge extends EventEmitter {
     return this.eventRetentionHours;
   }
 
+  /**
+   * Configure how long to keep messages (in hours). 0 disables time-based prune
+   * (the per-table count cap of 5000 still applies). Runs an immediate prune.
+   */
+  setMessageRetention(hours: number) {
+    if (!Number.isFinite(hours) || hours < 0) {
+      throw new Error('retention hours must be a non-negative number');
+    }
+    this.messageRetentionHours = hours;
+    this.runRetentionPrune();
+    this.startRetentionPruner();
+  }
+
+  getMessageRetention(): number {
+    return this.messageRetentionHours;
+  }
+
   private startRetentionPruner() {
     if (this.retentionPruneTimer) clearInterval(this.retentionPruneTimer);
     // Run every 5 minutes — frequent enough to feel responsive, cheap enough to be invisible.
     this.retentionPruneTimer = setInterval(() => this.runRetentionPrune(), 5 * 60_000);
   }
 
-  /** Drop events older than retentionHours from both the in-memory cache and SQLite. */
+  /** Drop events and messages older than retentionHours from memory caches and SQLite. */
   private runRetentionPrune() {
-    const cutoff = Date.now() - this.eventRetentionHours * 3600_000;
-    const before = this.events.length;
-    this.events = this.events.filter(e => e.timestamp >= cutoff);
-    let dbRemoved = 0;
-    try { dbRemoved = this.db.pruneEventsOlderThan(cutoff); }
-    catch (e: any) { console.error('[MeshtasticSerial] retention prune failed:', e.message); }
-    if (before - this.events.length > 0 || dbRemoved > 0) {
-      console.log(`[MeshtasticSerial] retention prune: -${before - this.events.length} memory / -${dbRemoved} db (cutoff=${this.eventRetentionHours}h)`);
+    // Events
+    const eventCutoff = Date.now() - this.eventRetentionHours * 3600_000;
+    const eventsBefore = this.events.length;
+    this.events = this.events.filter(e => e.timestamp >= eventCutoff);
+    let eventsDbRemoved = 0;
+    try { eventsDbRemoved = this.db.pruneEventsOlderThan(eventCutoff); }
+    catch (e: any) { console.error('[MeshtasticSerial] event retention prune failed:', e.message); }
+    if (eventsBefore - this.events.length > 0 || eventsDbRemoved > 0) {
+      console.log(`[MeshtasticSerial] event retention prune: -${eventsBefore - this.events.length} memory / -${eventsDbRemoved} db (cutoff=${this.eventRetentionHours}h)`);
+    }
+
+    // Messages — only prune when a positive retention window is configured.
+    if (this.messageRetentionHours > 0) {
+      const msgCutoff = Date.now() - this.messageRetentionHours * 3600_000;
+      const msgBefore = this.messages.length;
+      this.messages = this.messages.filter(m => m.timestamp >= msgCutoff);
+      let msgDbRemoved = 0;
+      try { msgDbRemoved = this.db.pruneMessagesOlderThan(msgCutoff); }
+      catch (e: any) { console.error('[MeshtasticSerial] message retention prune failed:', e.message); }
+      if (msgBefore - this.messages.length > 0 || msgDbRemoved > 0) {
+        console.log(`[MeshtasticSerial] message retention prune: -${msgBefore - this.messages.length} memory / -${msgDbRemoved} db (cutoff=${this.messageRetentionHours}h)`);
+      }
     }
   }
 }

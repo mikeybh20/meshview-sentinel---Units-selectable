@@ -71,8 +71,19 @@ export function useMeshNotifications({
 
     for (const m of newOnes) {
       if (m.isOwn) continue;
-      // Reactions are noise for notifications — skip
+      // Reactions are noise for notifications — skip the explicit ones first.
       if (m.isReaction) continue;
+      // Belt-and-suspenders for the edge case where the bridge fails to set
+      // `isReaction` (firmware variant emitting `Data.emoji` differently, or
+      // parser miss): treat short reply-attached messages with no whitespace
+      // as if they were a reaction. A 1–8 character no-space body that
+      // references another message is overwhelmingly an emoji tap-back, not
+      // an intentional micro-reply, and notifying for those is precisely the
+      // failure mode the ROADMAP rough-edges entry documents.
+      if (typeof m.replyTo === 'number' && m.replyTo > 0) {
+        const compact = (m.text ?? '').trim();
+        if (compact.length > 0 && compact.length <= 8 && !/\s/.test(compact)) continue;
+      }
 
       const isDmToMe = !!localNodeId && m.to === localNodeId && m.to !== '!ffffffff';
       const mentioned = !isDmToMe && isMentioned(m.text, localNode);

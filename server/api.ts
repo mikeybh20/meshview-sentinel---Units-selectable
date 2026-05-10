@@ -26,7 +26,7 @@ if (existsSync(distPath)) {
 // =============================================
 // AI Provider Configuration (persisted to file)
 // =============================================
-type AIProvider = 'anthropic' | 'gemini';
+type AIProvider = 'anthropic' | 'gemini' | 'ollama';
 
 interface AIConfig {
   provider: AIProvider;
@@ -34,6 +34,19 @@ interface AIConfig {
   geminiKey: string;
   anthropicModel: string;
   geminiModel: string;
+  /** Base URL of an Ollama server (e.g. http://host.docker.internal:11434). No trailing slash. */
+  ollamaBaseUrl: string;
+  /** Ollama model tag (e.g. "llama3.1:8b", "qwen2.5:14b"). */
+  ollamaModel: string;
+  /**
+   * When true, the AI Assistant strips node identifiers, names, and message
+   * content from the system prompt and ships only aggregate counts.
+   * Operators on third-party providers (Anthropic / Gemini) can use this to
+   * keep mesh PII out of the cloud. The server itself does NOT enforce this
+   * (the redaction happens client-side before the request), but we persist
+   * the preference here so it's consistent across browser sessions / tabs.
+   */
+  redactPii: boolean;
 }
 
 const dataDir = join(__dirname, '..', 'data');
@@ -51,6 +64,12 @@ function loadConfig(): AIConfig {
     geminiKey: process.env.GEMINI_API_KEY || '',
     anthropicModel: 'claude-sonnet-4-20250514',
     geminiModel: 'gemini-3-flash-preview',
+    // Inside Docker, `host.docker.internal` resolves to the host (with the
+    // host-gateway alias declared in docker-compose.yml). Operators running
+    // bare metal can override this in Settings → AI.
+    ollamaBaseUrl: process.env.OLLAMA_BASE_URL || 'http://host.docker.internal:11434',
+    ollamaModel: process.env.OLLAMA_MODEL || '',
+    redactPii: false,
   };
 
   try {
@@ -91,6 +110,9 @@ app.get('/api/ai/config', (_req, res) => {
     provider: aiConfig.provider,
     anthropicModel: aiConfig.anthropicModel,
     geminiModel: aiConfig.geminiModel,
+    ollamaBaseUrl: aiConfig.ollamaBaseUrl,
+    ollamaModel: aiConfig.ollamaModel,
+    redactPii: aiConfig.redactPii,
     hasAnthropicKey: !!aiConfig.anthropicKey,
     hasGeminiKey: !!aiConfig.geminiKey,
     // Mask keys — show last 4 chars only
@@ -100,20 +122,66 @@ app.get('/api/ai/config', (_req, res) => {
 });
 
 app.post('/api/ai/config', (req, res) => {
-  const { provider, anthropicKey, geminiKey, anthropicModel, geminiModel } = req.body;
+  const {
+    provider,
+    anthropicKey, geminiKey,
+    anthropicModel, geminiModel,
+    ollamaBaseUrl, ollamaModel,
+    redactPii,
+  } = req.body;
 
-  if (provider && (provider === 'anthropic' || provider === 'gemini')) {
+  if (provider === 'anthropic' || provider === 'gemini' || provider === 'ollama') {
     aiConfig.provider = provider;
   }
   if (anthropicKey !== undefined) aiConfig.anthropicKey = anthropicKey;
   if (geminiKey !== undefined) aiConfig.geminiKey = geminiKey;
   if (anthropicModel) aiConfig.anthropicModel = anthropicModel;
   if (geminiModel) aiConfig.geminiModel = geminiModel;
+  if (typeof ollamaBaseUrl === 'string') {
+    aiConfig.ollamaBaseUrl = ollamaBaseUrl.replace(/\/+$/, ''); // strip trailing slashes
+  }
+  if (typeof ollamaModel === 'string') aiConfig.ollamaModel = ollamaModel.trim();
+  if (typeof redactPii === 'boolean') aiConfig.redactPii = redactPii;
 
   saveConfig(aiConfig);
-  console.log(`[AI Config] Provider: ${aiConfig.provider}, Anthropic key: ${aiConfig.anthropicKey ? 'SET' : 'EMPTY'}, Gemini key: ${aiConfig.geminiKey ? 'SET' : 'EMPTY'}`);
+  console.log(`[AI Config] Provider: ${aiConfig.provider}, Anthropic key: ${aiConfig.anthropicKey ? 'SET' : 'EMPTY'}, Gemini key: ${aiConfig.geminiKey ? 'SET' : 'EMPTY'}, Ollama: ${aiConfig.ollamaBaseUrl || 'unset'} / ${aiConfig.ollamaModel || 'no-model'}`);
 
   return res.json({ ok: true, provider: aiConfig.provider });
+});
+
+// --- Ollama: list available models on a remote/local server ---
+// Operators use this to populate the Settings dropdown without typing tags.
+app.get('/api/ai/ollama/tags', async (req, res) => {
+  // Allow probing a candidate URL via ?baseUrl=… so the UI can preview-test
+  // before saving config. Otherwise fall back to the persisted setting.
+  const probeUrl = typeof req.query.baseUrl === 'string'
+    ? String(req.query.baseUrl).replace(/\/+$/, '')
+    : aiConfig.ollamaBaseUrl;
+  if (!probeUrl) return res.status(400).json({ error: 'No Ollama base URL configured' });
+
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5_000);
+    const upstream = await fetch(`${probeUrl}/api/tags`, { signal: ctrl.signal });
+    clearTimeout(timer);
+    if (!upstream.ok) {
+      const txt = await upstream.text().catch(() => '');
+      return res.status(502).json({ error: `Ollama returned ${upstream.status}: ${txt.slice(0, 200)}` });
+    }
+    const body = await upstream.json() as { models?: Array<{ name?: string; model?: string; size?: number; details?: { parameter_size?: string; quantization_level?: string } }> };
+    const models = (body.models ?? []).map(m => ({
+      name: m.name || m.model || '',
+      sizeBytes: m.size ?? null,
+      parameterSize: m.details?.parameter_size ?? null,
+      quantization: m.details?.quantization_level ?? null,
+    })).filter(m => m.name);
+    return res.json({ baseUrl: probeUrl, models });
+  } catch (err: any) {
+    const msg = err?.name === 'AbortError'
+      ? `Connection timed out after 5s — is the Ollama server reachable at ${probeUrl}?`
+      : `Could not reach ${probeUrl}: ${err?.message || String(err)}`;
+    return res.status(502).json({ error: msg });
+  }
 });
 
 // --- Unified AI Chat endpoint ---
@@ -144,6 +212,56 @@ app.post('/api/ai/chat', async (req, res) => {
         .filter((block): block is Anthropic.TextBlock => block.type === 'text')
         .map(block => block.text)
         .join('');
+    } else if (aiConfig.provider === 'ollama') {
+      if (!aiConfig.ollamaBaseUrl) {
+        return res.status(500).json({ error: 'Ollama base URL not configured. Go to Settings → AI to set it.' });
+      }
+      if (!aiConfig.ollamaModel) {
+        return res.status(500).json({ error: 'No Ollama model selected. Go to Settings → AI and pick one.' });
+      }
+
+      // Ollama exposes an OpenAI-compatible endpoint at /v1/chat/completions.
+      // Using fetch directly (no SDK dep) keeps the dependency tree small.
+      const messages: Array<{ role: string; content: string }> = [];
+      if (systemInstruction) messages.push({ role: 'system', content: systemInstruction });
+      messages.push({ role: 'user', content: prompt });
+
+      const ctrl = new AbortController();
+      // Local models can take a while on first call (model load); allow up to 2 min.
+      const timer = setTimeout(() => ctrl.abort(), 120_000);
+      let upstream: Response;
+      try {
+        upstream = await fetch(`${aiConfig.ollamaBaseUrl}/v1/chat/completions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: aiConfig.ollamaModel,
+            messages,
+            stream: false,
+            temperature: 0.7,
+          }),
+          signal: ctrl.signal,
+        });
+      } catch (err: any) {
+        const msg = err?.name === 'AbortError'
+          ? `Ollama request timed out — model warming up? (${aiConfig.ollamaBaseUrl})`
+          : `Could not reach Ollama at ${aiConfig.ollamaBaseUrl}: ${err?.message || String(err)}`;
+        return res.status(502).json({ error: msg });
+      } finally {
+        clearTimeout(timer);
+      }
+
+      if (!upstream.ok) {
+        const errText = await upstream.text().catch(() => '');
+        return res.status(502).json({ error: `Ollama returned ${upstream.status}: ${errText.slice(0, 300)}` });
+      }
+      const body = await upstream.json() as {
+        choices?: Array<{ message?: { content?: string } }>;
+      };
+      text = body.choices?.[0]?.message?.content ?? '';
+      if (!text) {
+        return res.status(502).json({ error: 'Ollama returned an empty response' });
+      }
     } else {
       const client = getGeminiClient();
       if (!client) {
@@ -169,13 +287,6 @@ app.post('/api/ai/chat', async (req, res) => {
   }
 });
 
-// Keep legacy endpoint working
-app.post('/api/gemini', (req, res) => {
-  // Redirect to unified endpoint
-  req.url = '/api/ai/chat';
-  app.handle(req, res);
-});
-
 // =============================================
 // Mesh Radio API (real hardware data)
 // =============================================
@@ -194,6 +305,9 @@ app.get('/api/mesh/status', (_req, res) => {
     } : null,
     nodeCount: meshBridge.getNodes().length,
     messageCount: meshBridge.getMessages().length,
+    localNodeId: meshBridge.getLocalNodeId(),
+    firmwareVersion: meshBridge.getLocalFirmwareVersion(),
+    rebootCount: meshBridge.getLocalRebootCount(),
   });
 });
 
@@ -332,6 +446,53 @@ const broadcastGroupsChanged = () => {
   }
 };
 
+// Server-side block list (replaces the per-browser localStorage version).
+// Blocking is purely a client-side filter — the radio still receives traffic
+// from these nodes; we just persist the list centrally so multi-tab and
+// multi-machine operators stay in sync.
+const broadcastBlockedChanged = () => {
+  const payload = `event: blocked\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`;
+  for (const send of sseClients) {
+    try { send(payload); } catch { /* client gone */ }
+  }
+};
+
+app.get('/api/mesh/blocked', (_req, res) => {
+  try {
+    return res.json({ blocked: meshDb().loadBlockedNodes() });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/mesh/blocked', (req, res) => {
+  const { nodeId } = req.body ?? {};
+  if (typeof nodeId !== 'string' || !nodeId.startsWith('!')) {
+    return res.status(400).json({ error: 'nodeId must be a !hex node id' });
+  }
+  try {
+    const added = meshDb().addBlockedNode(nodeId);
+    if (added) broadcastBlockedChanged();
+    return res.json({ ok: true, added });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/mesh/blocked/:nodeId', (req, res) => {
+  const nodeId = req.params.nodeId;
+  if (!nodeId.startsWith('!')) {
+    return res.status(400).json({ error: 'nodeId must be a !hex node id' });
+  }
+  try {
+    const removed = meshDb().removeBlockedNode(nodeId);
+    if (removed) broadcastBlockedChanged();
+    return res.json({ ok: true, removed });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // All messages received by the radio
 app.get('/api/mesh/messages', (_req, res) => {
   return res.json(meshBridge.getMessages());
@@ -356,6 +517,8 @@ app.get('/api/mesh/events', (_req, res) => {
 
 // Full snapshot (nodes + messages + events in one call)
 app.get('/api/mesh/snapshot', (_req, res) => {
+  let blocked: string[] = [];
+  try { blocked = meshDb().loadBlockedNodes(); } catch { /* fall back to empty */ }
   return res.json({
     nodes: meshBridge.getNodes(),
     messages: meshBridge.getMessages(),
@@ -367,6 +530,7 @@ app.get('/api/mesh/snapshot', (_req, res) => {
     storeForwardRouters: meshBridge.getStoreForwardRouters(),
     localModuleConfig: meshBridge.getLocalModuleConfig(),
     groups: meshBridge.getGroups(),
+    blocked,
     radioConnected: meshBridge.connected,
     localNodeId: meshBridge.getLocalNodeId(),
   });
@@ -403,6 +567,481 @@ app.post('/api/mesh/modules/neighbor-info', async (req, res) => {
       transmitOverLora: typeof transmitOverLora === 'boolean' ? transmitOverLora : true,
     });
     return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Range Test survey: kick off a timed sender session that auto-restores
+// the previous config when it expires. Body: { durationMinutes, senderIntervalSecs }
+app.post('/api/mesh/modules/range-test/survey', async (req, res) => {
+  const { durationMinutes, senderIntervalSecs } = req.body ?? {};
+  if (typeof durationMinutes !== 'number' || durationMinutes < 1 || durationMinutes > 120) {
+    return res.status(400).json({ error: 'durationMinutes must be 1..120' });
+  }
+  if (typeof senderIntervalSecs !== 'number' || senderIntervalSecs < 15 || senderIntervalSecs > 3600) {
+    return res.status(400).json({ error: 'senderIntervalSecs must be 15..3600' });
+  }
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    const r = await meshBridge.startRangeTestSurvey({ durationMinutes, senderIntervalSecs });
+    return res.json({ ok: true, expiresAt: r.expiresAt });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/mesh/modules/range-test/survey', async (_req, res) => {
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.cancelRangeTestSurvey();
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// NeighborInfo survey: same pattern — temporarily speed up the broadcast cadence
+// to map topology faster during deployment, then auto-restore.
+app.post('/api/mesh/modules/neighbor-info/survey', async (req, res) => {
+  const { durationMinutes, intervalSecs } = req.body ?? {};
+  if (typeof durationMinutes !== 'number' || durationMinutes < 1 || durationMinutes > 120) {
+    return res.status(400).json({ error: 'durationMinutes must be 1..120' });
+  }
+  if (typeof intervalSecs !== 'number' || intervalSecs < 60 || intervalSecs > 14400) {
+    return res.status(400).json({ error: 'intervalSecs must be 60..14400' });
+  }
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    const r = await meshBridge.startNeighborInfoSurvey({ durationMinutes, intervalSecs });
+    return res.json({ ok: true, expiresAt: r.expiresAt });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/mesh/modules/neighbor-info/survey', async (_req, res) => {
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.cancelNeighborInfoSurvey();
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Range Test module: refresh + write
+app.post('/api/mesh/modules/range-test/refresh', async (_req, res) => {
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.requestRangeTestConfig();
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/mesh/modules/range-test', async (req, res) => {
+  const { enabled, senderIntervalSecs, save } = req.body ?? {};
+  if (typeof enabled !== 'boolean') return res.status(400).json({ error: 'enabled must be a boolean' });
+  // 0 = receive-only; positive senderIntervalSecs must be in a sane band.
+  if (senderIntervalSecs !== undefined && (typeof senderIntervalSecs !== 'number' || senderIntervalSecs < 0 || senderIntervalSecs > 86400)) {
+    return res.status(400).json({ error: 'senderIntervalSecs must be between 0 and 86400' });
+  }
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.setRangeTestConfig({
+      enabled,
+      senderIntervalSecs,
+      save: typeof save === 'boolean' ? save : false,
+    });
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Telemetry module: refresh + write
+app.post('/api/mesh/modules/telemetry/refresh', async (_req, res) => {
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.requestTelemetryConfig();
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/mesh/modules/telemetry', async (req, res) => {
+  const {
+    deviceUpdateIntervalSecs,
+    environmentEnabled,
+    environmentUpdateIntervalSecs,
+    powerEnabled,
+    powerUpdateIntervalSecs,
+  } = req.body ?? {};
+
+  const checkInterval = (v: any, name: string) => {
+    if (v === undefined) return null;
+    if (typeof v !== 'number' || v < 0 || v > 86400) return `${name} must be between 0 and 86400`;
+    return null;
+  };
+  const errs = [
+    checkInterval(deviceUpdateIntervalSecs, 'deviceUpdateIntervalSecs'),
+    checkInterval(environmentUpdateIntervalSecs, 'environmentUpdateIntervalSecs'),
+    checkInterval(powerUpdateIntervalSecs, 'powerUpdateIntervalSecs'),
+  ].filter(Boolean);
+  if (errs.length) return res.status(400).json({ error: errs.join('; ') });
+
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.setTelemetryConfig({
+      deviceUpdateIntervalSecs,
+      environmentEnabled: typeof environmentEnabled === 'boolean' ? environmentEnabled : undefined,
+      environmentUpdateIntervalSecs,
+      powerEnabled: typeof powerEnabled === 'boolean' ? powerEnabled : undefined,
+      powerUpdateIntervalSecs,
+    });
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Store & Forward module: refresh + write
+app.post('/api/mesh/modules/store-forward/refresh', async (_req, res) => {
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.requestStoreForwardConfig();
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/mesh/modules/store-forward', async (req, res) => {
+  const {
+    enabled,
+    isServer,
+    heartbeat,
+    records,
+    historyReturnMax,
+    historyReturnWindow,
+  } = req.body ?? {};
+
+  if (typeof enabled !== 'boolean') return res.status(400).json({ error: 'enabled must be a boolean' });
+  const checkUint = (v: any, name: string, max = 100000) => {
+    if (v === undefined) return null;
+    if (typeof v !== 'number' || v < 0 || v > max) return `${name} must be between 0 and ${max}`;
+    return null;
+  };
+  const errs = [
+    checkUint(records, 'records', 100000),
+    checkUint(historyReturnMax, 'historyReturnMax', 100000),
+    checkUint(historyReturnWindow, 'historyReturnWindow', 1440), // window is in minutes; 24h cap
+  ].filter(Boolean);
+  if (errs.length) return res.status(400).json({ error: errs.join('; ') });
+
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.setStoreForwardConfig({
+      enabled,
+      isServer: typeof isServer === 'boolean' ? isServer : undefined,
+      heartbeat: typeof heartbeat === 'boolean' ? heartbeat : undefined,
+      records,
+      historyReturnMax,
+      historyReturnWindow,
+    });
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// MQTT module: refresh + write
+app.post('/api/mesh/modules/mqtt/refresh', async (_req, res) => {
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.requestMqttConfig();
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/mesh/modules/mqtt', async (req, res) => {
+  const body = req.body ?? {};
+  const requireBool = (v: any, name: string) => typeof v === 'boolean' ? null : `${name} must be a boolean`;
+  const requireString = (v: any, name: string, maxLen = 255) =>
+    typeof v === 'string' && v.length <= maxLen ? null : `${name} must be a string ≤ ${maxLen} chars`;
+
+  const errs: (string | null)[] = [
+    requireBool(body.enabled, 'enabled'),
+    requireString(body.address, 'address', 200),
+    requireString(body.username, 'username', 100),
+    requireString(body.password, 'password', 200),
+    requireBool(body.encryptionEnabled, 'encryptionEnabled'),
+    requireBool(body.jsonEnabled, 'jsonEnabled'),
+    requireBool(body.tlsEnabled, 'tlsEnabled'),
+    requireString(body.root, 'root', 100),
+    requireBool(body.proxyToClientEnabled, 'proxyToClientEnabled'),
+    requireBool(body.mapReportingEnabled, 'mapReportingEnabled'),
+  ].filter(Boolean);
+  if (errs.length) return res.status(400).json({ error: errs.join('; ') });
+
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.setMqttConfig({
+      enabled: body.enabled,
+      address: body.address,
+      username: body.username,
+      password: body.password,
+      encryptionEnabled: body.encryptionEnabled,
+      jsonEnabled: body.jsonEnabled,
+      tlsEnabled: body.tlsEnabled,
+      root: body.root,
+      proxyToClientEnabled: body.proxyToClientEnabled,
+      mapReportingEnabled: body.mapReportingEnabled,
+      // Pass-through: if the client has a captured raw MapReportSettings, echo it.
+      mapReportSettingsRaw: typeof body.mapReportSettingsRaw === 'string' ? body.mapReportSettingsRaw : null,
+    });
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Detection Sensor module: refresh + write
+app.post('/api/mesh/modules/detection-sensor/refresh', async (_req, res) => {
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.requestDetectionSensorConfig();
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/mesh/modules/detection-sensor', async (req, res) => {
+  const body = req.body ?? {};
+  const requireBool = (v: any, name: string) => typeof v === 'boolean' ? null : `${name} must be a boolean`;
+  const requireUint = (v: any, name: string, max: number) =>
+    typeof v === 'number' && v >= 0 && v <= max ? null : `${name} must be 0..${max}`;
+  const requireString = (v: any, name: string, max: number) =>
+    typeof v === 'string' && v.length <= max ? null : `${name} must be a string ≤ ${max} chars`;
+
+  const errs: (string | null)[] = [
+    requireBool(body.enabled, 'enabled'),
+    requireUint(body.minimumBroadcastSecs, 'minimumBroadcastSecs', 86400),
+    requireUint(body.stateBroadcastSecs, 'stateBroadcastSecs', 86400),
+    requireBool(body.sendBell, 'sendBell'),
+    requireString(body.name, 'name', 20),
+    requireUint(body.monitorPin, 'monitorPin', 64),
+    requireBool(body.detectionTriggeredHigh, 'detectionTriggeredHigh'),
+    requireBool(body.usePullup, 'usePullup'),
+  ].filter(Boolean);
+  if (errs.length) return res.status(400).json({ error: errs.join('; ') });
+
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.setDetectionSensorConfig({
+      enabled: body.enabled,
+      minimumBroadcastSecs: body.minimumBroadcastSecs,
+      stateBroadcastSecs: body.stateBroadcastSecs,
+      sendBell: body.sendBell,
+      name: body.name,
+      monitorPin: body.monitorPin,
+      detectionTriggeredHigh: body.detectionTriggeredHigh,
+      usePullup: body.usePullup,
+    });
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Audio module: refresh + write
+app.post('/api/mesh/modules/audio/refresh', async (_req, res) => {
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.requestAudioConfig();
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/mesh/modules/audio', async (req, res) => {
+  const body = req.body ?? {};
+  const requireBool = (v: any, name: string) => typeof v === 'boolean' ? null : `${name} must be a boolean`;
+  const requireUint = (v: any, name: string, max: number) =>
+    typeof v === 'number' && v >= 0 && v <= max ? null : `${name} must be 0..${max}`;
+
+  const errs: (string | null)[] = [
+    requireBool(body.codec2Enabled, 'codec2Enabled'),
+    requireUint(body.pttPin, 'pttPin', 64),
+    requireUint(body.bitrate, 'bitrate', 16),
+    requireUint(body.i2sWs, 'i2sWs', 64),
+    requireUint(body.i2sSd, 'i2sSd', 64),
+    requireUint(body.i2sDin, 'i2sDin', 64),
+    requireUint(body.i2sSck, 'i2sSck', 64),
+  ].filter(Boolean);
+  if (errs.length) return res.status(400).json({ error: errs.join('; ') });
+
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.setAudioConfig({
+      codec2Enabled: body.codec2Enabled,
+      pttPin: body.pttPin,
+      bitrate: body.bitrate,
+      i2sWs: body.i2sWs,
+      i2sSd: body.i2sSd,
+      i2sDin: body.i2sDin,
+      i2sSck: body.i2sSck,
+    });
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// External Notification module: refresh + write
+app.post('/api/mesh/modules/external-notification/refresh', async (_req, res) => {
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.requestExternalNotificationConfig();
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/mesh/modules/external-notification', async (req, res) => {
+  const body = req.body ?? {};
+  const requireBool = (v: any, name: string) => typeof v === 'boolean' ? null : `${name} must be a boolean`;
+  const requireUint = (v: any, name: string, max: number) =>
+    typeof v === 'number' && v >= 0 && v <= max ? null : `${name} must be a number between 0 and ${max}`;
+
+  const errs: (string | null)[] = [
+    requireBool(body.enabled, 'enabled'),
+    requireBool(body.active, 'active'),
+    requireBool(body.alertMessage, 'alertMessage'),
+    requireBool(body.alertBell, 'alertBell'),
+    requireBool(body.usePwm, 'usePwm'),
+    requireBool(body.alertMessageVibra, 'alertMessageVibra'),
+    requireBool(body.alertMessageBuzzer, 'alertMessageBuzzer'),
+    requireBool(body.alertBellVibra, 'alertBellVibra'),
+    requireBool(body.alertBellBuzzer, 'alertBellBuzzer'),
+    requireBool(body.useI2sAsBuzzer, 'useI2sAsBuzzer'),
+    requireUint(body.outputMs, 'outputMs', 60_000),
+    requireUint(body.output, 'output', 64),
+    requireUint(body.outputVibra, 'outputVibra', 64),
+    requireUint(body.outputBuzzer, 'outputBuzzer', 64),
+    requireUint(body.nagTimeout, 'nagTimeout', 86400),
+  ].filter(Boolean);
+  if (errs.length) return res.status(400).json({ error: errs.join('; ') });
+
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.setExternalNotificationConfig({
+      enabled: body.enabled,
+      outputMs: body.outputMs,
+      output: body.output,
+      active: body.active,
+      alertMessage: body.alertMessage,
+      alertBell: body.alertBell,
+      usePwm: body.usePwm,
+      outputVibra: body.outputVibra,
+      outputBuzzer: body.outputBuzzer,
+      alertMessageVibra: body.alertMessageVibra,
+      alertMessageBuzzer: body.alertMessageBuzzer,
+      alertBellVibra: body.alertBellVibra,
+      alertBellBuzzer: body.alertBellBuzzer,
+      nagTimeout: body.nagTimeout,
+      useI2sAsBuzzer: body.useI2sAsBuzzer,
+    });
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Range Test: aggregated coverage observations for the map / coverage view.
+app.get('/api/mesh/range-test/coverage', (req, res) => {
+  // windowMs=0 (or omitted) means "all"; otherwise observations from the last `windowMs` ms.
+  const wRaw = String(req.query.windowMs ?? '0');
+  const windowMs = Math.max(0, Math.min(parseInt(wRaw, 10) || 0, 90 * 24 * 3600 * 1000));
+  const limit = Math.max(1, Math.min(parseInt(String(req.query.limit ?? '5000'), 10) || 5000, 20000));
+  try {
+    const rows = meshDb().getRangeTestObservations(windowMs || undefined, limit);
+
+    // Aggregate per sender: count, best/worst/avg SNR + RSSI, latest position.
+    type Agg = {
+      senderId: string;
+      count: number;
+      bestSnr: number | null;
+      worstSnr: number | null;
+      sumSnr: number;
+      snrSamples: number;
+      bestRssi: number | null;
+      worstRssi: number | null;
+      sumRssi: number;
+      rssiSamples: number;
+      lastSeen: number;
+      lastLat: number | null;
+      lastLng: number | null;
+    };
+    const bySender = new Map<string, Agg>();
+    for (const r of rows) {
+      let a = bySender.get(r.senderId);
+      if (!a) {
+        a = {
+          senderId: r.senderId, count: 0,
+          bestSnr: null, worstSnr: null, sumSnr: 0, snrSamples: 0,
+          bestRssi: null, worstRssi: null, sumRssi: 0, rssiSamples: 0,
+          lastSeen: 0, lastLat: null, lastLng: null,
+        };
+        bySender.set(r.senderId, a);
+      }
+      a.count += 1;
+      if (typeof r.snr === 'number') {
+        a.sumSnr += r.snr; a.snrSamples += 1;
+        a.bestSnr = a.bestSnr == null ? r.snr : Math.max(a.bestSnr, r.snr);
+        a.worstSnr = a.worstSnr == null ? r.snr : Math.min(a.worstSnr, r.snr);
+      }
+      if (typeof r.rssi === 'number') {
+        a.sumRssi += r.rssi; a.rssiSamples += 1;
+        a.bestRssi = a.bestRssi == null ? r.rssi : Math.max(a.bestRssi, r.rssi);
+        a.worstRssi = a.worstRssi == null ? r.rssi : Math.min(a.worstRssi, r.rssi);
+      }
+      if (r.timestamp > a.lastSeen) {
+        a.lastSeen = r.timestamp;
+        if (r.senderLat != null && r.senderLng != null) {
+          a.lastLat = r.senderLat; a.lastLng = r.senderLng;
+        }
+      }
+    }
+
+    const aggregates = Array.from(bySender.values()).map(a => ({
+      senderId: a.senderId,
+      count: a.count,
+      avgSnr: a.snrSamples ? a.sumSnr / a.snrSamples : null,
+      bestSnr: a.bestSnr,
+      worstSnr: a.worstSnr,
+      avgRssi: a.rssiSamples ? a.sumRssi / a.rssiSamples : null,
+      bestRssi: a.bestRssi,
+      worstRssi: a.worstRssi,
+      lastSeen: a.lastSeen,
+      lastLat: a.lastLat,
+      lastLng: a.lastLng,
+    }));
+
+    return res.json({
+      windowMs,
+      total: rows.length,
+      aggregates,
+      observations: rows,
+    });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
   }
@@ -485,6 +1124,146 @@ app.get('/api/mesh/traces', (_req, res) => {
   return res.json(meshBridge.getTraces());
 });
 
+/**
+ * Route Intel — per-pair detail. Aggregates from the in-memory `messages`
+ * cache + node session history. Computes delivery rate, avg latency (from the
+ * `delivery_ms` column captured at ACK), most-common hop sequence, and a
+ * relay-frequency table. The `windowMs` query param caps the historical window
+ * (default 24h, max 30d).
+ */
+app.get('/api/mesh/route-intel/pair', (req, res) => {
+  const fromId = String(req.query.from ?? '');
+  const toId = String(req.query.to ?? '');
+  if (!fromId || !toId) return res.status(400).json({ error: 'from and to are required' });
+
+  const windowMs = Math.max(60_000, Math.min(parseInt(String(req.query.windowMs ?? ''), 10) || 24 * 3600_000, 30 * 24 * 3600_000));
+  const sinceMs = Date.now() - windowMs;
+
+  try {
+    const allMessages = meshBridge.getMessages();
+    // Filter on the in-memory cache; channel = "" or "BroadcastDM peer" — we
+    // match by from/to ids regardless of channel since the same pair can
+    // happen on either DM or a broadcast channel.
+    const subset = allMessages.filter(m =>
+      m.from === fromId &&
+      m.to === toId &&
+      m.timestamp >= sinceMs &&
+      !m.isReaction
+    );
+
+    if (subset.length === 0) {
+      return res.json({
+        fromId, toId, totalMessages: 0,
+        successful: 0, failed: 0, pending: 0, successRate: null,
+        avgDeliveryMs: null, bestRoute: [], relays: [], windowMs,
+      });
+    }
+
+    let successful = 0, failed = 0, pending = 0;
+    let sumLatency = 0, latencySamples = 0;
+    const relayCounts = new Map<string, { count: number; success: number; sumLatency: number; latencySamples: number }>();
+    const routeCounts = new Map<string, number>();
+
+    for (const m of subset) {
+      if (m.status === 'acked') successful++;
+      else if (m.status === 'error') failed++;
+      else pending++;
+
+      if (typeof m.deliveryMs === 'number') {
+        sumLatency += m.deliveryMs;
+        latencySamples += 1;
+      }
+
+      // Hops array: includes from + relays + to (both endpoints included by
+      // the bridge today). Strip the endpoints to derive intermediate relays.
+      const hops = Array.isArray(m.hops) ? m.hops : [];
+      const relays = hops.filter(h => h !== fromId && h !== toId);
+      for (const r of relays) {
+        let acc = relayCounts.get(r);
+        if (!acc) { acc = { count: 0, success: 0, sumLatency: 0, latencySamples: 0 }; relayCounts.set(r, acc); }
+        acc.count += 1;
+        if (m.status === 'acked') acc.success += 1;
+        if (typeof m.deliveryMs === 'number') {
+          acc.sumLatency += m.deliveryMs;
+          acc.latencySamples += 1;
+        }
+      }
+      // "Best route" = the most common ordered relay sequence
+      if (relays.length > 0) {
+        const key = relays.join('>');
+        routeCounts.set(key, (routeCounts.get(key) ?? 0) + 1);
+      }
+    }
+
+    let bestRoute: string[] = [];
+    let bestRouteCount = 0;
+    for (const [key, n] of routeCounts) {
+      if (n > bestRouteCount) { bestRoute = key.split('>'); bestRouteCount = n; }
+    }
+
+    const total = subset.length;
+    const totalEnded = successful + failed; // exclude pending from rate
+    const aggregateRelays = Array.from(relayCounts.entries()).map(([nodeId, a]) => {
+      const node = meshBridge.getNodes().find(n => n.id === nodeId);
+      return {
+        nodeId,
+        nodeName: node?.name || node?.shortName || nodeId,
+        relayPercent: total ? (a.count / total) * 100 : 0,
+        successRate: a.count ? (a.success / a.count) * 100 : 0,
+        avgDeliveryMs: a.latencySamples ? a.sumLatency / a.latencySamples : null,
+        count: a.count,
+      };
+    }).sort((a, b) => b.count - a.count);
+
+    return res.json({
+      fromId,
+      toId,
+      fromName: meshBridge.getNodes().find(n => n.id === fromId)?.name ?? fromId,
+      toName: meshBridge.getNodes().find(n => n.id === toId)?.name ?? toId,
+      totalMessages: total,
+      successful,
+      failed,
+      pending,
+      successRate: totalEnded ? (successful / totalEnded) * 100 : null,
+      avgDeliveryMs: latencySamples ? sumLatency / latencySamples : null,
+      bestRoute,
+      relays: aggregateRelays,
+      windowMs,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Route Intel — per-node uptime stats over a window. Computes uptime %,
+ * session count, average session length, and a 24-hour peak-hours histogram
+ * from the node_sessions table. Useful both for the Dashboard's per-node
+ * NODE_DETAILS widget and for the send-window heatmap inside the matrix's
+ * pair drill-down.
+ */
+app.get('/api/mesh/route-intel/uptime', (req, res) => {
+  const windowMs = Math.max(3600_000, Math.min(parseInt(String(req.query.windowMs ?? ''), 10) || 7 * 24 * 3600_000, 30 * 24 * 3600_000));
+  const nodeId = req.query.nodeId ? String(req.query.nodeId) : null;
+  try {
+    const all = meshDb().computeNodeUptime(windowMs);
+    const filtered = nodeId ? all.filter(s => s.nodeId === nodeId) : all;
+    const nodes = meshBridge.getNodes();
+    const enriched = filtered.map(s => {
+      const node = nodes.find(n => n.id === s.nodeId);
+      return {
+        ...s,
+        nodeName: node?.name || node?.shortName || s.nodeId,
+        currentlyOnline: !!node?.online,
+        uptimePercent: windowMs > 0 ? Math.min(100, (s.onlineMs / windowMs) * 100) : 0,
+      };
+    });
+    return res.json({ windowMs, results: enriched });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // --- Event-log retention (how long to keep entries in the event stream) ---
 const RETENTION_CONFIG_PATH = join(dataDir, 'log-retention.json');
 const ALLOWED_RETENTION_HOURS = [6, 24, 36, 48, 72];
@@ -506,9 +1285,34 @@ function saveRetention(hours: number) {
   catch (err: any) { console.error('[API] saveRetention failed:', err.message); }
 }
 
+// --- Message retention (parallel to event retention; 0 = keep all up to count cap) ---
+const MESSAGE_RETENTION_CONFIG_PATH = join(dataDir, 'message-retention.json');
+// 0 = unlimited (count cap only); other values are days converted to hours.
+const ALLOWED_MESSAGE_RETENTION_HOURS = [0, 24, 24 * 3, 24 * 7, 24 * 30, 24 * 90];
+
+function loadMessageRetention(): number {
+  try {
+    if (existsSync(MESSAGE_RETENTION_CONFIG_PATH)) {
+      const saved = JSON.parse(readFileSync(MESSAGE_RETENTION_CONFIG_PATH, 'utf-8'));
+      if (typeof saved.hours === 'number' && ALLOWED_MESSAGE_RETENTION_HOURS.includes(saved.hours)) {
+        return saved.hours;
+      }
+    }
+  } catch { /* fall through */ }
+  return 0; // default: no time-based prune
+}
+
+function saveMessageRetention(hours: number) {
+  try { writeFileSync(MESSAGE_RETENTION_CONFIG_PATH, JSON.stringify({ hours }, null, 2), 'utf-8'); }
+  catch (err: any) { console.error('[API] saveMessageRetention failed:', err.message); }
+}
+
 // Apply persisted retention on boot.
 try { meshBridge.setEventRetention(loadRetention()); } catch (err: any) {
   console.error('[API] could not apply persisted retention:', err.message);
+}
+try { meshBridge.setMessageRetention(loadMessageRetention()); } catch (err: any) {
+  console.error('[API] could not apply persisted message retention:', err.message);
 }
 
 app.get('/api/mesh/log-retention', (_req, res) => {
@@ -523,6 +1327,24 @@ app.post('/api/mesh/log-retention', (req, res) => {
   try {
     meshBridge.setEventRetention(hours);
     saveRetention(hours);
+    return res.json({ ok: true, hours });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/mesh/message-retention', (_req, res) => {
+  return res.json({ hours: meshBridge.getMessageRetention(), allowed: ALLOWED_MESSAGE_RETENTION_HOURS });
+});
+
+app.post('/api/mesh/message-retention', (req, res) => {
+  const { hours } = req.body ?? {};
+  if (typeof hours !== 'number' || !ALLOWED_MESSAGE_RETENTION_HOURS.includes(hours)) {
+    return res.status(400).json({ error: `hours must be one of ${ALLOWED_MESSAGE_RETENTION_HOURS.join(', ')}` });
+  }
+  try {
+    meshBridge.setMessageRetention(hours);
+    saveMessageRetention(hours);
     return res.json({ ok: true, hours });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });

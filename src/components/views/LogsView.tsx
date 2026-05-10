@@ -71,26 +71,26 @@ export function LogsView({ events }: LogsViewProps) {
         </div>
       </div>
       {retentionError && (
-        <div className="px-4 py-1 text-[10px] text-red-400 bg-red-500/10 border-b border-red-500/20">
+        <div className="px-4 py-1 text-[10px] text-brand-error bg-brand-error/10 border-b border-brand-error/20">
           Retention update failed: {retentionError}
         </div>
       )}
-      <div className="flex-1 overflow-y-auto font-mono text-[11px] p-2 space-y-0.5 bg-black/40">
+      <div className="flex-1 overflow-y-auto font-mono text-[11px] p-2 space-y-0.5 bg-brand-bg/40">
          {events.map(event => (
-           <div key={event.id} className="group hover:bg-brand-line/30 flex gap-4 px-2 py-1 rounded transition-colors">
-              <span className="text-brand-muted opacity-40 shrink-0">[{new Date(event.timestamp).toLocaleTimeString()}]</span>
+           <div key={event.id} className="group hover:bg-brand-line/40 flex gap-4 px-2 py-1 rounded transition-colors">
+              <span className="text-brand-muted shrink-0">[{new Date(event.timestamp).toLocaleTimeString()}]</span>
               <span className={cn(
                 "font-bold shrink-0 w-24",
-                event.type === 'MESSAGE' ? "text-blue-400" :
+                event.type === 'MESSAGE' ? "text-brand-info" :
                 event.type === 'TELEMETRY' ? "text-brand-accent" :
-                event.type === 'NODE_JOINED' ? "text-yellow-400" : "text-brand-muted"
+                event.type === 'NODE_JOINED' ? "text-brand-warning" : "text-brand-muted"
               )}>{event.type}</span>
-              <span className="text-brand-ink/80 truncate">{event.details}</span>
+              <span className="text-brand-ink truncate">{event.details}</span>
               <span className="ml-auto opacity-0 group-hover:opacity-100 text-brand-muted text-[10px] shrink-0">{event.nodeId}</span>
            </div>
          ))}
          {events.length === 0 && (
-           <div className="h-full flex items-center justify-center text-brand-muted opacity-30 italic">No network activity recorded...</div>
+           <div className="h-full flex items-center justify-center text-brand-muted italic">No network activity recorded...</div>
          )}
       </div>
     </div>

@@ -8,6 +8,12 @@ services:
     environment:
       - NODE_ENV=production
       - SERIAL_AUTO_DISCOVER=true
+    # `host.docker.internal` works on Docker Desktop (mac/windows) out of the
+    # box, but on Linux you have to alias it to the host gateway explicitly.
+    # This lets the in-container API reach a host-side Ollama at
+    # http://host.docker.internal:11434 (the default Ollama port).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     # --- Dynamic USB access ---
     # Mount /dev so the container sees devices as they appear/disappear.
     # cgroup rules grant access to USB serial devices (major 188 = ttyUSB, 166 = ttyACM)

@@ -177,7 +177,7 @@ export function ExportModal({ nodes, messages, events, onClose }: ExportModalPro
         <div className="p-4 border-t border-brand-line flex justify-end gap-3 bg-brand-line/10">
           <button 
             onClick={onClose}
-            className="px-4 py-2 text-sm font-bold uppercase tracking-widest hover:text-white transition-colors"
+            className="px-4 py-2 text-sm font-bold uppercase tracking-widest hover:text-brand-ink transition-colors"
           >
             Cancel
           </button>

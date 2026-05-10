@@ -22,14 +22,14 @@ A unified **Settings → Modules** section now exists with NeighborInfo as the f
 | Module | Status | Notes |
 |---|---|---|
 | **NeighborInfo** | ✅ Done | Enable/disable + interval + transmit-over-LoRa via Settings → Modules with authoritative readback. Quick-toggle button also lives in the topology banner |
-| **Range Test** | 📋 Deferred | Read-only ingest works; no UI to configure sender mode/interval |
-| **Store & Forward** | ⚠️ Partial | Detection + replay request work; no UI to configure local node *as* a router |
-| **MQTT bridge** | ⚠️ Partial | Per-channel uplink/downlink toggles exist (write path through channel admin); broker URL/auth config not exposed. Inbound `via_mqtt` flag is now parsed and surfaced as a node badge |
-| **Telemetry module** | 📋 Deferred | Receive works; configuring broadcast intervals not exposed |
-| **External Notification** | 📋 Deferred | No UI |
-| **Detection Sensor** | 📋 Deferred | No UI |
-| **Audio module** | 📋 Deferred | No UI |
-| **Position precision (per channel)** | ⚠️ Partial | Display-only in node popup (`precision_bits` field); no per-channel write |
+| **Range Test** | ✅ Done | Enable/disable + sender interval (presets + custom) + save-to-flash via Settings → Modules. Full readback / optimistic-update pattern matches NeighborInfo. UI warns operators that active sending consumes airtime; default is receive-only |
+| **Store & Forward** | ✅ Done | Settings → Modules now exposes the local S&F module: enable + client/router toggle, plus heartbeat / buffer size / replay-cap / time-window when router mode is on. Router parameters collapse-hide unless the operator opts in. Same readback / optimistic-update pattern as the other modules. (Detecting peer routers and CLIENT_HISTORY requests were already done) |
+| **MQTT bridge** | ✅ Done | Settings → Modules → MQTT: enable/disable, broker address (with username/password + TLS), topic root, channel encryption, JSON publish, proxy-to-client, map reporting. Same readback / optimistic-update pattern as the other modules. The `MapReportSettings` sub-message is captured opaquely on readback and echoed verbatim on save so unmodelled fields survive. Per-channel uplink/downlink toggles still live in Channels. Header pill is now state-aware (`ACTIVE` if module enabled, `OBSERVED` if any peer was seen via MQTT in the last 30 min, `OFF` otherwise) |
+| **Telemetry module** | ✅ Done | Settings → Modules now has a Telemetry card with device-metrics interval (battery / voltage / channel utilization), plus per-feature toggles + intervals for environment sensors (BME280 etc.) and power monitors (INA219 / INA260). Same readback / optimistic-update / Refresh-button pattern as the other modules; intervals collapse-hide when their feature is disabled |
+| **External Notification** | ✅ Done | Settings → Modules has an External Notification card with master enable, "alert on any text", "alert on bell character only", alert duration (preset + custom), and nag timeout. Board-specific GPIO pin assignments (output / buzzer / vibra / PWM / I2S) are read on connect, displayed read-only, and passed straight back through on save so the board's factory configuration survives a behavior edit |
+| **Detection Sensor** | ✅ Done | Settings → Modules card with master enable, sensor name (≤20 chars), monitor pin, min/state broadcast intervals, active-high vs active-low, internal pullup, send-bell toggle. Same readback / optimistic-update pattern as the other modules |
+| **Audio module** | ✅ Done | Settings → Modules card for Codec2 voice over LoRa: master enable, PTT pin, bitrate selector (Codec2 default / 3200 / 2400 / 1600 / 1400 / 1300 / 1200 / 700B bps), and the four I2S pins (WS / SD / DIN / SCK). UI carries an explicit experimental warning since most off-the-shelf boards lack the required mic+speaker hardware |
+| **Position precision (per channel)** | ✅ Done | ChannelsModal now exposes a per-channel precision picker with operator-friendly presets (Full / ~1.6 km / ~6.4 km / ~51 km / ~410 km / Disabled) plus a custom-bits fallback. Server reads `ChannelSettings.module_settings.position_precision` (field 7 → 1) on inbound channels and writes it back via the existing `set_channel` admin path. Persisted to the `channels` SQLite table via additive migration |
 
 ---
 
@@ -74,22 +74,27 @@ Tapping an existing reaction chip adds another reaction with the same emoji rath
 ### ✅ Mention notification routing — done
 Notifications now resolve `m.channel` (e.g. "LongFast", "Channel 2") to the correct `chan:N` chat id via the same matching rules `useReadStatus` uses. Clicking a mention notification jumps to the actual channel where the mention happened. As a bonus, the notification body is now prefixed with `[channel name]` for context, and focus-suppression works for channel mentions too (no notification fires if you're already viewing that channel).
 
-### ⚠️ Mention parsing edge cases
-`@everyone`, `@all`, or channel-wide mentions aren't recognized. Only `@shortname` and `@!hex` resolve. **📋 Deferred** — none of these are part of the Meshtastic protocol; would be UI-only conventions.
+### ✅ Channel-wide mention parsing — done
+`@everyone`, `@all`, and `@channel` now parse as channel-wide mentions. They render in the warning palette (distinct from regular accent-colored `@shortname`/`@!hex` mentions), are non-clickable (no specific node target), and `isMentioned` returns true for every recipient — so notification routing fires for everyone in the channel, not just the local node. UI-only convention (still not part of the Meshtastic wire protocol), but matches Slack/Discord etiquette and what most operators expect when they type `@everyone`.
 
-### 💡 Search-result highlight
-Search results jump to the right chat but don't scroll to or highlight the matched message. The chat just opens at the latest message. **💡 Idea** — would need message-id-based scroll anchoring in the messages list.
+### ✅ Search-result highlight — done
+Search results now scroll the matched bubble into view (centered) and flash a soft accent ring around it for 2 seconds. The auto-scroll-to-bottom effect is suppressed while the highlight is active so it doesn't fight the anchor. Refs are tracked per message id; defer-to-RAF lets the chat switch + re-render before the scroll fires.
 
 ---
 
 ## Radio module / packet handling
 
-### ⚠️ Range Test — no coverage map
-Range Test packets get logged to the event stream as `Range test "seq N" (snr=X dB rssi=Y dBm)` but nothing aggregates them into a coverage map (originator + position + SNR/RSSI over time). **📋 Deferred** — would need a dedicated `range_test` table and a "coverage" view that pairs each test packet with its sender's last known position.
+### ✅ Range Test — sender configurable, coverage tracked
+✅ The local sender is operator-configurable from Settings → Modules (enable/disable, sender interval, save-to-flash) — see "Module configuration" above.
 
-### ⚠️ Store & Forward — minimal control
-We detect routers, surface their stats, and request replays. Things missing:
-- Configuring the local node *as* a router (admin write, similar to NeighborInfo)
+✅ Coverage tracking shipped: every inbound Range Test packet is persisted to a new `range_test_observations` SQLite table with sender id, sender's last-known position, parsed seq number, SNR (dB), RSSI (dBm), and timestamp. Bound to the most recent 5,000 observations. The Map view has a new floating **Range Test Coverage** panel (top-right) with a window selector (1h / 6h / 24h / 7d / All time) showing per-sender aggregates: count, avg/best/worst SNR, avg RSSI, time since last seen. Each row is color-coded by avg SNR (emerald ≥ 5 dB, amber 0–5 dB, red < 0 dB) and clicking centers the map on that sender's last-known position. Auto-refreshes every 30 s while open.
+
+Still 💡: a true heatmap overlay where individual marker color/intensity reflects coverage strength visually on the map. The current panel + click-to-focus is the operator-facing MVP.
+
+### ⚠️ Store & Forward — most control shipped, polish pending
+✅ Configuring the local node *as* a router is now wired through Settings → Modules — see the Module configuration table above.
+
+Still pending:
 - Decoding `ROUTER_TEXT_BROADCAST` / `ROUTER_TEXT_DIRECT` (currently we ignore these — replays come back as ordinary `TEXT_MESSAGE_APP` packets which is the firmware's actual behavior, but the variant case isn't handled if encountered)
 - Periodic "ping" to verify a router is alive
 - Stats request (`CLIENT_STATS`) UI
@@ -167,8 +172,10 @@ Items that have been **field-tested** against the operator's BroadH20 radio vs o
 - **NodePopup** has a Group dropdown above the action grid — assign / unassign in one click; matching color dot displayed when assigned
 - **Dashboard NODE_DETAILS** has the same Group dropdown right under the node title
 
-**Still deferred:**
-- Inline group rename — currently you'd delete and recreate. A double-click-to-edit on the GroupItem would close that gap
+**✅ Inline group rename — done**
+- Double-click any user group in the sidebar to edit its name in place
+- Enter commits, Escape cancels, blur commits, empty/unchanged values are no-ops
+- Wired through the existing `PATCH /api/mesh/groups/:id` endpoint (`meshDataService.updateGroup`); fans out via SSE so multi-tab clients re-sync within ~250 ms
 
 **✅ Multi-select bulk-assign — done**
 - Per-row checkbox in the dashboard NODE_LIST table (subtle, brightens on hover)
@@ -187,7 +194,7 @@ Items that have been **field-tested** against the operator's BroadH20 radio vs o
 
 | Item | Type | Notes |
 |---|---|---|
-| Bundle size | ⚠️ Partial | ~1.2 MB total; `emoji-picker-react` (~140 KB) and `recharts` (~120 KB) are the largest single contributors. Lazy-load either via dynamic import to shrink initial load |
+| Bundle size | ✅ Done (Round 1) | Initial JS dropped 1.07 MB → 843 KB (gzip 304 → 252 KB, ~22%) by lazy-loading `recharts` (TelemetryChart), `emoji-picker-react` (WaypointEditorModal + reaction picker via a tiny `lazy/ReactionPicker` shim). Heavy chunks now load on-demand only when operators open the relevant feature |
 | Settings → Modules section | ✅ Done | Unified Settings modal hosts the module config UI (NeighborInfo first; expandable to others as admin write paths land) |
 | Settings hub consolidation | ✅ Done | Connection / Modules / Notifications / Display / Blocked / Data / AI all in one tabbed modal — replaces the previous 6-button rail |
 | Comm Matrix usability at scale | ✅ Done | Time filter + top-N + channels-as-columns + success-rate coloring + sticky axes — see "Comm Matrix" section above |
@@ -195,11 +202,12 @@ Items that have been **field-tested** against the operator's BroadH20 radio vs o
 | Topology zoom-to-fit | ✅ Done | Auto-fits ~800 ms after layout settles; manual ⛶ button in the camera-controls cluster |
 | Topology layout persistence | ✅ Done | Drag-positions saved to `localStorage` (`mesh.topologyLayout`); restored before simulation runs. "Reset" button clears all pinned positions and re-runs the layout |
 | Group color on map + topology | ✅ Done | Assigned group's hex color overrides the default emerald/amber/slate ring + fill + label. Priority: group > favorite > online > offline |
-| Node tooltip hover | 💡 Idea | On topology, hover-tooltip with node info (currently you have to click) |
+| App version in header | ✅ Done | Header now reads from `package.json` at build time via `__APP_VERSION__` Vite define (was hardcoded to a stale `v2.4.0-STABLE`). Bumped from 0.1.0 → 0.2.0 to reflect the work shipped |
+| Node tooltip hover | ✅ Done | Hovering any topology node now shows a cursor-following HTML overlay with name/short, id, hardware model, role, license, last-seen, battery / SNR / RSSI, group, MQTT-via, and favorite — flips to the cursor's other side near edges so it stays visible |
 | Mobile / responsive layout | 📋 Deferred | App works on desktop and tablet; phone screens will be cramped |
-| Dark/light theme toggle | 📋 Deferred | Currently dark only |
-| Time-based message retention | 📋 Deferred | Events have it (Settings → Display has retention control); messages still cap by count (5000 rows) |
-| Block list sync across server instances | 📋 Deferred | Stored in browser `localStorage`; doesn't follow the user across machines |
+| Dark/light theme toggle | ✅ Done | Settings → Display has Auto / Light / Dark. Auto follows OS `prefers-color-scheme` and live-flips. Brand-* CSS-variable palette swaps via `:root[data-theme="light"]`; all hardcoded `slate-*`/`emerald-*`/`amber-*`/`red-*`/`cyan-*` classes were migrated to brand-* tokens (~478 references, 22 files). Inline `style={{ background: '#020617' }}` modal backgrounds switched to `var(--color-brand-bg)` so popups also flip |
+| Time-based message retention | ✅ Done | Settings → Display now has a Message Retention dropdown (Keep all / 1d / 3d / 7d / 30d / 90d). Default is "Keep all" so existing behavior is unchanged; selecting a window prunes older messages on a 5-min timer (parallel to events). Count cap of 5,000 still applies as a safety net |
+| Block list sync across server instances | ✅ Done | Block list is now persisted server-side in a new `blocked_nodes` SQLite table, served via `GET /api/mesh/blocked`, mutated via `POST /api/mesh/blocked` and `DELETE /api/mesh/blocked/:id`, and fanned out via a new `blocked` SSE event (multi-tab sync within ~250 ms). `useBlockList` migrated from localStorage to the server with optimistic UI + revert-on-failure; legacy localStorage entries are pushed up on first mount and then kept as a stale-cache fallback for offline reads |
 | Node ignore from radio side | 💡 Idea | Block list is local-only. Firmware also has node-level ignore — could be wired through |
 
 ---
@@ -213,7 +221,7 @@ Items that have been **field-tested** against the operator's BroadH20 radio vs o
 | No outbound telemetry | ✅ Done | The app makes no third-party calls except to the user-configured AI provider |
 | Server auth | 📋 Deferred | The HTTP API has no auth — anyone with network access to the server can read/send. Fine for `localhost`-only deployments; needs reverse-proxy + basic auth for anything broader |
 | HTTPS / WSS | 📋 Deferred | Not configured by default — terminate at a reverse proxy |
-| AI prompts include node IDs and message text | ⚠️ Partial | Be aware: when the AI assistant is invoked, the system prompt includes a snapshot of mesh state. If you don't want that data going to Anthropic/Google, leave keys unset |
+| AI prompts include node IDs and message text | ✅ Done | Settings → AI has a **Redact PII from AI prompts** toggle. When on, the system prompt drops all node identifiers, names, positions, and message contents — the provider only sees aggregate counts (total / online / offline / favorites / positioned / telemetry-reporting / RPi-bridges / temperature avg) plus event-type histogram from the last 50 events. Persisted server-side at `data/ai-config.json` and applied client-side in [src/services/geminiService.ts](src/services/geminiService.ts) before the request leaves the browser. AIAssistant header shows a `REDACTED` pill when active so the operator always knows which mode is in effect |
 
 ---
 
@@ -232,8 +240,12 @@ Items that have been **field-tested** against the operator's BroadH20 radio vs o
 
 These haven't been requested but seem natural fits:
 
-- **Coverage heatmap** — combine Range Test + position data into a colored overlay on the map showing where reception is strong/weak
+- ✅ **Coverage heatmap** — done. The Range Test Coverage panel now has a "Heatmap mode" toggle that recolors every map marker by avg SNR (emerald ≥ 5 dB / amber 0–5 / red < 0 / muted for senders we haven't heard via Range Test in the active window). Inline color legend in the panel; the existing list + click-to-focus works alongside
 - **Mesh playback** — scrub through historical events on a timeline, replay the mesh state at any point
+- ✅ **Channel sharing via QR** — done. ChannelsModal now has a "Share via QR" button that opens a modal with a QR + copyable URL in the standard Meshtastic `https://meshtastic.org/e/#<base64url>` format. Encodes the active channel set's PSKs, names, uplink/downlink flags, and per-channel position-precision. Compatible with the official Meshtastic mobile clients. Live in [src/lib/channelShare.ts](src/lib/channelShare.ts) with a hand-rolled `ChannelSet` protobuf encoder
+- ✅ **Range Test scheduler** — done. Settings → Modules → Range Test now has a "Coverage Survey" panel with a duration picker (5–60 min) and a survey cadence picker (30 s – 5 min). Captures the current Range Test config before starting, applies a faster sender cadence, and auto-restores when the timer fires. Active surveys show a live countdown with a Cancel button
+- ✅ **Site survey mode** — done. Same pattern for NeighborInfo: Settings → Modules → NeighborInfo has a "Site Survey" panel that temporarily speeds up the NeighborInfo broadcast cadence (1–10 min options) for 5–60 minutes, then restores the previous config. Useful right after deploying a new node so the topology fills in within minutes instead of hours. Both surveys share a `SurveyControl` helper component and surface their expiry via `LocalModuleConfigSnapshot.activeSurveys`
+- ✅ **Node firmware version surfacing** — done. Settings → Connection now surfaces `firmwareVersion`, `localNodeId`, and `rebootCount` once the radio reports them. Bridge captures from MyNodeInfo (older firmware path: field 4 string) AND FromRadio.metadata → DeviceMetadata (newer firmware path: field 1 string). Whichever arrives first wins
 - ~~**Per-node graphs** — RSSI/SNR/battery time-series for a single node~~ ✅ Done — three-tab chart (Signal · Power · Environment) inline in the NODE_DETAILS dashboard widget, auto-refreshes every 30 s, uses `recharts` (was already in deps but unused)
 - **Node ignore (firmware-level)** — combine block list with the firmware's actual ignore list for nodes that are spamming
 - **Channel sharing via QR** — the per-channel PSK + name URL format for sharing a whole channel config
@@ -241,15 +253,43 @@ These haven't been requested but seem natural fits:
 - **CSV → mesh import** — bulk-add favorite contacts or pre-seed nodes from a roster
 - **Webhook on important events** — fire an HTTP POST when a favorite goes offline / battery drops below X / specific keyword arrives in a channel
 - **Voice/audio channel monitoring** if the audio module sees use
-- **Range Test scheduler** — kick off a range test session that runs for N minutes and produces a coverage report
-- **Node firmware version surfacing** (the radio reports it in MyNodeInfo)
-- **Site survey mode** — temporarily increase NeighborInfo broadcast frequency for faster topology mapping during deployment
+
+---
+
+## v2.0 — explicitly out of scope for 1.0
+
+These items are documented for the next major version. **Not** going into the 1.0 release codebase.
+
+### Multi-radio support (two or more USB modems on the same host)
+
+The current architecture is single-radio end to end. Two radios on different LoRa frequencies, on different bands, or on the same band but different channels would need a substantial refactor — order of 1–2 weeks, real schema + API surface changes, and is the kind of work that justifies a major version bump.
+
+**What's baked in to single-radio assumptions today:**
+
+| Layer | Assumption |
+|---|---|
+| Bridge | `export const meshBridge = new MeshtasticSerialBridge()` — one singleton instance per process |
+| Serial discovery | `serialDiscovery` attaches the *first* LoRa device on `/dev/ttyUSB*` / `/dev/ttyACM*` and ignores any others |
+| State | Nodes, messages, events, NeighborInfo, traceroutes, range-test observations, node_sessions, channels, local_module_config — all in-memory + SQLite tables keyed by node id with no `source_radio_id` column |
+| API | `POST /api/mesh/send`, `POST /api/mesh/modules/*`, `POST /api/mesh/traceroute/:id` etc. all hit the singleton — no `?radio=` parameter |
+| UI | One header pill, one topology graph, one Comm Matrix, one Settings → Modules section, one Channels modal. No radio selector anywhere |
+| MQTT module | A single broker URL on `localModuleConfig.mqtt`. Two radios would each have their own |
+
+**What it would take for v2.0:**
+
+1. Multi-bridge: `Map<radioId, MeshtasticSerialBridge>` with per-radio ACK tracker, pendingAcks, packet-id sequence
+2. Source-tagged data: `source_radio_id` column on every relevant table, with an additive migration that defaults existing rows to a single seed radio
+3. API parameterization: every write endpoint takes a `radio` parameter; reads either filter by radio or aggregate
+4. UI radio selector: dropdown in the header that scopes topology / matrix / messaging / modules / channels to one radio (plus an "All radios" aggregate view)
+5. Discovery rewrite: enumerate all attached LoRa devices and auto-attach each
+
+**1.0 workaround for operators who need it now:** run two independent dashboard instances. Copy `docker-compose.yml` to a second directory, remap the host port (`3000:3001` → `3001:3001`), use a different volume name so each instance has its own `mesh.sqlite`. Two browser tabs, two completely independent dashboards. No cross-radio aggregation, but each works correctly with zero code changes.
 
 ---
 
 ## Known minor bugs / rough edges
 
-- **Reaction notification suppression** — added a skip for `m.isReaction` in [useMeshNotifications.ts](src/hooks/useMeshNotifications.ts), but reactions to your own messages may still trigger notifications in edge cases. Worth eyeballing once with a real mesh
-- **Topology force-graph performance** — at 134+ nodes the layout takes a few seconds to settle. Acceptable but could be tuned
-- **`localNodeId` resolution timing** — on first connect, NodeInfo for the local node arrives a few seconds after serial open. Brief window where the topology banner shows "NeighborInfo: NOT BROADCASTING" before the local node's own ID is known
-- **Trace results don't persist** — they live in memory on the server; a server restart clears them. Easy DB-add if needed
+- ✅ **Reaction notification suppression** — done. Primary skip on `m.isReaction` plus a defensive secondary heuristic: any message with `replyTo` set whose text is ≤8 chars and contains no whitespace is treated as a reaction-equivalent for notification purposes (catches the edge case where firmware variants emit `Data.emoji` in a way the parser misses). Chat UI still renders the message normally; only the notification path is suppressed
+- ✅ **Topology force-graph performance** — done. `forceManyBody.distanceMax(350)` cuts the per-tick O(N²) cost; `alphaDecay(0.045)` cuts settle time roughly in half (~150 ticks vs ~300); `velocityDecay(0.55)` damps oscillation. Final layout is visually identical at any reasonable mesh size; settle time on a 134-node mesh drops from ~4-5 s to ~1.5-2 s
+- ✅ **`localNodeId` resolution timing** — done. The topology banner now shows an "IDENTIFYING…" amber state for the first 6 s after a connect (or until `localNodeId` arrives, whichever comes first), so a healthy radio doesn't flash the wrong "NOT BROADCASTING" badge during the initial NodeInfo handshake
+- ~~**Trace results don't persist**~~ ✅ Done — new `trace_results` table in SQLite with up-to-500 rolling history; bridge upserts on every state transition (`pending` → `response` / `timeout` / `error`) and rehydrates on boot

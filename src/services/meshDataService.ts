@@ -22,6 +22,7 @@ interface MeshSnapshot {
   storeForwardRouters?: StoreForwardRouter[];
   localModuleConfig?: LocalModuleConfigSnapshot;
   groups?: Group[];
+  blocked?: string[];
   radioConnected: boolean;
   localNodeId?: string | null;
 }
@@ -32,7 +33,7 @@ export interface TransportInfo {
   tcp?: { host: string; port: number };
 }
 
-interface MeshStatus {
+export interface MeshStatus {
   radioConnected: boolean;
   transport?: TransportInfo;
   serialDevice: {
@@ -43,6 +44,12 @@ interface MeshStatus {
   } | null;
   nodeCount: number;
   messageCount: number;
+  /** Local-radio firmware version string (e.g. "2.5.13.55c2c5b"), if reported. */
+  firmwareVersion?: string | null;
+  /** Local-radio reboot count (uptime / stability hint), if reported. */
+  rebootCount?: number | null;
+  /** Local node `!hex` id, once MyNodeInfo has been received. */
+  localNodeId?: string | null;
 }
 
 export type AckStatus = 'sending' | 'sent' | 'acked' | 'error';
@@ -59,6 +66,8 @@ export class MeshDataService {
   private lastModuleConfig: LocalModuleConfigSnapshot = {};
   private groupListeners: ((groups: Group[]) => void)[] = [];
   private lastGroups: Group[] = [];
+  private blockedListeners: ((blocked: string[]) => void)[] = [];
+  private lastBlocked: string[] = [];
   private statusListeners: ((status: MeshStatus | null) => void)[] = [];
   private ackListeners: ((msgId: string, status: AckStatus, errorCode: number) => void)[] = [];
   private traceListeners: ((trace: TraceResult) => void)[] = [];
@@ -167,6 +176,7 @@ export class MeshDataService {
       this.eventSource.addEventListener('neighborInfo', triggerDebouncedPoll);
       this.eventSource.addEventListener('moduleConfig', triggerDebouncedPoll);
       this.eventSource.addEventListener('groups', triggerDebouncedPoll);
+      this.eventSource.addEventListener('blocked', triggerDebouncedPoll);
 
       this.eventSource.onerror = () => {
         // Browser will auto-reconnect; no action needed
@@ -352,6 +362,388 @@ export class MeshDataService {
     }
   }
 
+  /** Ask the radio to re-send its current Range Test module config. Local admin only. */
+  async refreshRangeTestConfig(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/range-test/refresh`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Start a timed Range Test sender survey. Restores the previous config after `durationMinutes`. */
+  async startRangeTestSurvey(opts: { durationMinutes: number; senderIntervalSecs: number }): Promise<{ ok: boolean; expiresAt?: number; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/range-test/survey`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(opts),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true, expiresAt: body.expiresAt };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  async cancelRangeTestSurvey(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/range-test/survey`, { method: 'DELETE' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Start a timed NeighborInfo survey (faster cadence) to accelerate topology discovery. */
+  async startNeighborInfoSurvey(opts: { durationMinutes: number; intervalSecs: number }): Promise<{ ok: boolean; expiresAt?: number; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/neighbor-info/survey`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(opts),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true, expiresAt: body.expiresAt };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  async cancelNeighborInfoSurvey(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/neighbor-info/survey`, { method: 'DELETE' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Configure the Range Test sender on the connected radio. senderIntervalSecs=0 = receive-only. */
+  async setRangeTestConfig(opts: { enabled: boolean; senderIntervalSecs?: number; save?: boolean }): Promise<{ ok: boolean; senderIntervalSecs?: number; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/range-test`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(opts),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Ask the radio to re-send its current Telemetry module config. Local admin only. */
+  async refreshTelemetryConfig(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/telemetry/refresh`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Configure the Telemetry module on the connected radio. */
+  async setTelemetryConfig(opts: {
+    deviceUpdateIntervalSecs?: number;
+    environmentEnabled?: boolean;
+    environmentUpdateIntervalSecs?: number;
+    powerEnabled?: boolean;
+    powerUpdateIntervalSecs?: number;
+  }): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/telemetry`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(opts),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Ask the radio to re-send its current Store & Forward module config. Local admin only. */
+  async refreshStoreForwardConfig(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/store-forward/refresh`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Fetch aggregated Range Test coverage observations from the server. */
+  async getRangeTestCoverage(windowMs = 0, limit = 5000): Promise<{
+    windowMs: number;
+    total: number;
+    aggregates: Array<{
+      senderId: string;
+      count: number;
+      avgSnr: number | null;
+      bestSnr: number | null;
+      worstSnr: number | null;
+      avgRssi: number | null;
+      bestRssi: number | null;
+      worstRssi: number | null;
+      lastSeen: number;
+      lastLat: number | null;
+      lastLng: number | null;
+    }>;
+    observations: Array<{
+      id: number;
+      senderId: string;
+      senderLat: number | null;
+      senderLng: number | null;
+      seq: number | null;
+      snr: number | null;
+      rssi: number | null;
+      text: string | null;
+      timestamp: number;
+    }>;
+  } | { error: string }> {
+    try {
+      const url = `${API_BASE}/api/mesh/range-test/coverage?windowMs=${windowMs}&limit=${limit}`;
+      const res = await fetch(url);
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { error: body.error || `HTTP ${res.status}` };
+      }
+      return await res.json();
+    } catch (err: any) {
+      return { error: err.message || 'Network error' };
+    }
+  }
+
+  /** Ask the radio to re-send its current Detection Sensor module config. Local admin only. */
+  async refreshDetectionSensorConfig(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/detection-sensor/refresh`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Configure the Detection Sensor module on the connected radio. */
+  async setDetectionSensorConfig(cfg: {
+    enabled: boolean;
+    minimumBroadcastSecs: number;
+    stateBroadcastSecs: number;
+    sendBell: boolean;
+    name: string;
+    monitorPin: number;
+    detectionTriggeredHigh: boolean;
+    usePullup: boolean;
+  }): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/detection-sensor`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(cfg),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Ask the radio to re-send its current Audio module config. Local admin only. */
+  async refreshAudioConfig(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/audio/refresh`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Configure the Audio module on the connected radio. */
+  async setAudioConfig(cfg: {
+    codec2Enabled: boolean;
+    pttPin: number;
+    bitrate: number;
+    i2sWs: number;
+    i2sSd: number;
+    i2sDin: number;
+    i2sSck: number;
+  }): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/audio`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(cfg),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Ask the radio to re-send its current MQTT module config. Local admin only. */
+  async refreshMqttConfig(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/mqtt/refresh`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Configure the MQTT module on the connected radio. */
+  async setMqttConfig(cfg: {
+    enabled: boolean;
+    address: string;
+    username: string;
+    password: string;
+    encryptionEnabled: boolean;
+    jsonEnabled: boolean;
+    tlsEnabled: boolean;
+    root: string;
+    proxyToClientEnabled: boolean;
+    mapReportingEnabled: boolean;
+    mapReportSettingsRaw: string | null;
+  }): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/mqtt`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(cfg),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Ask the radio to re-send its current External Notification module config. Local admin only. */
+  async refreshExternalNotificationConfig(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/external-notification/refresh`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Configure the External Notification module. All fields are required so board-specific GPIO assignments are preserved. */
+  async setExternalNotificationConfig(cfg: {
+    enabled: boolean;
+    outputMs: number;
+    output: number;
+    active: boolean;
+    alertMessage: boolean;
+    alertBell: boolean;
+    usePwm: boolean;
+    outputVibra: number;
+    outputBuzzer: number;
+    alertMessageVibra: boolean;
+    alertMessageBuzzer: boolean;
+    alertBellVibra: boolean;
+    alertBellBuzzer: boolean;
+    nagTimeout: number;
+    useI2sAsBuzzer: boolean;
+  }): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/external-notification`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(cfg),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Configure the Store & Forward module on the connected radio. */
+  async setStoreForwardConfig(opts: {
+    enabled: boolean;
+    isServer?: boolean;
+    heartbeat?: boolean;
+    records?: number;
+    historyReturnMax?: number;
+    historyReturnWindow?: number;
+  }): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/store-forward`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(opts),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
   // ---- Node groups ----
 
   /** Subscribe to the current groups list (replays the last known list immediately). */
@@ -359,6 +751,47 @@ export class MeshDataService {
     this.groupListeners.push(callback);
     callback(this.lastGroups);
     return () => { this.groupListeners = this.groupListeners.filter(l => l !== callback); };
+  }
+
+  /** Subscribe to the blocked-node-id list (replays the last known list immediately). */
+  onBlocked(callback: (blocked: string[]) => void) {
+    this.blockedListeners.push(callback);
+    callback(this.lastBlocked);
+    return () => { this.blockedListeners = this.blockedListeners.filter(l => l !== callback); };
+  }
+
+  /** Add a node to the server-side block list. */
+  async blockNode(nodeId: string): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/blocked`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ nodeId }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Remove a node from the server-side block list. */
+  async unblockNode(nodeId: string): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/blocked/${encodeURIComponent(nodeId)}`, {
+        method: 'DELETE',
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
   }
 
   getGroups(): Group[] {
@@ -649,6 +1082,11 @@ export class MeshDataService {
       if (data.groups) {
         this.lastGroups = data.groups;
         this.groupListeners.forEach(l => l(data.groups!));
+      }
+
+      if (Array.isArray(data.blocked)) {
+        this.lastBlocked = data.blocked;
+        this.blockedListeners.forEach(l => l(data.blocked!));
       }
 
       if (data.localNodeId !== undefined) {

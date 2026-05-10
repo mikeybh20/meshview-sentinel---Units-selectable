@@ -49,58 +49,98 @@ export function RecipeView() {
         </div>
       </div>
 
-      <div className="flex-1 bg-brand-line/5 border border-brand-line rounded-2xl overflow-hidden shadow-inner flex flex-col">
-        <div className="flex items-center gap-2 px-4 py-2 bg-brand-line/20 border-b border-brand-line">
-          <div className="w-2.5 h-2.5 rounded-full bg-red-500/30" />
-          <div className="w-2.5 h-2.5 rounded-full bg-yellow-500/30" />
-          <div className="w-2.5 h-2.5 rounded-full bg-brand-accent/30" />
-          <span className="ml-2 text-[10px] font-mono text-brand-muted uppercase">recipe_v1.0.md</span>
+      <div className="flex-1 bg-brand-surface/40 border border-brand-line rounded-2xl overflow-hidden shadow-inner flex flex-col">
+        <div className="flex items-center gap-2 px-4 py-2 bg-brand-line/30 border-b border-brand-line">
+          <div className="w-2.5 h-2.5 rounded-full bg-brand-error/40" />
+          <div className="w-2.5 h-2.5 rounded-full bg-brand-warning/40" />
+          <div className="w-2.5 h-2.5 rounded-full bg-brand-accent/40" />
+          <span className="ml-2 text-[10px] font-mono text-brand-muted uppercase">recipe_v2.0.md</span>
         </div>
-        
-        <div className="flex-1 overflow-y-auto p-8 custom-scrollbar bg-brand-bg/50">
+
+        <div className="flex-1 overflow-y-auto p-8 custom-scrollbar bg-brand-bg/40">
           <div className="max-w-none text-brand-ink space-y-6">
             <ReactMarkdown
               components={{
                 h1: ({ children }) => (
-                  <h1 className="text-3xl font-bold uppercase tracking-widest italic mb-8 border-b-2 border-brand-accent/20 pb-4 text-white">
+                  <h1 className="text-2xl md:text-3xl font-bold uppercase tracking-widest italic mb-6 border-b-2 border-brand-accent/30 pb-4 text-brand-ink">
                     {children}
                   </h1>
                 ),
                 h2: ({ children }) => (
-                  <h2 className="text-xl font-bold uppercase tracking-widest italic mt-10 mb-4 text-brand-accent">
+                  <h2 className="text-lg md:text-xl font-bold uppercase tracking-widest italic mt-8 mb-3 text-brand-accent">
                     {children}
                   </h2>
                 ),
                 h3: ({ children }) => (
-                  <h3 className="text-sm font-bold uppercase tracking-widest mt-6 mb-2 text-brand-muted">
+                  <h3 className="text-sm font-bold uppercase tracking-widest mt-5 mb-2 text-brand-ink">
                     {children}
                   </h3>
                 ),
                 p: ({ children }) => (
-                  <p className="text-sm leading-relaxed text-gray-300">
+                  <p className="text-sm leading-relaxed text-brand-ink">
                     {children}
                   </p>
                 ),
                 ul: ({ children }) => (
-                  <ul className="list-disc list-inside text-sm space-y-2 text-gray-300 ml-4">
+                  <ul className="list-disc list-inside text-sm space-y-2 text-brand-ink ml-4">
                     {children}
                   </ul>
                 ),
+                ol: ({ children }) => (
+                  <ol className="list-decimal list-inside text-sm space-y-2 text-brand-ink ml-4">
+                    {children}
+                  </ol>
+                ),
+                li: ({ children }) => (
+                  <li className="text-brand-ink leading-relaxed">{children}</li>
+                ),
+                a: ({ children, href }) => (
+                  <a
+                    href={href}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-brand-accent hover:underline break-all"
+                  >
+                    {children}
+                  </a>
+                ),
+                blockquote: ({ children }) => (
+                  <blockquote className="border-l-4 border-brand-accent/50 pl-4 py-1 my-3 bg-brand-surface/40 rounded-r text-brand-ink/90 text-sm">
+                    {children}
+                  </blockquote>
+                ),
+                table: ({ children }) => (
+                  <div className="overflow-x-auto my-4">
+                    <table className="w-full text-xs border-collapse">{children}</table>
+                  </div>
+                ),
+                thead: ({ children }) => (
+                  <thead className="bg-brand-line/40 text-brand-ink uppercase tracking-widest text-[10px]">{children}</thead>
+                ),
+                th: ({ children }) => (
+                  <th className="border border-brand-line px-3 py-1.5 text-left font-bold">{children}</th>
+                ),
+                td: ({ children }) => (
+                  <td className="border border-brand-line px-3 py-1.5 text-brand-ink align-top">{children}</td>
+                ),
                 code: ({ children }) => (
-                  <code className="bg-brand-line/40 px-1.5 py-0.5 rounded text-brand-accent font-mono text-xs">
+                  <code className="bg-brand-line/50 border border-brand-line px-1.5 py-0.5 rounded text-brand-accent font-mono text-xs">
                     {children}
                   </code>
                 ),
                 pre: ({ children }) => (
-                  <pre className="bg-black/50 border border-brand-line/50 p-4 rounded-xl overflow-x-auto my-4 font-mono text-xs text-brand-accent/90">
+                  <pre className="bg-brand-surface border border-brand-line p-4 rounded-xl overflow-x-auto my-4 font-mono text-xs text-brand-ink">
                     {children}
                   </pre>
                 ),
-                hr: () => <hr className="border-brand-line my-10" />,
+                hr: () => <hr className="border-brand-line my-8" />,
                 strong: ({ children }) => (
                   <strong className="text-brand-accent font-bold">
                     {children}
                   </strong>
+                ),
+                em: ({ children }) => (
+                  <em className="text-brand-ink italic">{children}</em>
                 ),
               }}
             >

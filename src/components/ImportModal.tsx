@@ -162,7 +162,7 @@ export function ImportModal({ nodes, onClose }: ImportModalProps) {
           {status && (
             <div className={cn(
               "p-3 rounded-lg flex items-start gap-3 text-xs animate-in fade-in slide-in-from-top-2",
-              status.type === 'success' ? "bg-brand-accent/10 text-brand-accent border border-brand-accent/20" : "bg-red-500/10 text-red-500 border border-red-500/20"
+              status.type === 'success' ? "bg-brand-accent/10 text-brand-accent border border-brand-accent/20" : "bg-brand-error/10 text-brand-error border border-brand-error/20"
             )}>
               {status.type === 'success' ? <Check size={16} className="shrink-0" /> : <AlertCircle size={16} className="shrink-0" />}
               <p>{status.message}</p>
@@ -173,7 +173,7 @@ export function ImportModal({ nodes, onClose }: ImportModalProps) {
         <div className="p-4 border-t border-brand-line flex justify-end bg-brand-line/10">
           <button 
             onClick={onClose}
-            className="px-6 py-2 text-sm font-bold uppercase tracking-widest hover:text-white transition-colors"
+            className="px-6 py-2 text-sm font-bold uppercase tracking-widest hover:text-brand-ink transition-colors"
           >
             Close
           </button>

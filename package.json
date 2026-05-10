@@ -1,10 +1,10 @@
 {
   "name": "meshview-sentinel",
-  "version": "0.1.0",
+  "version": "1.0.0rc1",
   "description": "Web dashboard, control center, and diagnostic tool for Meshtastic LoRa mesh networks. Personal open-source project; not affiliated with any employer.",
   "license": "MIT",
   "author": {
-    "name": "Michael Broadwater",
+    "name": "Kit Kim and Michael Broadwater",
     "email": "michael.broadwater@gmail.com"
   },
   "private": true,

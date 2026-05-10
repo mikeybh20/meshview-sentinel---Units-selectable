@@ -1,6 +1,8 @@
 import React from 'react';
 import { Filter, Signal, Activity, Users, ArrowRight, Settings, Clock, Check, CheckCheck, AlertCircle, RotateCcw, Wifi, WifiOff, CornerDownRight, Smile, X, Search } from 'lucide-react';
-import EmojiPicker, { Theme, EmojiStyle } from 'emoji-picker-react';
+// ReactionPicker is lazy-loaded so emoji-picker-react (~140 KB) only ships
+// when the operator actually opens a reaction picker.
+const ReactionPicker = React.lazy(() => import('../lazy/ReactionPicker'));
 
 import { Node, Message, Channel } from '../../types';
 import { cn } from '../../lib/utils';
@@ -42,6 +44,103 @@ function lastSeenLabel(lastSeen: number): string {
   return `${Math.floor(seconds / 3600)}h ago`;
 }
 
+/**
+ * Map a stored `errorCode` to operator-facing diagnostics.
+ *
+ * Negative codes are bridge-internal (we set them ourselves):
+ *   -1 = 30s ACK timeout (the most common DM failure)
+ *   -2 = synchronous radio-write error (frame build / link not open)
+ * Positive codes 0-9, 32-38 are the firmware's `Routing.Error` enum from
+ * mesh.proto — when a peer or relay sends a NAK, that enum value flows back
+ * through PORT_ROUTING_APP and we store it on the message.
+ *
+ * Returns `{ short, long }`:
+ *   short — uppercase tag for the inline pill (e.g. "TIMEOUT", "NO_ROUTE")
+ *   long  — multi-line tooltip body explaining what it usually means
+ */
+function describeMessageError(errorCode: number | undefined): { short: string; long: string } {
+  switch (errorCode) {
+    case -1: return {
+      short: 'TIMEOUT',
+      long: 'Timeout — no ACK received within 30 s.\n\nMost common cause: the destination is offline or unreachable. Check the node\'s "last seen" time. If it was last seen via MQTT, ACKs often don\'t round-trip through the public broker.',
+    };
+    case -2: return {
+      short: 'SEND ERR',
+      long: 'Radio write failed before the packet went out.\n\nUsually means the serial link dropped or the bridge is in a stuck state. Check `docker compose logs meshview` and consider `docker compose restart meshview`.',
+    };
+    case 1: return {
+      short: 'NO ROUTE',
+      long: 'NO_ROUTE — no path to destination. The mesh\'s routers don\'t have a route to this node.\n\nUsually means too many hops, or the destination has been off the mesh long enough that route cache expired.',
+    };
+    case 2: return {
+      short: 'GOT NAK',
+      long: 'GOT_NAK — a relay along the path explicitly NAK\'d the packet (couldn\'t forward it).',
+    };
+    case 3: return {
+      short: 'FW TIMEOUT',
+      long: 'TIMEOUT — the firmware itself timed out waiting for an ACK before our 30 s wrapper did. Same root cause as our timeout: destination unreachable.',
+    };
+    case 4: return {
+      short: 'NO IFACE',
+      long: 'NO_INTERFACE — no interface available to send on. The radio\'s LoRa or WiFi/MQTT stack isn\'t up.',
+    };
+    case 5: return {
+      short: 'MAX RETRY',
+      long: 'MAX_RETRANSMIT — the firmware retried internally up to its limit and never got an ACK. Usually weak link or duty-cycle congestion.',
+    };
+    case 6: return {
+      short: 'NO CHANNEL',
+      long: 'NO_CHANNEL — the destination isn\'t configured for any channel we know about. Common when DMing a node we only see via MQTT but don\'t share a channel PSK with.',
+    };
+    case 7: return {
+      short: 'TOO LARGE',
+      long: 'TOO_LARGE — message exceeds the LoRa max payload size (~228 bytes). Shorten the text and resend.',
+    };
+    case 8: return {
+      short: 'NO RESPONSE',
+      long: 'NO_RESPONSE — the destination never responded. Effectively the same as TIMEOUT but reported by the firmware rather than our 30 s wrapper.',
+    };
+    case 9: return {
+      short: 'DUTY CYCLE',
+      long: 'DUTY_CYCLE_LIMIT — your radio hit the regulatory airtime cap (1 % in EU, etc.) and refused to TX. Wait a few minutes and retry.',
+    };
+    case 32: return {
+      short: 'BAD REQ',
+      long: 'BAD_REQUEST — the firmware considered the packet malformed. This is unusual; check the bridge logs.',
+    };
+    case 33: return {
+      short: 'NOT AUTH',
+      long: 'NOT_AUTHORIZED — operation requires admin auth that wasn\'t provided. Most often seen on admin writes, not DMs.',
+    };
+    case 34: return {
+      short: 'PKI FAIL',
+      long: 'PKI_FAILED — the destination\'s public-key encryption rejected our packet. Usually means a stale public key on our side; the destination has rotated keys since we cached them.',
+    };
+    case 35: return {
+      short: 'PKI UNKNOWN',
+      long: 'PKI_UNKNOWN_PUBKEY — the destination has no record of our public key. They may have wiped their NodeDB or never received our NodeInfo.',
+    };
+    case 36: return {
+      short: 'ADMIN KEY',
+      long: 'ADMIN_BAD_SESSION_KEY — admin session key invalid (firmware admin auth feature).',
+    };
+    case 37: return {
+      short: 'ADMIN PUB',
+      long: 'ADMIN_PUBLIC_KEY_UNAUTHORIZED — admin public key not in the destination\'s allow-list.',
+    };
+    case 38: return {
+      short: 'RATE LIMIT',
+      long: 'RATE_LIMIT_EXCEEDED — you\'ve sent too much traffic too fast for this destination. Slow down.',
+    };
+    default: return {
+      short: `ERR ${errorCode ?? '?'}`,
+      long: errorCode === undefined
+        ? 'Send failed (no error code recorded).'
+        : `Send failed with Routing.Error code ${errorCode}. See mesh.proto for the full enum — or check the server logs for context.`,
+    };
+  }
+}
+
 function MessageStatusIcon({ status, errorCode, onRetry }: {
   status?: Message['status'];
   errorCode?: number;
@@ -59,17 +158,18 @@ function MessageStatusIcon({ status, errorCode, onRetry }: {
     return <span title="Sent to radio"><Check size={11} className="text-brand-muted" /></span>;
   }
   if (status === 'error') {
-    const label = errorCode === -1 ? 'Timeout — no ACK received'
-      : errorCode === -2 ? 'Radio write failed'
-      : `Routing error ${errorCode}`;
+    const { short, long } = describeMessageError(errorCode);
     return (
-      <span className="flex items-center gap-1">
-        <span title={label}><AlertCircle size={11} className="text-red-400" /></span>
+      <span className="flex items-center gap-1" title={long}>
+        <AlertCircle size={11} className="text-brand-error" />
+        <span className="text-[9px] mono-text uppercase tracking-wider text-brand-error font-bold">
+          {short}
+        </span>
         {onRetry && (
           <button
             onClick={onRetry}
-            className="flex items-center gap-0.5 text-[9px] text-red-400 hover:text-red-300 mono-text uppercase transition-colors"
-            title="Retry"
+            className="flex items-center gap-0.5 text-[9px] text-brand-error hover:text-brand-error mono-text uppercase transition-colors"
+            title={`Retry sending\n\n${long}`}
           >
             <RotateCcw size={9} />
             RETRY
@@ -101,11 +201,24 @@ export function MessagesView({
   blockedNodeIds,
 }: MessagesViewProps) {
   const messagesEndRef = React.useRef<HTMLDivElement>(null);
+  const messageRefs = React.useRef<Map<string, HTMLDivElement>>(new Map());
+  const [highlightId, setHighlightId] = React.useState<string | null>(null);
 
-  // Auto-scroll to bottom when new messages arrive
+  // Auto-scroll to bottom when new messages arrive (suppressed briefly while a
+  // search-result highlight is anchoring on a specific older message).
   React.useEffect(() => {
+    if (highlightId) return;
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [filteredMessages.length]);
+  }, [filteredMessages.length, highlightId]);
+
+  // When a search result is jumped to, scroll its bubble into view and flash it.
+  React.useEffect(() => {
+    if (!highlightId) return;
+    const el = messageRefs.current.get(highlightId);
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    const t = setTimeout(() => setHighlightId(null), 2000);
+    return () => clearTimeout(t);
+  }, [highlightId]);
 
   const { unreadCounts } = useReadStatus({
     messages,
@@ -194,6 +307,9 @@ export function MessagesView({
     if (target) setActiveChatId(target);
     setSearchQuery('');
     setSearchResults([]);
+    // Defer the highlight set so the chat switch and re-render happen first;
+    // the effect above then scrolls the bubble into view.
+    requestAnimationFrame(() => setHighlightId(m.id));
   };
 
   const handleSendWithReply = () => {
@@ -250,7 +366,7 @@ export function MessagesView({
             {searchQuery && (
               <button
                 onClick={() => { setSearchQuery(''); setSearchResults([]); }}
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-brand-muted hover:text-white"
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-brand-muted hover:text-brand-ink"
                 title="Clear"
               >
                 <X size={11} />
@@ -398,13 +514,25 @@ export function MessagesView({
               const reactions = m.packetId ? reactionsByParent.get(m.packetId) : undefined;
               const canReplyOrReact = typeof m.packetId === 'number' && !m.isReaction;
 
+              const isHighlighted = highlightId === m.id;
               return (
-                <div key={m.id} className={cn('flex flex-col gap-1 group/msg', isOwn ? 'items-end' : 'items-start')}>
+                <div
+                  key={m.id}
+                  ref={(el) => {
+                    if (el) messageRefs.current.set(m.id, el);
+                    else messageRefs.current.delete(m.id);
+                  }}
+                  className={cn(
+                    'flex flex-col gap-1 group/msg transition-all rounded-lg',
+                    isOwn ? 'items-end' : 'items-start',
+                    isHighlighted && 'bg-brand-accent/10 ring-1 ring-brand-accent/40 -mx-2 px-2 py-2'
+                  )}
+                >
                   <div className="flex items-center gap-2 px-2">
-                    <span className="text-[10px] font-bold uppercase tracking-tighter opacity-50">
+                    <span className="text-[11px] font-bold uppercase tracking-tight text-brand-ink">
                       {isOwn ? 'You' : senderName}
                     </span>
-                    <span className="text-[9px] mono-text opacity-30">{new Date(m.timestamp).toLocaleTimeString()}</span>
+                    <span className="text-[10px] mono-text text-brand-muted">{new Date(m.timestamp).toLocaleTimeString()}</span>
                   </div>
 
                   {/* Reply indicator — shown above the bubble if this message is a reply */}
@@ -429,8 +557,30 @@ export function MessagesView({
                         : 'bg-brand-line text-brand-ink',
                       m.status === 'error' && 'opacity-70'
                     )}>
-                      {parseMentions(m.text, nodes).map((seg, i) => (
-                        seg.type === 'mention' ? (
+                      {parseMentions(m.text, nodes).map((seg, i) => {
+                        if (seg.type !== 'mention') {
+                          return <React.Fragment key={i}>{seg.text}</React.Fragment>;
+                        }
+                        // Channel-wide mention (`@everyone` / `@all` / `@channel`):
+                        // not clickable (no specific node to navigate to) and styled
+                        // with the warning palette to distinguish from regular mentions.
+                        if (seg.channelWide) {
+                          return (
+                            <span
+                              key={i}
+                              className={cn(
+                                'font-bold rounded px-1',
+                                isOwn
+                                  ? 'bg-black/25 text-black'
+                                  : 'bg-brand-warning/20 text-brand-warning',
+                              )}
+                              title="Channel-wide mention — every recipient sees this as a mention"
+                            >
+                              {seg.text}
+                            </span>
+                          );
+                        }
+                        return (
                           <button
                             key={i}
                             onClick={() => seg.node && setActiveChatId(seg.node.id)}
@@ -443,10 +593,8 @@ export function MessagesView({
                           >
                             {seg.text}
                           </button>
-                        ) : (
-                          <React.Fragment key={i}>{seg.text}</React.Fragment>
-                        )
-                      ))}
+                        );
+                      })}
                     </div>
 
                     {/* Hover actions: Reply / React (only when we have a packetId to reference) */}
@@ -472,24 +620,21 @@ export function MessagesView({
                       </div>
                     )}
 
-                    {/* Emoji picker (popover) */}
+                    {/* Emoji picker (popover) — lazy-loaded */}
                     {reactPickerForId === m.id && (
                       <>
                         <div className="fixed inset-0 z-40" onClick={() => setReactPickerForId(null)} />
                         <div className={cn(
-                          'absolute z-50 top-full mt-1 rounded overflow-hidden border border-slate-700 shadow-xl',
+                          'absolute z-50 top-full mt-1 rounded overflow-hidden border border-brand-line shadow-xl',
                           isOwn ? 'right-0' : 'left-0'
                         )}>
-                          <EmojiPicker
-                            theme={Theme.DARK}
-                            emojiStyle={EmojiStyle.NATIVE}
-                            width={300}
-                            height={350}
-                            searchDisabled={false}
-                            skinTonesDisabled
-                            previewConfig={{ showPreview: false }}
-                            onEmojiClick={(e) => handleReact(m, e.emoji)}
-                          />
+                          <React.Suspense fallback={
+                            <div className="w-[300px] h-[350px] flex items-center justify-center bg-brand-surface text-[10px] text-brand-muted italic">
+                              Loading emoji picker…
+                            </div>
+                          }>
+                            <ReactionPicker onPick={(emoji) => handleReact(m, emoji)} />
+                          </React.Suspense>
                         </div>
                       </>
                     )}
@@ -530,11 +675,11 @@ export function MessagesView({
                           onClick={() => { setTraceMessageId(m.id); setActiveTab('map'); }}
                           className={cn(
                             'flex items-center gap-1 transition-all rounded hover:bg-brand-accent/10 group',
-                            traceMessageId === m.id ? 'opacity-100 text-brand-accent scale-105' : 'opacity-50 hover:opacity-100'
+                            traceMessageId === m.id ? 'text-brand-accent scale-105' : 'text-brand-muted hover:text-brand-ink'
                           )}
                         >
                           <Signal size={10} className={cn(traceMessageId === m.id ? 'animate-pulse' : '')} />
-                          <span className="text-[8px] mono-text uppercase">
+                          <span className="text-[9px] mono-text uppercase">
                             {traceMessageId === m.id ? 'Tracing…' : `Hops: ${m.hops.length}`}
                           </span>
                         </button>
@@ -548,11 +693,11 @@ export function MessagesView({
                       onClick={() => { setTraceMessageId(m.id); setActiveTab('map'); }}
                       className={cn(
                         'px-2 flex items-center gap-1 transition-all rounded hover:bg-brand-accent/10',
-                        traceMessageId === m.id ? 'opacity-100 text-brand-accent scale-105' : 'opacity-50 hover:opacity-100'
+                        traceMessageId === m.id ? 'text-brand-accent scale-105' : 'text-brand-muted hover:text-brand-ink'
                       )}
                     >
                       <Signal size={10} className={cn(traceMessageId === m.id ? 'animate-pulse' : '')} />
-                      <span className="text-[8px] mono-text uppercase">
+                      <span className="text-[9px] mono-text uppercase">
                         {traceMessageId === m.id ? 'Tracing Path…' : `Hops: ${m.hops.length}`}
                       </span>
                     </button>
@@ -580,7 +725,7 @@ export function MessagesView({
                 </span>
                 <button
                   onClick={() => setReplyingTo(null)}
-                  className="text-brand-muted hover:text-white shrink-0"
+                  className="text-brand-muted hover:text-brand-ink shrink-0"
                   title="Cancel reply"
                 >
                   <X size={11} />

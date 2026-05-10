@@ -1,5 +1,19 @@
 import { Node, Message, RadioEvent, UptimeRecord, RouteRecord, Waypoint } from '../types';
 
+/**
+ * Generate a unique-enough id for a simulator-only message or event.
+ *
+ * We deliberately do NOT use `crypto.randomUUID()` here: that API throws on a
+ * non-secure context (any HTTP origin that isn't localhost), and the simulator
+ * is constructed eagerly at module load — so a single throw cascades into a
+ * black-screen crash for every component that imports it. The simulator's ids
+ * don't need to be cryptographically random, just collision-free for an
+ * in-browser session, which `Date.now()` plus randomness easily achieves.
+ */
+function simId(): string {
+  return `sim-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 const INITIAL_NODES: Node[] = [
   {
     id: '!abcdef01',
@@ -112,7 +126,104 @@ export class MeshtasticSimulator {
         this.uptimeHistory.push({ nodeId: n.id, onlineAt: Date.now() - 60000, offlineAt: null });
       }
     });
+    // Defensive: if the demo seed throws for any reason (browser API quirk,
+    // unexpected node shape, etc.), log it but don't take down the whole app.
+    // The simulator is constructed eagerly at module load; a thrown error here
+    // would cascade to break every component that imports the simulator
+    // (including AIAssistant, MapView, DashboardView, etc.) and produce a
+    // black screen on dashboard load.
+    try {
+      this.seedDemoHistory();
+    } catch (err) {
+      console.error('[Simulator] seedDemoHistory failed; continuing without seeded demo data:', err);
+    }
     this.startSimulation();
+  }
+
+  /**
+   * Pre-populate ~24 h of demo data so the Comm Matrix, NodeUptimeWidget, and
+   * other analytics views have something interesting to show the moment the
+   * operator switches to simulator mode.
+   *
+   * Generates:
+   *  - ~120 messages spread evenly across the last 24 h between random pairs
+   *    of online nodes, with realistic hops, status, errorCode, deliveryMs.
+   *  - ~3-5 historical online↔offline sessions per node so peak-hours histos
+   *    have data and the per-node uptime widget shows variation.
+   */
+  private seedDemoHistory() {
+    const now = Date.now();
+    const DAY = 24 * 3600_000;
+    const onlineNodes = this.nodes.filter(n => n.online);
+    if (onlineNodes.length < 2) return;
+
+    // ---- Messages ----
+    const SAMPLE_BODIES = [
+      'Check in', 'Position update', 'Signals are clear', 'Moving to position B',
+      'Weather looks good', "How's the relay?", 'Status update', 'Requesting telemetry',
+      'ACK received', 'Range test seq 42', 'Battery at 85%', 'Heading north',
+      'Standing by', 'Comms check, all good', 'Repeater online', 'Drop point reached',
+    ];
+    const N_MESSAGES = 120;
+    for (let i = 0; i < N_MESSAGES; i++) {
+      const from = onlineNodes[Math.floor(Math.random() * onlineNodes.length)];
+      let to = onlineNodes[Math.floor(Math.random() * onlineNodes.length)];
+      // Avoid self-loops; bias toward repeating pairs so the matrix has hot cells
+      // rather than uniform sprinkle.
+      if (to.id === from.id) to = onlineNodes[(onlineNodes.indexOf(to) + 1) % onlineNodes.length];
+      if (to.id === from.id) continue;
+
+      const hops = this.computeRoute(from.id, to.id);
+      const relayHops = hops.slice(1, -1);
+      const allRelaysOnline = relayHops.every(h => this.nodes.find(n => n.id === h)?.online);
+      // Per-pair lossiness so the success column has variation. Hash from+to to
+      // a stable failure rate so the same pair is consistently good/bad.
+      const pairHash = Array.from(from.id + to.id).reduce((s, c) => s + c.charCodeAt(0), 0);
+      const baseSuccessRate = 0.55 + ((pairHash % 40) / 100); // 55%-94%
+      const succeeded = allRelaysOnline && to.online && Math.random() < baseSuccessRate;
+      const deliveryMs = hops.length * (200 + Math.random() * 800);
+      // Spread timestamps over the last 24 h, weighted slightly toward "recent"
+      const ageMs = Math.floor(Math.random() * Math.random() * DAY);
+      const ts = now - ageMs;
+
+      this.messages.push({
+        id: simId(),
+        from: from.id,
+        to: to.id,
+        text: SAMPLE_BODIES[Math.floor(Math.random() * SAMPLE_BODIES.length)],
+        timestamp: ts,
+        channel: 'Private',
+        hopLimit: 3,
+        hops,
+        status: succeeded ? 'acked' : 'error',
+        errorCode: succeeded ? undefined : -1,
+        deliveryMs: succeeded ? Math.round(deliveryMs) : undefined,
+      });
+    }
+    this.messages.sort((a, b) => a.timestamp - b.timestamp);
+
+    // ---- Uptime sessions ----
+    // Replace the "online for the last minute" stub with a richer per-node
+    // history so the peak-hours histogram has variation.
+    this.uptimeHistory = [];
+    for (const n of this.nodes) {
+      if (!n.online) continue;
+      // Each node gets 3-5 sessions in the last 24 h.
+      const sessions = 3 + Math.floor(Math.random() * 3);
+      for (let i = 0; i < sessions; i++) {
+        const startOffset = Math.floor(Math.random() * DAY);
+        const dur = 30 * 60_000 + Math.floor(Math.random() * 4 * 3600_000); // 30 min – 4 h 30 min
+        const onlineAt = now - startOffset - dur;
+        const offlineAt = onlineAt + dur;
+        this.uptimeHistory.push({ nodeId: n.id, onlineAt, offlineAt });
+      }
+      // Plus a still-open session for "currently online".
+      this.uptimeHistory.push({
+        nodeId: n.id,
+        onlineAt: now - Math.floor(Math.random() * 30 * 60_000),
+        offlineAt: null,
+      });
+    }
   }
 
   public getUptimeHistory(): UptimeRecord[] {
@@ -198,8 +309,11 @@ export class MeshtasticSimulator {
           const allRelaysOnline = relayHops.every(h => this.nodes.find(n => n.id === h)?.online);
           const deliveryMs = hops.length * (200 + Math.random() * 800);
 
+          // Stamp status + deliveryMs directly on the Message so the Comm Matrix
+          // drill-down (which reads from `messages` prop) has full data in
+          // simulator mode without hitting the server.
           const msg: Message = {
-            id: crypto.randomUUID(),
+            id: simId(),
             from: node.id,
             to: toNode.id,
             text: ["Check in", "Signals are clear", "Moving to position B", "Weather looks good", "How's the relay?", "Status update", "Requesting telemetry", "ACK received"][Math.floor(Math.random() * 8)],
@@ -207,6 +321,9 @@ export class MeshtasticSimulator {
             channel: 'Private',
             hopLimit: 3,
             hops,
+            status: (allRelaysOnline && toNode.online) ? 'acked' : 'error',
+            errorCode: (allRelaysOnline && toNode.online) ? undefined : -1,
+            deliveryMs: (allRelaysOnline && toNode.online) ? Math.round(deliveryMs) : undefined,
           };
           this.messages = [...this.messages, msg];
 
@@ -306,7 +423,7 @@ export class MeshtasticSimulator {
 
   public addEvent(type: RadioEvent['type'], nodeId: string, details: string) {
     const event: RadioEvent = {
-      id: crypto.randomUUID(),
+      id: simId(),
       type,
       nodeId,
       timestamp: Date.now(),
