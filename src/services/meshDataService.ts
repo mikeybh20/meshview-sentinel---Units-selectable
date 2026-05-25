@@ -134,6 +134,28 @@ export class MeshDataService {
     return () => { this.ackListeners = this.ackListeners.filter(l => l !== cb); };
   }
 
+  /**
+   * Subscribe to a fine-grained TX/RX activity feed. Each callback firing
+   * represents one packet's worth of radio activity:
+   *   'tx' — we successfully wrote a frame to the radio (status='sent' on ackUpdate)
+   *   'rx' — the radio gave us a parsed packet (node/event/ack SSE arrival)
+   *
+   * Intended for tiny UI activity LEDs — not for state mirroring. We don't
+   * buffer or replay; if there's no listener, nothing is emitted.
+   */
+  onActivity(cb: (kind: 'tx' | 'rx') => void) {
+    this.activityListeners.push(cb);
+    return () => { this.activityListeners = this.activityListeners.filter(l => l !== cb); };
+  }
+
+  private activityListeners: Array<(kind: 'tx' | 'rx') => void> = [];
+
+  private emitActivity(kind: 'tx' | 'rx') {
+    for (const l of this.activityListeners) {
+      try { l(kind); } catch { /* listener exploded — keep firing the others */ }
+    }
+  }
+
   private connectEvents() {
     if (this.eventSource) return;
     try {
@@ -143,6 +165,11 @@ export class MeshDataService {
         try {
           const { msgId, status, errorCode } = JSON.parse(e.data);
           this.ackListeners.forEach(l => l(msgId, status as AckStatus, errorCode ?? 0));
+          // 'sent' = bytes left our process for the radio → TX activity.
+          // Other statuses (queued/acked/error) come from packets arriving FROM
+          // the radio and are accounted for via the rx-side listeners below.
+          if (status === 'sent') this.emitActivity('tx');
+          else this.emitActivity('rx');
         } catch { /* malformed */ }
       });
 
@@ -169,14 +196,24 @@ export class MeshDataService {
       // (e.g. several telemetry packets in a second) collapses into a
       // single full-snapshot fetch. 250 ms is short enough to feel instant
       // but long enough to absorb most bursts.
+      // RX-side: every parsed packet from the radio fans out on one of these
+      // SSE channels. Pulse the activity LED on each one (not on the debounced
+      // poll — that collapses bursts and would hide rapid activity).
       const triggerDebouncedPoll = () => this.schedulePoll();
-      this.eventSource.addEventListener('node', triggerDebouncedPoll);
-      this.eventSource.addEventListener('eventLog', triggerDebouncedPoll);
+      const rxPulseAndPoll = () => { this.emitActivity('rx'); this.schedulePoll(); };
+      this.eventSource.addEventListener('node', rxPulseAndPoll);
+      this.eventSource.addEventListener('eventLog', rxPulseAndPoll);
       this.eventSource.addEventListener('storeForward', triggerDebouncedPoll);
-      this.eventSource.addEventListener('neighborInfo', triggerDebouncedPoll);
+      this.eventSource.addEventListener('neighborInfo', rxPulseAndPoll);
       this.eventSource.addEventListener('moduleConfig', triggerDebouncedPoll);
       this.eventSource.addEventListener('groups', triggerDebouncedPoll);
       this.eventSource.addEventListener('blocked', triggerDebouncedPoll);
+      // BBS mail changes — fan out to listeners so the Mail view + nav badge
+      // refresh in real time without a full poll.
+      this.eventSource.addEventListener('bbsMail', () => {
+        this.emitActivity('rx');
+        this.bbsMailListeners.forEach(l => { try { l(); } catch { /* keep firing */ } });
+      });
 
       this.eventSource.onerror = () => {
         // Browser will auto-reconnect; no action needed
@@ -227,6 +264,157 @@ export class MeshDataService {
       return { ok: true, messageId: body.messageId };
     } catch {
       return { ok: false };
+    }
+  }
+
+  // -------- BBS Mail --------
+
+  /** Mail row shape returned by /api/mesh/bbs/inbox (recipient side). */
+  // (declared inline to avoid creating a separate type file for one feature)
+  private bbsMailListeners: Array<() => void> = [];
+
+  /** Subscribe to "something about BBS mail changed" notifications. The callback
+   *  fires after any mail insert / read / delete and is the cue to re-fetch
+   *  the inbox/outbox via getBbsInbox/getBbsOutbox. */
+  onBbsMail(cb: () => void): () => void {
+    this.bbsMailListeners.push(cb);
+    return () => { this.bbsMailListeners = this.bbsMailListeners.filter(l => l !== cb); };
+  }
+
+  async getBbsInbox(nodeId?: string): Promise<{
+    nodeId: string;
+    unread: number;
+    mail: Array<{
+      id: number; senderNodeId: string; senderShortName: string;
+      postedAt: number; body: string; readAt: number | null; deliveredAt: number | null;
+    }>;
+  } | null> {
+    try {
+      const q = nodeId ? `?nodeId=${encodeURIComponent(nodeId)}` : '';
+      const res = await fetch(`${API_BASE}/api/mesh/bbs/inbox${q}`);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch {
+      return null;
+    }
+  }
+
+  async getBbsOutbox(nodeId?: string): Promise<{
+    nodeId: string;
+    mail: Array<{
+      id: number; recipientNodeId: string; senderShortName: string;
+      postedAt: number; body: string; readAt: number | null;
+    }>;
+  } | null> {
+    try {
+      const q = nodeId ? `?nodeId=${encodeURIComponent(nodeId)}` : '';
+      const res = await fetch(`${API_BASE}/api/mesh/bbs/outbox${q}`);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch {
+      return null;
+    }
+  }
+
+  async composeBbsMail(recipientNodeId: string, body: string): Promise<{ ok: boolean; mailId?: number; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/bbs/compose`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ recipientNodeId, body }),
+      });
+      if (!res.ok) {
+        const b = await res.json().catch(() => ({}));
+        return { ok: false, error: b.error || `HTTP ${res.status}` };
+      }
+      const b = await res.json();
+      return { ok: true, mailId: b.mailId };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'request failed' };
+    }
+  }
+
+  async markBbsRead(id: number): Promise<boolean> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/bbs/${id}/read`, { method: 'POST' });
+      return res.ok;
+    } catch { return false; }
+  }
+
+  async deleteBbsMail(id: number): Promise<boolean> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/bbs/${id}`, { method: 'DELETE' });
+      return res.ok;
+    } catch { return false; }
+  }
+
+  /** Per-node position history (newest first). */
+  async getNodePositionHistory(nodeId: string, limit = 200): Promise<Array<{
+    id: number;
+    timestamp: number;
+    lat: number;
+    lng: number;
+    alt: number | null;
+    source: 'manual' | 'gps' | null;
+    precisionBits: number | null;
+  }> | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/nodes/${encodeURIComponent(nodeId)}/positions?limit=${limit}`);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch {
+      return null;
+    }
+  }
+
+  /** Trace-route results that targeted this node. */
+  async getNodeTraces(nodeId: string, limit = 50): Promise<TraceResult[] | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/nodes/${encodeURIComponent(nodeId)}/traces?limit=${limit}`);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch {
+      return null;
+    }
+  }
+
+  async getBbsUsers(): Promise<{
+    users: Array<{
+      nodeId: string;
+      sentCount: number;
+      receivedCount: number;
+      unreadCount: number;
+      lastActivity: number;
+      name: string | null;
+      shortName: string | null;
+      isLocal: boolean;
+    }>;
+    total: number;
+  } | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/bbs/users`);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Ask the radio to re-emit its full NodeDB / channel set / module configs.
+   * The bridge already issues this on connect; this is a manual nudge for when
+   * a phone (BLE) has changed config out-of-band and the UI looks stale.
+   */
+  async refreshNodeDb(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/refresh`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'request failed' };
     }
   }
 

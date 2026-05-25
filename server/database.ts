@@ -38,11 +38,13 @@ const LOAD_EVENTS = 200;
 
 export class MeshDatabase {
   private db: Db;
+  private dbPath: string;
 
   constructor(dbPath: string = DEFAULT_DB_PATH) {
     const dir = dirname(dbPath);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
+    this.dbPath = dbPath;
     this.db = new Database(dbPath);
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('synchronous = NORMAL');
@@ -50,6 +52,10 @@ export class MeshDatabase {
 
     this.runMigrations();
     console.log(`[MeshDB] Opened ${dbPath}`);
+  }
+
+  getDbPath(): string {
+    return this.dbPath;
   }
 
   close() {
@@ -230,6 +236,53 @@ export class MeshDatabase {
 
       CREATE INDEX IF NOT EXISTS idx_node_sessions_node_id ON node_sessions(node_id, online_at DESC);
       CREATE INDEX IF NOT EXISTS idx_node_sessions_open ON node_sessions(node_id) WHERE offline_at IS NULL;
+
+      -- BBS mail. Body-only (no subject) to keep the send flow at three messages
+      -- per the design. 200-char body cap enforced at insert time. Auto-pruned
+      -- after 30 days regardless of read state.
+      CREATE TABLE IF NOT EXISTS bbs_mail (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender_node_id     TEXT NOT NULL,
+        sender_short_name  TEXT NOT NULL,
+        recipient_node_id  TEXT NOT NULL,
+        posted_at          INTEGER NOT NULL,
+        body               TEXT NOT NULL,
+        read_at            INTEGER,
+        delivered_at       INTEGER
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_bbs_mail_recipient ON bbs_mail(recipient_node_id, posted_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_bbs_mail_unread ON bbs_mail(recipient_node_id) WHERE read_at IS NULL;
+      CREATE INDEX IF NOT EXISTS idx_bbs_mail_sender ON bbs_mail(sender_node_id, posted_at DESC);
+
+      -- Weather alert subscribers. Each row is a node that has DM'd
+      -- ":weather subscribe" to opt into proactive alerts for the operator's
+      -- configured home ZIP. channel_index is remembered so we reply on the
+      -- same channel they subscribed on (encryption parity).
+      CREATE TABLE IF NOT EXISTS bbs_weather_subscribers (
+        node_id        TEXT PRIMARY KEY,
+        subscribed_at  INTEGER NOT NULL,
+        channel_index  INTEGER NOT NULL DEFAULT 0,
+        last_alert_at  INTEGER
+      );
+
+      -- Per-node position history. Backs the iOS-style "Position Log" view in
+      -- the node detail panel. We write a row every time a Position arrives
+      -- (POSITION_APP packet OR NodeInfo-embedded position). Tracks lat/lng/
+      -- alt/source/precision at the moment of arrival. Caller-side dedup not
+      -- needed — every row is a discrete data point with its own timestamp.
+      CREATE TABLE IF NOT EXISTS position_history (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        node_id         TEXT NOT NULL,
+        timestamp       INTEGER NOT NULL,
+        lat             REAL NOT NULL,
+        lng             REAL NOT NULL,
+        alt             REAL,
+        source          TEXT,
+        precision_bits  INTEGER
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_pos_hist_node_ts ON position_history(node_id, timestamp DESC);
     `);
 
     // Additive migrations for older DBs. SQLite throws if the column already
@@ -853,7 +906,7 @@ export class MeshDatabase {
       num: anyNum(node, 'num'),
       name: node.name ?? null,
       short_name: node.shortName ?? null,
-      first_seen: node.lastSeen ?? now,
+      first_seen: node.firstSeen ?? node.lastSeen ?? now,
       last_seen: node.lastSeen ?? now,
       online: node.online ? 1 : 0,
       favorite: node.favorite ? 1 : 0,
@@ -878,10 +931,22 @@ export class MeshDatabase {
   }
 
   loadNodes(): MeshNode[] {
-    const rows = this.db.prepare(`SELECT raw_json FROM nodes`).all() as { raw_json: string }[];
+    // Pull the first_seen column alongside raw_json so older nodes whose
+    // raw_json predates the firstSeen field get backfilled from the column.
+    // This guarantees every node we hand back has a firstSeen value, which
+    // the UI can show as "First heard X ago" without null-handling.
+    const rows = this.db.prepare(
+      `SELECT raw_json, first_seen FROM nodes`
+    ).all() as { raw_json: string; first_seen: number | null }[];
     const out: MeshNode[] = [];
     for (const r of rows) {
-      try { out.push(JSON.parse(r.raw_json)); } catch { /* skip corrupt row */ }
+      try {
+        const node = JSON.parse(r.raw_json) as MeshNode;
+        if (node.firstSeen === undefined && r.first_seen) {
+          node.firstSeen = r.first_seen;
+        }
+        out.push(node);
+      } catch { /* skip corrupt row */ }
     }
     return out;
   }
@@ -1119,6 +1184,403 @@ export class MeshDatabase {
       telemetry: get(`SELECT COUNT(*) AS c FROM telemetry`),
       channels:  get(`SELECT COUNT(*) AS c FROM channels`),
     };
+  }
+
+  /**
+   * Comprehensive per-table inventory for the Settings → Disk panel.
+   *
+   * For each table we return:
+   *   - row count
+   *   - oldest row's timestamp (if the table has a meaningful time column)
+   *   - newest row's timestamp (likewise)
+   *   - retention policy description (rendered by the UI)
+   *
+   * Caller is expected to derive total DB size from the file itself; we just
+   * report what's INSIDE the DB here.
+   */
+  diskInventory(): Array<{
+    table: string;
+    rows: number;
+    oldest: number | null;
+    newest: number | null;
+    retention: string;
+  }> {
+    const count = (sql: string): number => {
+      try { return (this.db.prepare(sql).get() as { c: number }).c; }
+      catch { return 0; }
+    };
+    const range = (table: string, col: string): { oldest: number | null; newest: number | null } => {
+      try {
+        const row = this.db.prepare(
+          `SELECT MIN(${col}) AS lo, MAX(${col}) AS hi FROM ${table}`
+        ).get() as { lo: number | null; hi: number | null };
+        return { oldest: row.lo ?? null, newest: row.hi ?? null };
+      } catch {
+        return { oldest: null, newest: null };
+      }
+    };
+
+    const out: Array<{ table: string; rows: number; oldest: number | null; newest: number | null; retention: string }> = [];
+
+    const push = (table: string, rows: number, col: string | null, retention: string) => {
+      const tr = col ? range(table, col) : { oldest: null, newest: null };
+      out.push({ table, rows, oldest: tr.oldest, newest: tr.newest, retention });
+    };
+
+    push('nodes',                       count(`SELECT COUNT(*) AS c FROM nodes`),                       'last_seen',     'One row per known node (no prune)');
+    push('messages',                    count(`SELECT COUNT(*) AS c FROM messages`),                    'timestamp',     `${MAX_MESSAGES}-row cap + retention window (Settings → Data)`);
+    push('messages_fts',                count(`SELECT COUNT(*) AS c FROM messages_fts`),                null,            'Mirrors messages via FTS5 trigger');
+    push('events',                      count(`SELECT COUNT(*) AS c FROM events`),                      'timestamp',     `${MAX_EVENTS}-row cap + retention window (Settings → Data)`);
+    push('telemetry',                   count(`SELECT COUNT(*) AS c FROM telemetry`),                   'timestamp',     `${MAX_TELEMETRY_PER_NODE} rows per node`);
+    push('channels',                    count(`SELECT COUNT(*) AS c FROM channels`),                    'updated_at',    'Up to 8 channels (firmware limit)');
+    push('waypoints',                   count(`SELECT COUNT(*) AS c FROM waypoints`),                   'last_seen',     'Operator-controlled, no prune');
+    push('neighbor_info',               count(`SELECT COUNT(*) AS c FROM neighbor_info`),               'last_seen',     'One row per node (replace, no prune)');
+    push('store_forward_routers',       count(`SELECT COUNT(*) AS c FROM store_forward_routers`),       'last_heartbeat','One row per S&F router');
+    push('groups',                      count(`SELECT COUNT(*) AS c FROM groups`),                      'created_at',    'Operator-controlled, no prune');
+    push('trace_results',               count(`SELECT COUNT(*) AS c FROM trace_results`),               'started_at',    '500-row cap');
+    push('range_test_observations',     count(`SELECT COUNT(*) AS c FROM range_test_observations`),     'timestamp',     '5000-row cap');
+    push('blocked_nodes',               count(`SELECT COUNT(*) AS c FROM blocked_nodes`),               'blocked_at',    'Operator-controlled, no prune');
+    push('node_sessions',               count(`SELECT COUNT(*) AS c FROM node_sessions`),               'online_at',     '100k-row cap (auto-pruned)');
+    push('position_history',            count(`SELECT COUNT(*) AS c FROM position_history`),            'timestamp',     '30 days (auto-pruned)');
+    push('bbs_mail',                    count(`SELECT COUNT(*) AS c FROM bbs_mail`),                    'posted_at',     '30 days (auto-pruned)');
+    push('bbs_weather_subscribers',     count(`SELECT COUNT(*) AS c FROM bbs_weather_subscribers`),     'subscribed_at', 'Operator + subscriber controlled');
+
+    return out;
+  }
+
+  /** Total bytes occupied by all rows + indexes, computed from the SQLite
+   *  page allocator. This is the "logical" size — what the DB would compact
+   *  to if you ran VACUUM. The on-disk file size (separate measurement)
+   *  may include freed pages not yet reclaimed. */
+  logicalDbBytes(): number {
+    try {
+      const pageCount = (this.db.pragma('page_count', { simple: true }) as number) ?? 0;
+      const pageSize = (this.db.pragma('page_size', { simple: true }) as number) ?? 0;
+      return pageCount * pageSize;
+    } catch {
+      return 0;
+    }
+  }
+
+  /** Trigger a VACUUM to reclaim space from previously-deleted rows. Returns
+   *  bytes freed (file size before − file size after). Expensive on large
+   *  DBs — UI should warn before calling. */
+  vacuum(): { freedBytes: number; finalBytes: number } {
+    const before = this.logicalDbBytes();
+    this.db.exec('VACUUM');
+    const after = this.logicalDbBytes();
+    return { freedBytes: Math.max(0, before - after), finalBytes: after };
+  }
+
+  // ---------------------------------------------------------------------
+  // BBS Mail
+  // ---------------------------------------------------------------------
+
+  /** Insert a new piece of mail. Caller is responsible for trimming/validating
+   *  body length. Returns the rowid so the caller can echo it back. */
+  insertMail(row: {
+    sender_node_id: string;
+    sender_short_name: string;
+    recipient_node_id: string;
+    posted_at: number;
+    body: string;
+  }): number {
+    const result = this.db.prepare(`
+      INSERT INTO bbs_mail (sender_node_id, sender_short_name, recipient_node_id, posted_at, body)
+      VALUES (@sender_node_id, @sender_short_name, @recipient_node_id, @posted_at, @body)
+    `).run(row);
+    return Number(result.lastInsertRowid);
+  }
+
+  /** Load mail rows for a specific recipient, newest first. */
+  loadInbox(recipientNodeId: string, limit = 200): Array<{
+    id: number; senderNodeId: string; senderShortName: string;
+    postedAt: number; body: string; readAt: number | null;
+    deliveredAt: number | null;
+  }> {
+    const rows = this.db.prepare(`
+      SELECT id, sender_node_id, sender_short_name, posted_at, body, read_at, delivered_at
+      FROM bbs_mail
+      WHERE recipient_node_id = ?
+      ORDER BY posted_at DESC
+      LIMIT ?
+    `).all(recipientNodeId, limit) as Array<{
+      id: number; sender_node_id: string; sender_short_name: string;
+      posted_at: number; body: string; read_at: number | null;
+      delivered_at: number | null;
+    }>;
+    return rows.map(r => ({
+      id: r.id,
+      senderNodeId: r.sender_node_id,
+      senderShortName: r.sender_short_name,
+      postedAt: r.posted_at,
+      body: r.body,
+      readAt: r.read_at,
+      deliveredAt: r.delivered_at,
+    }));
+  }
+
+  /** Load mail rows sent by a specific node, newest first. */
+  loadOutbox(senderNodeId: string, limit = 200): Array<{
+    id: number; recipientNodeId: string; senderShortName: string;
+    postedAt: number; body: string; readAt: number | null;
+  }> {
+    const rows = this.db.prepare(`
+      SELECT id, recipient_node_id, sender_short_name, posted_at, body, read_at
+      FROM bbs_mail
+      WHERE sender_node_id = ?
+      ORDER BY posted_at DESC
+      LIMIT ?
+    `).all(senderNodeId, limit) as Array<{
+      id: number; recipient_node_id: string; sender_short_name: string;
+      posted_at: number; body: string; read_at: number | null;
+    }>;
+    return rows.map(r => ({
+      id: r.id,
+      recipientNodeId: r.recipient_node_id,
+      senderShortName: r.sender_short_name,
+      postedAt: r.posted_at,
+      body: r.body,
+      readAt: r.read_at,
+    }));
+  }
+
+  /** Count of unread messages for a recipient. */
+  countUnread(recipientNodeId: string): number {
+    const row = this.db.prepare(
+      `SELECT COUNT(*) AS c FROM bbs_mail WHERE recipient_node_id = ? AND read_at IS NULL`
+    ).get(recipientNodeId) as { c: number } | undefined;
+    return row?.c ?? 0;
+  }
+
+  /** Fetch a single unread mail item by recipient, oldest first (for sequential reading). */
+  nextUnreadFor(recipientNodeId: string): {
+    id: number; senderNodeId: string; senderShortName: string;
+    postedAt: number; body: string;
+  } | null {
+    const row = this.db.prepare(`
+      SELECT id, sender_node_id, sender_short_name, posted_at, body
+      FROM bbs_mail
+      WHERE recipient_node_id = ? AND read_at IS NULL
+      ORDER BY posted_at ASC
+      LIMIT 1
+    `).get(recipientNodeId) as {
+      id: number; sender_node_id: string; sender_short_name: string;
+      posted_at: number; body: string;
+    } | undefined;
+    if (!row) return null;
+    return {
+      id: row.id,
+      senderNodeId: row.sender_node_id,
+      senderShortName: row.sender_short_name,
+      postedAt: row.posted_at,
+      body: row.body,
+    };
+  }
+
+  markMailRead(id: number, readAt: number = Date.now()): boolean {
+    const r = this.db.prepare(`UPDATE bbs_mail SET read_at = ? WHERE id = ? AND read_at IS NULL`).run(readAt, id);
+    return Number((r as any).changes ?? 0) > 0;
+  }
+
+  markMailDelivered(id: number, deliveredAt: number = Date.now()): boolean {
+    const r = this.db.prepare(`UPDATE bbs_mail SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL`).run(deliveredAt, id);
+    return Number((r as any).changes ?? 0) > 0;
+  }
+
+  deleteMail(id: number): boolean {
+    const r = this.db.prepare(`DELETE FROM bbs_mail WHERE id = ?`).run(id);
+    return Number((r as any).changes ?? 0) > 0;
+  }
+
+  /** Delete mail older than the given epoch-ms cutoff (regardless of read state).
+   *  Returns rows removed. Called by the periodic retention pruner. */
+  pruneMailOlderThan(cutoffMs: number): number {
+    const result = this.db.prepare(`DELETE FROM bbs_mail WHERE posted_at < ?`).run(cutoffMs);
+    return Number((result as any).changes ?? 0);
+  }
+
+  // ---------------------------------------------------------------------
+  // BBS Weather Subscribers
+  // ---------------------------------------------------------------------
+
+  /** Add or refresh a subscription. If the node already subscribed, we update
+   *  the channel_index in case they're subscribing from a different channel
+   *  than before. Returns true if this is a NEW subscription, false if
+   *  refreshing an existing one. */
+  addWeatherSubscriber(nodeId: string, channelIndex: number, now: number = Date.now()): boolean {
+    const existing = this.db.prepare(
+      `SELECT 1 FROM bbs_weather_subscribers WHERE node_id = ?`
+    ).get(nodeId);
+    this.db.prepare(`
+      INSERT INTO bbs_weather_subscribers (node_id, subscribed_at, channel_index)
+      VALUES (?, ?, ?)
+      ON CONFLICT(node_id) DO UPDATE SET channel_index = excluded.channel_index
+    `).run(nodeId, now, channelIndex);
+    return !existing;
+  }
+
+  removeWeatherSubscriber(nodeId: string): boolean {
+    const r = this.db.prepare(
+      `DELETE FROM bbs_weather_subscribers WHERE node_id = ?`
+    ).run(nodeId);
+    return Number((r as any).changes ?? 0) > 0;
+  }
+
+  isWeatherSubscriber(nodeId: string): boolean {
+    const row = this.db.prepare(
+      `SELECT 1 FROM bbs_weather_subscribers WHERE node_id = ?`
+    ).get(nodeId);
+    return !!row;
+  }
+
+  listWeatherSubscribers(): Array<{ nodeId: string; subscribedAt: number; channelIndex: number; lastAlertAt: number | null }> {
+    const rows = this.db.prepare(`
+      SELECT node_id, subscribed_at, channel_index, last_alert_at
+      FROM bbs_weather_subscribers
+      ORDER BY subscribed_at DESC
+    `).all() as Array<{ node_id: string; subscribed_at: number; channel_index: number; last_alert_at: number | null }>;
+    return rows.map(r => ({
+      nodeId: r.node_id,
+      subscribedAt: r.subscribed_at,
+      channelIndex: r.channel_index,
+      lastAlertAt: r.last_alert_at,
+    }));
+  }
+
+  countWeatherSubscribers(): number {
+    const row = this.db.prepare(
+      `SELECT COUNT(*) AS c FROM bbs_weather_subscribers`
+    ).get() as { c: number } | undefined;
+    return row?.c ?? 0;
+  }
+
+  /** Record that we just pushed an alert to this subscriber. Diagnostic only —
+   *  used for the operator's subscriber list. */
+  touchWeatherSubscriberAlert(nodeId: string, now: number = Date.now()): void {
+    this.db.prepare(
+      `UPDATE bbs_weather_subscribers SET last_alert_at = ? WHERE node_id = ?`
+    ).run(now, nodeId);
+  }
+
+  // ---------------------------------------------------------------------
+  // Position history
+  // ---------------------------------------------------------------------
+
+  /** Append one position observation for the given node. */
+  insertPositionHistory(row: {
+    nodeId: string;
+    timestamp: number;
+    lat: number;
+    lng: number;
+    alt?: number | null;
+    source?: 'manual' | 'gps' | null;
+    precisionBits?: number | null;
+  }): void {
+    this.db.prepare(`
+      INSERT INTO position_history (node_id, timestamp, lat, lng, alt, source, precision_bits)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      row.nodeId,
+      row.timestamp,
+      row.lat,
+      row.lng,
+      row.alt ?? null,
+      row.source ?? null,
+      row.precisionBits ?? null,
+    );
+  }
+
+  /** Delete position history older than the given epoch-ms cutoff. Returns
+   *  number of rows removed. Called by the periodic retention pruner so the
+   *  table doesn't grow unbounded on chatty meshes (a single node broadcasting
+   *  position every 15 min produces ~35k rows/year). */
+  prunePositionHistoryOlderThan(cutoffMs: number): number {
+    const r = this.db.prepare(`DELETE FROM position_history WHERE timestamp < ?`).run(cutoffMs);
+    return Number((r as any).changes ?? 0);
+  }
+
+  /** Newest-first history for a single node, capped at `limit`. */
+  loadPositionHistory(nodeId: string, limit = 500): Array<{
+    id: number;
+    timestamp: number;
+    lat: number;
+    lng: number;
+    alt: number | null;
+    source: 'manual' | 'gps' | null;
+    precisionBits: number | null;
+  }> {
+    const rows = this.db.prepare(`
+      SELECT id, timestamp, lat, lng, alt, source, precision_bits
+      FROM position_history
+      WHERE node_id = ?
+      ORDER BY timestamp DESC
+      LIMIT ?
+    `).all(nodeId, limit) as Array<{
+      id: number; timestamp: number; lat: number; lng: number;
+      alt: number | null; source: string | null; precision_bits: number | null;
+    }>;
+    return rows.map(r => ({
+      id: r.id,
+      timestamp: r.timestamp,
+      lat: r.lat,
+      lng: r.lng,
+      alt: r.alt,
+      source: r.source as 'manual' | 'gps' | null,
+      precisionBits: r.precision_bits,
+    }));
+  }
+
+  /**
+   * Aggregate per-node mail activity for the operator's BBS Users panel.
+   * Each row is one distinct node that has either sent or received mail
+   * through this BBS, with counts and most-recent-activity timestamp.
+   *
+   * Implementation: UNION ALL of sender side and recipient side, grouped.
+   * SQLite handles this efficiently against the indexes we already have
+   * on sender/recipient node ids.
+   */
+  listMailUsers(): Array<{
+    nodeId: string;
+    sentCount: number;
+    receivedCount: number;
+    unreadCount: number;
+    lastActivity: number;
+  }> {
+    const rows = this.db.prepare(`
+      SELECT
+        user_id AS nodeId,
+        SUM(sent) AS sentCount,
+        SUM(received) AS receivedCount,
+        SUM(unread) AS unreadCount,
+        MAX(last_activity) AS lastActivity
+      FROM (
+        SELECT
+          sender_node_id AS user_id,
+          1 AS sent,
+          0 AS received,
+          0 AS unread,
+          posted_at AS last_activity
+        FROM bbs_mail
+        UNION ALL
+        SELECT
+          recipient_node_id AS user_id,
+          0 AS sent,
+          1 AS received,
+          CASE WHEN read_at IS NULL THEN 1 ELSE 0 END AS unread,
+          posted_at AS last_activity
+        FROM bbs_mail
+      )
+      GROUP BY user_id
+      ORDER BY lastActivity DESC
+    `).all() as Array<{
+      nodeId: string;
+      sentCount: number;
+      receivedCount: number;
+      unreadCount: number;
+      lastActivity: number;
+    }>;
+    return rows;
   }
 }
 

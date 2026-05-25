@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Channel, Message } from '../types';
 
 const STORAGE_KEY = 'mesh.readStatus';
@@ -32,12 +32,32 @@ function chatIdForMessage(m: Message, channels: Channel[], localNodeId: string |
 /**
  * Compute per-chat unread counts. Persists last-read timestamps to localStorage.
  * The currently-active chat always shows 0 unread (the user is looking right at it).
+ *
+ * Also exposes `firstUnreadAt[chatId]` — the lastReadAt value captured the moment
+ * the user switched into that chat, frozen for the duration of the visit. The
+ * message view uses this to render a "—— New ——" divider that stays put while
+ * the user reads, instead of disappearing the moment markActive fires.
  */
 export function useReadStatus({ messages, channels, localNodeId, activeChatId, markActiveAsRead }: Args) {
   const [readMap, setReadMap] = useState<Record<string, number>>(() => {
     try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); }
     catch { return {}; }
   });
+  const [firstUnreadAt, setFirstUnreadAt] = useState<Record<string, number>>({});
+
+  // Keep a live ref of readMap so the chat-switch effect below can read it
+  // without re-running every time the map changes.
+  const readMapRef = useRef(readMap);
+  useEffect(() => { readMapRef.current = readMap; }, [readMap]);
+
+  // On chat switch: snapshot the *pre-switch* lastReadAt for the new chat. This
+  // becomes the divider boundary. We only do this once per switch — not on
+  // every incoming message — so the divider stays put while the user reads.
+  useEffect(() => {
+    if (!activeChatId) return;
+    const prev = readMapRef.current[activeChatId] || 0;
+    setFirstUnreadAt(b => ({ ...b, [activeChatId]: prev }));
+  }, [activeChatId]);
 
   // Mark active chat read whenever the user switches to it (or when on the
   // messages view and new messages arrive — handled by the caller via markActiveAsRead).
@@ -63,5 +83,10 @@ export function useReadStatus({ messages, channels, localNodeId, activeChatId, m
     return counts;
   }, [messages, channels, localNodeId, activeChatId, markActiveAsRead, readMap]);
 
-  return { unreadCounts };
+  const totalUnread = useMemo(
+    () => Object.values(unreadCounts).reduce((a, b) => a + b, 0),
+    [unreadCounts]
+  );
+
+  return { unreadCounts, totalUnread, firstUnreadAt };
 }

@@ -80,10 +80,11 @@ export function LogsView({ events }: LogsViewProps) {
            <div key={event.id} className="group hover:bg-brand-line/40 flex gap-4 px-2 py-1 rounded transition-colors">
               <span className="text-brand-muted shrink-0">[{new Date(event.timestamp).toLocaleTimeString()}]</span>
               <span className={cn(
-                "font-bold shrink-0 w-24",
+                "font-bold shrink-0 w-28",
                 event.type === 'MESSAGE' ? "text-brand-info" :
                 event.type === 'TELEMETRY' ? "text-brand-accent" :
-                event.type === 'NODE_JOINED' ? "text-brand-warning" : "text-brand-muted"
+                event.type === 'NODE_JOINED' ? "text-brand-warning" :
+                event.type === 'WEATHER_ALERT' ? "text-brand-error" : "text-brand-muted"
               )}>{event.type}</span>
               <span className="text-brand-ink truncate">{event.details}</span>
               <span className="ml-auto opacity-0 group-hover:opacity-100 text-brand-muted text-[10px] shrink-0">{event.nodeId}</span>

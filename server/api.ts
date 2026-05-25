@@ -8,6 +8,25 @@ import dotenv from 'dotenv';
 import { serialDiscovery } from './serialDiscovery.js';
 import { meshBridge } from './meshtasticSerial.js';
 import { meshDb } from './database.js';
+import { BbsService } from './bbs.js';
+import { loadBbsConfig, saveBbsConfig, normalizeBbsConfig, type BbsConfig } from './bbsConfig.js';
+import { WeatherAlertPoller } from './weatherAlertPoller.js';
+
+// Wire BBS-Mail. The bridge type-imports BbsService so we attach it after
+// both are constructed to avoid a runtime import cycle.
+const bbs = new BbsService(meshBridge);
+meshBridge.setBbs(bbs);
+
+// Load persisted BBS config and apply it to the live service. Subsequent
+// updates via POST /api/mesh/bbs/config flow through the same path.
+let bbsConfig: BbsConfig = loadBbsConfig();
+bbs.setConfig(bbsConfig);
+
+// Weather alert poller — starts immediately. The first poll fires ~10s after
+// boot so the radio has time to settle; the ticker reads from bbsConfig each
+// cycle so it picks up zip / enabled changes without restarting.
+const weatherPoller = new WeatherAlertPoller(meshBridge, () => bbsConfig);
+weatherPoller.start();
 
 dotenv.config();
 
@@ -29,6 +48,14 @@ if (existsSync(distPath)) {
 type AIProvider = 'anthropic' | 'gemini' | 'ollama';
 
 interface AIConfig {
+  /**
+   * Master switch. When false, the AI Assistant launcher is hidden from the
+   * dashboard and /api/ai/chat returns 503. Keys / models / preferences stay
+   * persisted so flipping it back on doesn't require re-entering anything.
+   * Defaults to false so fresh installs don't surface the feature until the
+   * operator explicitly opts in.
+   */
+  enabled: boolean;
   provider: AIProvider;
   anthropicKey: string;
   geminiKey: string;
@@ -59,6 +86,7 @@ const CONFIG_PATH = join(dataDir, 'ai-config.json');
 
 function loadConfig(): AIConfig {
   const defaults: AIConfig = {
+    enabled: false,
     provider: 'anthropic',
     anthropicKey: process.env.ANTHROPIC_API_KEY || '',
     geminiKey: process.env.GEMINI_API_KEY || '',
@@ -107,6 +135,7 @@ function getGeminiClient(): any | null {
 // --- AI Config API ---
 app.get('/api/ai/config', (_req, res) => {
   return res.json({
+    enabled: aiConfig.enabled,
     provider: aiConfig.provider,
     anthropicModel: aiConfig.anthropicModel,
     geminiModel: aiConfig.geminiModel,
@@ -123,6 +152,7 @@ app.get('/api/ai/config', (_req, res) => {
 
 app.post('/api/ai/config', (req, res) => {
   const {
+    enabled,
     provider,
     anthropicKey, geminiKey,
     anthropicModel, geminiModel,
@@ -130,6 +160,7 @@ app.post('/api/ai/config', (req, res) => {
     redactPii,
   } = req.body;
 
+  if (typeof enabled === 'boolean') aiConfig.enabled = enabled;
   if (provider === 'anthropic' || provider === 'gemini' || provider === 'ollama') {
     aiConfig.provider = provider;
   }
@@ -144,9 +175,9 @@ app.post('/api/ai/config', (req, res) => {
   if (typeof redactPii === 'boolean') aiConfig.redactPii = redactPii;
 
   saveConfig(aiConfig);
-  console.log(`[AI Config] Provider: ${aiConfig.provider}, Anthropic key: ${aiConfig.anthropicKey ? 'SET' : 'EMPTY'}, Gemini key: ${aiConfig.geminiKey ? 'SET' : 'EMPTY'}, Ollama: ${aiConfig.ollamaBaseUrl || 'unset'} / ${aiConfig.ollamaModel || 'no-model'}`);
+  console.log(`[AI Config] Enabled: ${aiConfig.enabled}, Provider: ${aiConfig.provider}, Anthropic key: ${aiConfig.anthropicKey ? 'SET' : 'EMPTY'}, Gemini key: ${aiConfig.geminiKey ? 'SET' : 'EMPTY'}, Ollama: ${aiConfig.ollamaBaseUrl || 'unset'} / ${aiConfig.ollamaModel || 'no-model'}`);
 
-  return res.json({ ok: true, provider: aiConfig.provider });
+  return res.json({ ok: true, enabled: aiConfig.enabled, provider: aiConfig.provider });
 });
 
 // --- Ollama: list available models on a remote/local server ---
@@ -186,6 +217,9 @@ app.get('/api/ai/ollama/tags', async (req, res) => {
 
 // --- Unified AI Chat endpoint ---
 app.post('/api/ai/chat', async (req, res) => {
+  if (!aiConfig.enabled) {
+    return res.status(503).json({ error: 'AI Assistant is disabled. Enable it in Settings → AI.' });
+  }
   const { prompt, systemInstruction } = req.body;
 
   if (!prompt) {
@@ -291,10 +325,16 @@ app.post('/api/ai/chat', async (req, res) => {
 // Mesh Radio API (real hardware data)
 // =============================================
 
+// Sourced from .env SYSTEM_VERSION so it stays in lockstep with the bundle
+// the browser is loading. Falls back to "dev" when the env var is missing.
+const SYSTEM_VERSION = (process.env.SYSTEM_VERSION || '').trim() || 'dev';
+console.log(`[API] MeshView Sentinel ${SYSTEM_VERSION}`);
+
 // Status: is the radio connected?
 app.get('/api/mesh/status', (_req, res) => {
   const device = serialDiscovery.getDevice();
   return res.json({
+    systemVersion: SYSTEM_VERSION,
     radioConnected: meshBridge.connected,
     transport: meshBridge.getTransport(),
     serialDevice: device ? {
@@ -360,6 +400,18 @@ app.post('/api/mesh/disconnect', async (_req, res) => {
     return res.json({ ok: true });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
+  }
+});
+
+// Re-issue want_config_id to pull a fresh NodeDB / channel set from the radio.
+// Useful when a phone (BLE) has changed config out-of-band and the UI is showing
+// stale liveness or channel-index drift.
+app.post('/api/mesh/refresh', (_req, res) => {
+  try {
+    meshBridge.refreshNodeDb();
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(409).json({ error: err.message || 'refresh failed' });
   }
 });
 
@@ -1360,11 +1412,84 @@ app.get('/api/mesh/db/stats', (_req, res) => {
   }
 });
 
+/**
+ * GET /api/mesh/db/disk — comprehensive disk-usage inventory for the
+ * Settings → Disk panel. Returns per-table row counts + oldest/newest
+ * timestamps + retention policy descriptions, plus file-size measurements
+ * for the SQLite DB itself (including the WAL sidecar).
+ */
+app.get('/api/mesh/db/disk', (_req, res) => {
+  try {
+    const db = meshDb();
+    const dbPath = db.getDbPath();
+
+    // File sizes — SQLite WAL mode creates -wal and -shm sidecars; sum them
+    // so the operator sees the true on-disk footprint, not just the main file.
+    const fileSize = (p: string): number => {
+      try { return require('fs').statSync(p).size as number; } catch { return 0; }
+    };
+    const mainBytes = fileSize(dbPath);
+    const walBytes  = fileSize(`${dbPath}-wal`);
+    const shmBytes  = fileSize(`${dbPath}-shm`);
+
+    return res.json({
+      dbPath,
+      onDisk: {
+        main: mainBytes,
+        wal:  walBytes,
+        shm:  shmBytes,
+        total: mainBytes + walBytes + shmBytes,
+      },
+      logicalBytes: db.logicalDbBytes(),
+      tables: db.diskInventory(),
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/** POST /api/mesh/db/vacuum — reclaim space from deleted rows. Blocks until
+ *  done (could be seconds on a large DB). UI should confirm before calling. */
+app.post('/api/mesh/db/vacuum', (_req, res) => {
+  try {
+    const result = meshDb().vacuum();
+    return res.json({ ok: true, ...result });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // Telemetry history for one node
 app.get('/api/mesh/nodes/:id/telemetry', (req, res) => {
   const limit = Math.min(parseInt(String(req.query.limit ?? '200'), 10) || 200, 2000);
   try {
     return res.json(meshDb().getTelemetryHistory(req.params.id, limit));
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/** GET /api/mesh/nodes/:id/positions — per-node position history (newest first). */
+app.get('/api/mesh/nodes/:id/positions', (req, res) => {
+  const limit = Math.min(parseInt(String(req.query.limit ?? '200'), 10) || 200, 2000);
+  try {
+    return res.json(meshDb().loadPositionHistory(req.params.id, limit));
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/mesh/nodes/:id/traces — trace results targeting this node.
+ * Reuses the global trace results table filtered by target_id. Useful for the
+ * iOS-style Trace Route Log section on the node detail panel.
+ */
+app.get('/api/mesh/nodes/:id/traces', (req, res) => {
+  const limit = Math.min(parseInt(String(req.query.limit ?? '50'), 10) || 50, 500);
+  try {
+    const all = meshDb().loadTraceResults(2000);
+    const filtered = all.filter(t => t.targetId === req.params.id).slice(0, limit);
+    return res.json(filtered);
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
   }
@@ -1382,6 +1507,202 @@ app.post('/api/mesh/channels', async (req, res) => {
   try {
     await meshBridge.setChannels(channels);
     return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------
+// BBS Mail endpoints
+// ---------------------------------------------------------------------
+
+/** GET /api/mesh/bbs/config — current BBS configuration. */
+app.get('/api/mesh/bbs/config', (_req, res) => {
+  return res.json(bbsConfig);
+});
+
+/**
+ * POST /api/mesh/bbs/config — replace the BBS configuration. Inputs are
+ * normalized (trigger lowercase, body cap clamped, ZIP validated) before
+ * being applied; an invalid POST won't brick the BBS, it just gets safe
+ * defaults for the bad fields. The live BbsService picks up the new config
+ * immediately and the weather poller will pick up the new home ZIP on its
+ * next tick (or right now via pollNow if the ZIP changed).
+ */
+app.post('/api/mesh/bbs/config', (req, res) => {
+  try {
+    const oldZip = bbsConfig.homeZipCode;
+    bbsConfig = normalizeBbsConfig(req.body ?? {});
+    saveBbsConfig(bbsConfig);
+    bbs.setConfig(bbsConfig);
+    // If the home ZIP changed (or just got set), trigger a poll right away
+    // so the operator sees alerts within seconds instead of waiting 20 min.
+    if (bbsConfig.homeZipCode && bbsConfig.homeZipCode !== oldZip) {
+      weatherPoller.pollNow().catch(err =>
+        console.warn('[BBSConfig] immediate weather poll failed:', err?.message)
+      );
+    }
+    // Fan out to all SSE clients so other dashboard tabs re-render their
+    // settings panel with the new values.
+    for (const send of sseClients) {
+      try { send(`event: bbsConfig\ndata: ${JSON.stringify(bbsConfig)}\n\n`); } catch { /* client gone */ }
+    }
+    return res.json({ ok: true, config: bbsConfig });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/** GET /api/mesh/bbs/inbox?nodeId=<hex>  — defaults to local node */
+app.get('/api/mesh/bbs/inbox', (req, res) => {
+  const localNodeId = (meshBridge as any).localNodeId as string | null;
+  const nodeId = (req.query.nodeId as string) || localNodeId;
+  if (!nodeId) return res.status(400).json({ error: 'nodeId required (local node unknown)' });
+  const limit = parseInt(String(req.query.limit ?? '200'), 10) || 200;
+  try {
+    return res.json({
+      nodeId,
+      unread: meshDb().countUnread(nodeId),
+      mail: meshDb().loadInbox(nodeId, Math.min(500, Math.max(1, limit))),
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/** GET /api/mesh/bbs/outbox?nodeId=<hex>  — defaults to local node */
+app.get('/api/mesh/bbs/outbox', (req, res) => {
+  const localNodeId = (meshBridge as any).localNodeId as string | null;
+  const nodeId = (req.query.nodeId as string) || localNodeId;
+  if (!nodeId) return res.status(400).json({ error: 'nodeId required (local node unknown)' });
+  const limit = parseInt(String(req.query.limit ?? '200'), 10) || 200;
+  try {
+    return res.json({
+      nodeId,
+      mail: meshDb().loadOutbox(nodeId, Math.min(500, Math.max(1, limit))),
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/mesh/bbs/compose
+ * { recipientNodeId, body }
+ *
+ * Sender = local node (the dashboard operator). The body is capped at 200
+ * chars at the DB layer; we trim and reject empty here for a clearer error.
+ * Push notification fires the same as a remote-sourced send.
+ */
+app.post('/api/mesh/bbs/compose', async (req, res) => {
+  const localNodeId = (meshBridge as any).localNodeId as string | null;
+  if (!localNodeId) return res.status(503).json({ error: 'Local node not identified — radio still booting' });
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+
+  const { recipientNodeId, body } = req.body ?? {};
+  if (typeof recipientNodeId !== 'string' || !/^![0-9a-f]{8}$/i.test(recipientNodeId)) {
+    return res.status(400).json({ error: 'recipientNodeId must be a hex node id like !02eb3bec' });
+  }
+  if (typeof body !== 'string') return res.status(400).json({ error: 'body required' });
+  const clean = body.trim().slice(0, 200);
+  if (!clean) return res.status(400).json({ error: 'body must be non-empty' });
+
+  const localNode = meshBridge.getNodes().find(n => n.id === localNodeId);
+  const recipientNode = meshBridge.getNodes().find(n => n.id === recipientNodeId.toLowerCase());
+  if (!recipientNode) return res.status(404).json({ error: `Unknown recipient ${recipientNodeId}` });
+
+  try {
+    const mailId = meshDb().insertMail({
+      sender_node_id: localNodeId,
+      sender_short_name: localNode?.shortName || localNodeId.slice(-4),
+      recipient_node_id: recipientNodeId.toLowerCase(),
+      posted_at: Date.now(),
+      body: clean,
+    });
+    meshBridge.emit('bbsMail', { recipientNodeId: recipientNodeId.toLowerCase(), mailId, source: 'dashboard' });
+    // Push notify the recipient via DM. Fire-and-forget; the mail is stored
+    // regardless of notification success.
+    const sender = localNode?.shortName || localNodeId.slice(-4);
+    const notice = `✉ Mail from ${sender}. DM :mail R to read.`;
+    meshBridge.sendMessage(notice, recipientNodeId.toLowerCase(), 0)
+      .then(() => meshDb().markMailDelivered(mailId))
+      .catch(err => console.warn(`[BBS API] push notify failed: ${err?.message}`));
+    return res.json({ ok: true, mailId });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/** POST /api/mesh/bbs/:id/read  — mark a piece of mail as read */
+app.post('/api/mesh/bbs/:id/read', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid id' });
+  const ok = meshDb().markMailRead(id);
+  if (ok) meshBridge.emit('bbsMail', { mailId: id, read: true });
+  return res.json({ ok });
+});
+
+/** DELETE /api/mesh/bbs/:id  — delete a piece of mail */
+app.delete('/api/mesh/bbs/:id', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid id' });
+  const ok = meshDb().deleteMail(id);
+  if (ok) meshBridge.emit('bbsMail', { mailId: id, deleted: true });
+  return res.json({ ok });
+});
+
+/**
+ * GET /api/mesh/bbs/users — list of every node that has sent or received mail
+ * through this BBS, with sent / received / unread counts and last-activity
+ * timestamp. Sorted newest-activity-first.
+ */
+app.get('/api/mesh/bbs/users', (_req, res) => {
+  try {
+    const users = meshDb().listMailUsers();
+    // Decorate with the local node's friendly name + short_name when known,
+    // so the UI doesn't have to re-fetch nodes just to label rows.
+    const nodes = meshBridge.getNodes();
+    const nodeByid = new Map(nodes.map(n => [n.id, n]));
+    const localNodeId = (meshBridge as any).localNodeId as string | null;
+    const decorated = users.map(u => {
+      const node = nodeByid.get(u.nodeId);
+      return {
+        ...u,
+        name: node?.name || null,
+        shortName: node?.shortName || null,
+        isLocal: u.nodeId === localNodeId,
+      };
+    });
+    return res.json({ users: decorated, total: decorated.length });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/** GET /api/mesh/bbs/weather/subscribers — list of nodes opted into alerts. */
+app.get('/api/mesh/bbs/weather/subscribers', (_req, res) => {
+  try {
+    return res.json({
+      subscribers: meshDb().listWeatherSubscribers(),
+      total: meshDb().countWeatherSubscribers(),
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/** DELETE /api/mesh/bbs/weather/subscribers/:nodeId — operator-side removal.
+ *  Useful when a subscriber goes silent / is removed from the mesh and you
+ *  want to stop trying to push them alerts. */
+app.delete('/api/mesh/bbs/weather/subscribers/:nodeId', (req, res) => {
+  const nodeId = req.params.nodeId;
+  if (!/^![0-9a-f]{8}$/i.test(nodeId)) {
+    return res.status(400).json({ error: 'nodeId must be a hex node id like !02ea5e70' });
+  }
+  try {
+    const ok = meshDb().removeWeatherSubscriber(nodeId.toLowerCase());
+    if (ok) meshBridge.emit('bbsSubscriber', { nodeId, action: 'unsubscribed' });
+    return res.json({ ok });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
   }
@@ -1445,6 +1766,8 @@ meshBridge.on('event',                   fanOut('eventLog'));
 meshBridge.on('storeForwardUpdate',      fanOut('storeForward'));
 meshBridge.on('neighborInfoUpdate',      fanOut('neighborInfo'));
 meshBridge.on('localModuleConfigUpdate', fanOut('moduleConfig'));
+meshBridge.on('bbsMail',                 fanOut('bbsMail'));
+meshBridge.on('bbsSubscriber',           fanOut('bbsSubscriber'));
 
 app.get('/api/mesh/stream', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');

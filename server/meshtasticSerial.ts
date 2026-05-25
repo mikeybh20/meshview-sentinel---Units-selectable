@@ -11,6 +11,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { meshDb, type MeshDatabase } from './database.js';
+import { type BbsService } from './bbs.js';
 
 const __filename_local = fileURLToPath(import.meta.url);
 const __dirname_local = dirname(__filename_local);
@@ -29,6 +30,9 @@ export interface MeshNode {
   id: string;
   name: string;
   shortName: string;
+  /** Epoch ms of the very first packet we observed from this node. Populated
+   *  once on initial discovery and preserved across all subsequent upserts. */
+  firstSeen?: number;
   lastSeen: number;
   online: boolean;
   favorite: boolean;
@@ -44,6 +48,14 @@ export interface MeshNode {
   isLicensed?: boolean;
   /** User.hw_model — Meshtastic HardwareModel enum (TBEAM, HELTEC_V3, RAK4631, etc.). */
   hwModel?: number;
+  /**
+   * Mesh distance to this node, in hops, as last reported by the local radio's
+   * NodeInfo (mesh.proto NodeInfo.hops_away, field 9). Undefined when the
+   * firmware hasn't yet computed/sent it (very-far nodes or fresh discovery).
+   * Used by sendMessage to size MeshPacket.hopLimit so DMs to far peers don't
+   * get dropped by the default-3-hop ceiling.
+   */
+  hopsAway?: number;
   /** Last-observed inbound transport for this node ('lora' = direct over RF, 'mqtt' = bridged). */
   lastVia?: 'lora' | 'mqtt';
   /** Group id this node belongs to (operator-assigned). null/undefined = unassigned. */
@@ -83,7 +95,7 @@ export interface MeshMessage {
   channel: string;
   hopLimit: number;
   hops: string[];
-  status?: 'sending' | 'sent' | 'acked' | 'error';
+  status?: 'sending' | 'sent' | 'queued' | 'acked' | 'error';
   errorCode?: number;
   isOwn?: boolean;
   /** The radio's MeshPacket.id (uint32). Used for cross-referencing replies and reactions. */
@@ -101,9 +113,21 @@ export interface MeshMessage {
   deliveryMs?: number;
 }
 
+/** Context retained per outbound message so the auto-retry path can rebuild
+ *  an identical packet under a fresh packetId. */
+interface ResendContext {
+  text: string;
+  to: string;
+  channel: number;
+  replyTo?: number;
+  isReaction?: boolean;
+  hopLimit?: number;
+  destPublicKey?: string;
+}
+
 export interface MeshEvent {
   id: string;
-  type: 'NODE_JOINED' | 'NODE_LOST' | 'MESSAGE' | 'TELEMETRY' | 'POSITION_UPDATE';
+  type: 'NODE_JOINED' | 'NODE_LOST' | 'MESSAGE' | 'TELEMETRY' | 'POSITION_UPDATE' | 'WEATHER_ALERT';
   nodeId: string;
   timestamp: number;
   details: string;
@@ -431,6 +455,11 @@ export interface TcpEndpoint {
 }
 
 export class MeshtasticSerialBridge extends EventEmitter {
+  /** BBS-Mail handler. Wired up from api.ts after the bridge is constructed
+   *  to avoid an import cycle (bbs.ts type-imports MeshtasticSerialBridge). */
+  private bbs: BbsService | null = null;
+  setBbs(bbs: BbsService): void { this.bbs = bbs; }
+
   private port: SerialPort | null = null;
   private portPath: string | null = null;
   private tcpSocket: net.Socket | null = null;
@@ -501,9 +530,29 @@ export class MeshtasticSerialBridge extends EventEmitter {
     return false;
   }
 
-  // ACK tracking: maps packetId → { msgId, timer }
-  private pendingAcks = new Map<number, { msgId: string; timer: ReturnType<typeof setTimeout> }>();
-  private nextPacketId = (Math.floor(Math.random() * 0xfffe) + 1);
+  // ACK tracking: maps packetId → { msgId, timer, retryCount, context? }
+  // context only populated for DMs (broadcasts are never retried — they can't
+  // fail in a way retry would help).
+  private pendingAcks = new Map<number, {
+    msgId: string;
+    timer: ReturnType<typeof setTimeout>;
+    retryCount: number;
+    context?: ResendContext;
+  }>();
+
+  /** Maximum auto-retransmits before surfacing the error to the UI. iOS retries
+   *  once on MAX_RETRANSMIT / TIMEOUT before showing the user. */
+  private static readonly MAX_AUTO_RETRIES = 1;
+
+  /**
+   * Fresh MeshPacket.id for outbound packets. Matches the official iOS app's
+   * strategy of a random uint32 in [256, 2^31) — random IDs dodge the
+   * post-restart-collision risk an incrementing counter has, and the lower
+   * bound avoids the firmware's reserved-low-id range.
+   */
+  private newPacketId(): number {
+    return Math.floor(Math.random() * (0x7FFFFFFE - 256)) + 256;
+  }
 
   constructor() {
     super();
@@ -706,13 +755,20 @@ export class MeshtasticSerialBridge extends EventEmitter {
     return true;
   }
 
-  /** Mark a node as favorite (or unfavorite). Updates the in-memory cache and persists. */
+  /**
+   * Mark a node as favorite (or unfavorite). Updates the in-memory cache and
+   * persists via upsertNode so the change survives a restart.
+   *
+   * Important: we MUST call upsertNode here (not just setFavorite on the DB)
+   * because loadNodes hydrates from the `raw_json` blob — the favorite column
+   * alone is invisible to the load path. The previous setFavorite-only write
+   * was silently dropped on every container restart.
+   */
   setFavorite(nodeId: string, favorite: boolean): boolean {
     const node = this.nodes.get(nodeId);
     if (!node) return false;
     node.favorite = !!favorite;
-    try { this.db.setFavorite(nodeId, node.favorite); }
-    catch (err: any) { console.error('[MeshtasticSerial] setFavorite persist failed:', err.message); }
+    this.upsertNode(node); // rewrites raw_json with the new favorite state
     this.emit('nodeUpdate', node);
     return true;
   }
@@ -963,8 +1019,40 @@ export class MeshtasticSerialBridge extends EventEmitter {
       throw new Error('Radio not connected');
     }
 
+    // Sanity-check the channel index against our cached set so a stale UI →
+    // unknown-channel send doesn't silently time out 30 s later. If the radio
+    // reports no channel at this index we still attempt the send (firmware may
+    // know about a channel we haven't been told about yet), but we surface a
+    // clear log line so the operator can correlate it with a timeout.
+    const cachedCh = this.channels.get(channel);
+    if (!cachedCh) {
+      console.warn(`[MeshtasticSerial] sendMessage on channel idx=${channel} which is NOT in our cached channel set [${[...this.channels.keys()].sort((a,b)=>a-b).join(',')}]. Possible stale UI — try POST /api/mesh/refresh.`);
+    } else {
+      const hasPsk = !!cachedCh.pskBase64 && cachedCh.pskBase64.length > 0;
+      console.log(`[MeshtasticSerial] sendMessage ch=${channel} name="${cachedCh.name}" role=${cachedCh.role} uplink=${cachedCh.uplinkEnabled} downlink=${cachedCh.downlinkEnabled} psk=${hasPsk ? 'set' : 'EMPTY'}`);
+      if (cachedCh.uplinkEnabled === false) {
+        console.warn(`[MeshtasticSerial] Channel idx=${channel} has uplink_enabled=false — firmware will refuse to TX on this channel. Enable uplink in Settings → Channels.`);
+      }
+    }
+
     const localId = randomId();
-    const packetId = (++this.nextPacketId) & 0x7fffffff; // keep positive
+    const packetId = this.newPacketId();
+
+    // Size MeshPacket.hopLimit for the destination. The mesh default is 3 (good
+    // for most direct/2-hop traffic); broadcasts use that. For DMs we know the
+    // destination's distance via NodeInfo.hops_away — if the peer is farther
+    // than 3, bump the limit so relays don't drop the packet. Mesh ceiling is
+    // 7; never exceed that or firmware rejects.
+    const DEFAULT_HOP_LIMIT = 3;
+    const MAX_HOP_LIMIT = 7;
+    let hopLimit = DEFAULT_HOP_LIMIT;
+    if (to !== '!ffffffff') {
+      const destNode = this.nodes.get(to);
+      if (destNode?.hopsAway !== undefined && destNode.hopsAway >= DEFAULT_HOP_LIMIT) {
+        hopLimit = Math.min(MAX_HOP_LIMIT, destNode.hopsAway + 1);
+        console.log(`[MeshtasticSerial] DM destination ${to} is ${destNode.hopsAway} hops away — raising hopLimit to ${hopLimit}`);
+      }
+    }
 
     // Add an optimistic outbound message immediately so the UI shows it right away
     const localNode = this.localNodeId || '!local';
@@ -975,7 +1063,7 @@ export class MeshtasticSerialBridge extends EventEmitter {
       text,
       timestamp: Date.now(),
       channel: this.resolveChannelName(channel, to),
-      hopLimit: 3,
+      hopLimit,
       hops: [localNode, to],
       status: 'sending',
       isOwn: true,
@@ -987,30 +1075,90 @@ export class MeshtasticSerialBridge extends EventEmitter {
     if (this.messages.length > 500) this.messages = this.messages.slice(-500);
     this.persistMessage(msg); // persist immediately so DMs survive a restart
 
-    // 30-second timeout → mark as error if no ACK arrives
+    // PKI encryption is opt-in via `opts.usePki`. We previously auto-enabled
+    // it for any DM whose recipient had a known public key, but that breaks
+    // in practice: the official iOS app does its own client-side ECDH+AES
+    // encryption before handing the packet to the firmware, whereas we just
+    // set the pki_encrypted flag and trust the firmware to do it. Firmware
+    // behavior here varies by version — some encrypt for us, some don't,
+    // some rewrite the packet id mid-flight. The visible symptom is that
+    // PKI-flagged DMs reach the recipient at the LoRa layer (we even get a
+    // routing ACK) but the recipient's app can't decrypt the payload and
+    // shows nothing.
+    //
+    // Until we implement proper client-side ECDH encryption, leave this off
+    // by default. Channel-PSK encryption (which the firmware does for us)
+    // works reliably between any two peers sharing the channel.
+    const destPublicKey = (opts as any).usePki && to !== '!ffffffff'
+      ? this.nodes.get(to)?.publicKey
+      : undefined;
+
+    // Build a send-context that's good enough to retransmit under a fresh
+    // packetId without re-walking sendMessage. Used by retrySend below.
+    const sendContext = {
+      text, to, channel,
+      replyTo: opts.replyTo,
+      isReaction: opts.isReaction,
+      hopLimit: hopLimit > DEFAULT_HOP_LIMIT ? hopLimit : undefined,
+      destPublicKey,
+    };
+
+    // 30-second timeout. For DMs (`to !== '!ffffffff'`) the absence of an ACK
+    // genuinely means the destination didn't acknowledge — but we auto-retry
+    // once before surfacing the failure to the user (matches iOS behavior on
+    // MAX_RETRANSMIT/TIMEOUT). Broadcasts never get over-the-air ACKs, so
+    // their timeout is silent — see comment in the body.
+    const isBroadcast = to === '!ffffffff';
     const timer = setTimeout(() => {
+      const pending = this.pendingAcks.get(packetId);
       this.pendingAcks.delete(packetId);
       const m = this.messages.find(m => m.id === localId);
-      if (m && (m.status === 'sending' || m.status === 'sent')) {
-        m.status = 'error';
-        m.errorCode = -1; // timeout
-        this.persistMessage(m);
-        this.emit('ackUpdate', localId, 'error', -1);
-        console.log(`[MeshtasticSerial] ACK timeout for msg ${localId}`);
+      // If the message already reached 'queued' (broadcast happy path) or
+      // 'acked' (DM happy path), there's nothing to do here. We only care
+      // about packets that never got past 'sending'/'sent'.
+      if (!m || (m.status !== 'sending' && m.status !== 'sent')) return;
+
+      const chCtx = cachedCh
+        ? `ch=${channel}/"${cachedCh.name}" role=${cachedCh.role}`
+        : `ch=${channel} (UNKNOWN)`;
+
+      if (isBroadcast) {
+        console.log(`[MeshtasticSerial] No QueueStatus for broadcast ${localId} pktId=${packetId} ${chCtx} after 30s — leaving as 'sent' (firmware did not confirm, but no delivery proof is expected for broadcasts).`);
+        return;
       }
+
+      // DM timeout — try once more before surfacing the error.
+      const retryCount = pending?.retryCount ?? 0;
+      if (retryCount < MeshtasticSerialBridge.MAX_AUTO_RETRIES && pending?.context) {
+        console.log(`[MeshtasticSerial] DM timeout for ${localId} pktId=${packetId} ${chCtx} — scheduling auto-retry #${retryCount + 1} in 2s`);
+        setTimeout(() => this.retrySend(localId, pending.context!, retryCount + 1), 2_000);
+        return;
+      }
+
+      m.status = 'error';
+      m.errorCode = -1; // timeout
+      this.persistMessage(m);
+      this.emit('ackUpdate', localId, 'error', -1);
+      console.warn(`[MeshtasticSerial] DM timeout for msg ${localId} pktId=${packetId} ${chCtx} to=${to}. No ROUTING reply observed in 30s (${retryCount} retries already attempted).`);
     }, 30_000);
-    this.pendingAcks.set(packetId, { msgId: localId, timer });
+    this.pendingAcks.set(packetId, { msgId: localId, timer, retryCount: 0, context: sendContext });
 
     try {
       const packet = this.buildTextPacket(text, to, channel, packetId, {
         replyTo: opts.replyTo,
         isReaction: opts.isReaction,
+        // Only override firmware's default hop_limit when we computed an
+        // escalation for a far DM — otherwise omit so the radio uses its
+        // operator-configured lora_config.hop_limit.
+        hopLimit: hopLimit > DEFAULT_HOP_LIMIT ? hopLimit : undefined,
+        destPublicKey,
       });
       this.sendToRadio(packet); // must go through sendToRadio to get the 0x94 0xC3 framing header
       msg.status = 'sent';
       this.persistMessage(msg);
       this.emit('ackUpdate', localId, 'sent', 0);
-      console.log(`[MeshtasticSerial] Sent message: "${text}" to ${to} (id=${packetId}) reaction=${!!opts.isReaction} replyTo=${opts.replyTo ?? 0}`);
+      const enc = destPublicKey ? 'pki' : (to === '!ffffffff' ? 'channel-psk' : 'channel-psk(no-pki-key)');
+      console.log(`[MeshtasticSerial] Sent message: "${text}" to ${to} (id=${packetId}) reaction=${!!opts.isReaction} replyTo=${opts.replyTo ?? 0} enc=${enc}`);
 
       // Mirror to event log so outbound traffic shows up in LogsView alongside inbound.
       // Suppress for reactions (they'd flood the log with single-emoji entries).
@@ -1034,6 +1182,80 @@ export class MeshtasticSerialBridge extends EventEmitter {
     }
 
     return localId;
+  }
+
+  /**
+   * Resend an existing message with a fresh packetId. Used by the auto-retry
+   * path on DM timeout / routing TIMEOUT / MAX_RETRANSMIT. The user-facing
+   * bubble is reused (same msgId) — only its packetId, status, and timer flip.
+   */
+  private retrySend(
+    localId: string,
+    ctx: ResendContext,
+    retryCount: number,
+  ): void {
+    const msg = this.messages.find(m => m.id === localId);
+    if (!msg) return;
+    // If something else has already concluded this message (manual retry,
+    // late-arriving ACK), don't pile on with another packet.
+    if (msg.status !== 'sending' && msg.status !== 'sent' && msg.status !== 'error') return;
+    if (!this.isLinkOpen()) {
+      console.warn(`[MeshtasticSerial] retrySend skipped — link not open (msg=${localId})`);
+      return;
+    }
+
+    const newPacketId = this.newPacketId();
+    console.log(`[MeshtasticSerial] Auto-retry #${retryCount} for msg=${localId} → new pktId=${newPacketId}`);
+
+    const isBroadcast = ctx.to === '!ffffffff';
+    const timer = setTimeout(() => {
+      const pending = this.pendingAcks.get(newPacketId);
+      this.pendingAcks.delete(newPacketId);
+      const m = this.messages.find(m => m.id === localId);
+      if (!m || (m.status !== 'sending' && m.status !== 'sent')) return;
+      if (isBroadcast) return; // broadcast retries don't surface
+
+      const prior = pending?.retryCount ?? retryCount;
+      if (prior < MeshtasticSerialBridge.MAX_AUTO_RETRIES && pending?.context) {
+        setTimeout(() => this.retrySend(localId, pending.context!, prior + 1), 2_000);
+        return;
+      }
+      m.status = 'error';
+      m.errorCode = -1;
+      this.persistMessage(m);
+      this.emit('ackUpdate', localId, 'error', -1);
+      console.warn(`[MeshtasticSerial] DM retry timeout for msg ${localId} pktId=${newPacketId} — giving up after ${prior} retries`);
+    }, 30_000);
+
+    this.pendingAcks.set(newPacketId, {
+      msgId: localId,
+      timer,
+      retryCount,
+      context: ctx,
+    });
+
+    try {
+      const packet = this.buildTextPacket(ctx.text, ctx.to, ctx.channel, newPacketId, {
+        replyTo: ctx.replyTo,
+        isReaction: ctx.isReaction,
+        hopLimit: ctx.hopLimit,
+        destPublicKey: ctx.destPublicKey,
+      });
+      this.sendToRadio(packet);
+      msg.packetId = newPacketId;
+      msg.status = 'sent';
+      msg.timestamp = Date.now(); // reset for accurate deliveryMs on retry success
+      this.persistMessage(msg);
+      this.emit('ackUpdate', localId, 'sent', 0);
+    } catch (err: any) {
+      clearTimeout(timer);
+      this.pendingAcks.delete(newPacketId);
+      msg.status = 'error';
+      msg.errorCode = -2;
+      this.persistMessage(msg);
+      this.emit('ackUpdate', localId, 'error', -2);
+      console.error(`[MeshtasticSerial] retrySend write failed for ${localId}:`, err?.message);
+    }
   }
 
   // ---- Internal serial data handling ----
@@ -1412,8 +1634,17 @@ export class MeshtasticSerialBridge extends EventEmitter {
 
   /** Parse a NodeInfo submessage */
   private handleNodeInfo(buf: Buffer) {
-    // NodeInfo has: num (varint field 1), user (submessage field 2), position (field 3)
-    // We extract what we can and upsert the node
+    // NodeInfo (mesh.proto):
+    //   1 num (varint)             — node number
+    //   2 user (submessage)        — User { long_name, short_name, public_key, hw_model, ... }
+    //   3 position (submessage)
+    //   4 snr (float)
+    //   5 last_heard (fixed32)
+    //   6 device_metrics (submessage)
+    //   7 channel (varint)
+    //   8 via_mqtt (bool)
+    //   9 hops_away (varint, optional uint32) — distance in hops
+    //  10 is_favorite (bool)
     let nodeNum = 0;
     let longName = '';
     let shortName = '';
@@ -1421,6 +1652,8 @@ export class MeshtasticSerialBridge extends EventEmitter {
     let hwModel: number | undefined;
     let isLicensed: boolean | undefined;
     let role: number | undefined;
+    let hopsAway: number | undefined;
+    let positionBuf: Buffer | null = null;
     let offset = 0;
 
     while (offset < buf.length) {
@@ -1433,6 +1666,7 @@ export class MeshtasticSerialBridge extends EventEmitter {
         const { value, bytesRead } = this.readVarint(buf, offset);
         offset += bytesRead;
         if (fieldNumber === 1) nodeNum = value;
+        else if (fieldNumber === 9) hopsAway = value;
       } else if (wireType === 2) {
         const { value: len, bytesRead } = this.readVarint(buf, offset);
         offset += bytesRead;
@@ -1448,6 +1682,10 @@ export class MeshtasticSerialBridge extends EventEmitter {
           hwModel = user.hwModel;
           isLicensed = user.isLicensed;
           role = user.role;
+        } else if (fieldNumber === 3) {
+          // Position submessage — captured here, applied AFTER upsertNode below
+          // so the node exists when applyPositionToNode looks it up.
+          positionBuf = subBuf;
         }
       } else {
         break;
@@ -1475,6 +1713,7 @@ export class MeshtasticSerialBridge extends EventEmitter {
         ...(hwModel !== undefined ? { hwModel } : {}),
         ...(isLicensed !== undefined ? { isLicensed } : {}),
         ...(role !== undefined ? { role } : {}),
+        ...(hopsAway !== undefined ? { hopsAway } : {}),
       };
       node.lastSeen = Date.now();
       const wasOnline = !!existing?.online;
@@ -1483,6 +1722,18 @@ export class MeshtasticSerialBridge extends EventEmitter {
       const isNew = !this.nodes.has(nodeId);
       const hadKey = !!existing?.publicKey;
       this.upsertNode(node);
+
+      // Position submessage handling. We capture this from NodeInfo as well as
+      // from standalone POSITION_APP packets — without it, the map would only
+      // populate when nodes happen to broadcast a fresh Position packet, which
+      // many firmware variants do infrequently. NodeInfo arrives reliably on
+      // every want_config_id (e.g. after a container restart), so picking
+      // position up here means the map repopulates within seconds of reconnect
+      // instead of waiting for the next per-node position broadcast.
+      if (positionBuf) {
+        const pos = this.parsePositionSubmessage(positionBuf);
+        if (pos) this.applyPositionToNode(nodeId, pos, 'nodeinfo');
+      }
 
       // Record online transition for uptime tracking. Skip for the local node
       // (it's always online by definition while the serial port is open).
@@ -1624,11 +1875,13 @@ export class MeshtasticSerialBridge extends EventEmitter {
 
     // Ensure the sender node exists
     if (fromNum > 0 && !this.nodes.has(fromId)) {
+      const now = Date.now();
       this.upsertNode({
         id: fromId,
         name: fromId,
         shortName: fromId.slice(-4),
-        lastSeen: Date.now(),
+        firstSeen: now,
+        lastSeen: now,
         online: true,
         favorite: false,
       });
@@ -1662,9 +1915,18 @@ export class MeshtasticSerialBridge extends EventEmitter {
         this.handleTextMessage(fromId, toId, hopLimit, channelIndex, payloadBuf, incomingPacketId, replyId, emoji);
         break;
       case PORT_ROUTING:
-        // The ACK's request_id may come from Data.request_id (field 6 varint)
-        // or the incoming packet's own id (incomingPacketId fixed32). Try both.
-        this.handleRoutingPacket(requestId || incomingPacketId, payloadBuf);
+        // Real peer/relay ACKs carry the original packet id in Data.request_id.
+        // Local self-ACK frames the firmware emits for our own broadcasts have
+        // request_id=0 and a fresh MeshPacket.id of their own — those can't be
+        // correlated to a pending send and should be ignored (don't fall back
+        // to incomingPacketId, which only spams "no match" lines).
+        if (requestId) {
+          // iOS treats packet.to != packet.from as the marker for a "real" peer
+          // ACK vs. a self-ACK the firmware echoes for our own transmissions.
+          // We pass both so the handler can log accordingly.
+          const isRealAck = fromId !== toId;
+          this.handleRoutingPacket(requestId, payloadBuf, isRealAck, fromId);
+        }
         break;
       case PORT_POSITION:
         this.handlePosition(fromId, payloadBuf);
@@ -1907,8 +2169,7 @@ export class MeshtasticSerialBridge extends EventEmitter {
     }
 
     if (this.isLinkOpen()) {
-      const packetId = this.nextPacketId++;
-      if (this.nextPacketId > 0xfffe) this.nextPacketId = 1;
+      const packetId = this.newPacketId();
       const frame = this.buildWaypointPacket(wp, channel, packetId);
       this.sendToRadio(frame);
       console.log(`[MeshtasticSerial] WAYPOINT tx id=${wp.id} "${wp.name}" packetId=${packetId}`);
@@ -1940,8 +2201,7 @@ export class MeshtasticSerialBridge extends EventEmitter {
     }
 
     if (this.isLinkOpen()) {
-      const packetId = this.nextPacketId++;
-      if (this.nextPacketId > 0xfffe) this.nextPacketId = 1;
+      const packetId = this.newPacketId();
       const frame = this.buildWaypointPacket(tombstone, channel, packetId);
       this.sendToRadio(frame);
       console.log(`[MeshtasticSerial] WAYPOINT delete id=${id} packetId=${packetId}`);
@@ -1965,8 +2225,7 @@ export class MeshtasticSerialBridge extends EventEmitter {
     if (!targetId || targetId === '!ffffffff') throw new Error('Traceroute requires a specific target');
 
     const requestId = randomId();
-    const packetId = this.nextPacketId++;
-    if (this.nextPacketId > 0xfffe) this.nextPacketId = 1;
+    const packetId = this.newPacketId();
 
     const trace: MeshTraceResult = {
       id: requestId,
@@ -2188,11 +2447,13 @@ export class MeshtasticSerialBridge extends EventEmitter {
     const neighbors: NeighborObservation[] = parsed.neighbors.map(n => {
       const id = nodeIdToHex(n.nodeNum);
       if (!this.nodes.has(id)) {
+        const now = Date.now();
         this.upsertNode({
           id,
           name: id,
           shortName: id.slice(-4),
-          lastSeen: Date.now(),
+          firstSeen: now,
+          lastSeen: now,
           online: true,
           favorite: false,
         });
@@ -2520,8 +2781,7 @@ export class MeshtasticSerialBridge extends EventEmitter {
     ]);
 
     const toNum = parseInt(routerId.replace('!', ''), 16) >>> 0;
-    const packetId = this.nextPacketId++;
-    if (this.nextPacketId > 0xfffe) this.nextPacketId = 1;
+    const packetId = this.newPacketId();
 
     // MeshPacket { to: fixed32, channel: varint, decoded: Data, id: fixed32, want_ack: bool }
     const meshPacket = Buffer.concat([
@@ -2550,12 +2810,14 @@ export class MeshtasticSerialBridge extends EventEmitter {
     requestId: number;
     replyId: number;
     emoji: number;
+    bitfield: number;
   } {
     let portNum = 0;
     let payload: Buffer | null = null;
     let requestId = 0;
     let replyId = 0;
     let emoji = 0;
+    let bitfield = 0;
     let offset = 0;
 
     while (offset < buf.length) {
@@ -2568,34 +2830,58 @@ export class MeshtasticSerialBridge extends EventEmitter {
         const { value, bytesRead } = this.readVarint(buf, offset);
         offset += bytesRead;
         if (fieldNumber === 1) portNum = value;        // portnum
-        else if (fieldNumber === 6) requestId = value; // request_id (ACK reply-to)
-        else if (fieldNumber === 8) emoji = value;     // emoji flag (uint32; non-zero = reaction)
+        // Older firmware emitted request_id / emoji as varints. The canonical
+        // mesh.proto declares both as fixed32 (handled in the wireType===5
+        // branch below). Accept either form so we work across firmware ages.
+        else if (fieldNumber === 6) requestId = value;
+        else if (fieldNumber === 8) emoji = value;
+        // Data.bitfield (field 9, optional uint32) — bit 0 is `ok_to_mqtt`,
+        // the operator's "yes please bridge this to the public MQTT broker"
+        // marker. Newer firmware uses this to enforce per-message MQTT opt-in
+        // independent of the channel's downlink setting. We surface it
+        // unparsed for now; specific bit interpretation lives at the call site.
+        else if (fieldNumber === 9) bitfield = value;
       } else if (wireType === 2) {
         const { value: len, bytesRead } = this.readVarint(buf, offset);
         offset += bytesRead;
         if (fieldNumber === 2) payload = buf.subarray(offset, offset + len); // payload
         offset += len;
       } else if (wireType === 5) {
-        // fixed32: reply_id is field 7 (the only one we care about here)
+        // fixed32 — current proto: request_id=6, reply_id=7, emoji=8.
+        // Until this branch existed for field 6, real peer ACKs (which carry
+        // request_id as fixed32) were silently dropped and every DM timed out.
         if (offset + 4 > buf.length) break;
         const v = buf.readUInt32LE(offset);
         offset += 4;
-        if (fieldNumber === 7) replyId = v;
+        if (fieldNumber === 6) requestId = v;
+        else if (fieldNumber === 7) replyId = v;
+        else if (fieldNumber === 8) emoji = v;
       } else {
         break;
       }
     }
 
-    if (portNum === PORT_ROUTING || requestId || replyId || emoji) {
-      console.log(`[MeshtasticSerial] Data: portNum=${portNum} requestId=${requestId} replyId=${replyId} emoji=${emoji} payloadLen=${payload?.length ?? 0}`);
+    if (portNum === PORT_ROUTING || requestId || replyId || emoji || bitfield) {
+      const okToMqtt = (bitfield & 0x1) !== 0;
+      console.log(`[MeshtasticSerial] Data: portNum=${portNum} requestId=${requestId} replyId=${replyId} emoji=${emoji} bitfield=${bitfield}${okToMqtt ? ' (ok_to_mqtt)' : ''} payloadLen=${payload?.length ?? 0}`);
     }
 
-    return { portNum, payload, requestId, replyId, emoji };
+    return { portNum, payload, requestId, replyId, emoji, bitfield };
   }
 
-  /** Handle a ROUTING_APP packet — these carry ACK/NAK for messages sent with want_ack=true */
-  private handleRoutingPacket(requestId: number, payload: Buffer | null) {
-    console.log(`[MeshtasticSerial] ROUTING pkt requestId=${requestId} pendingKeys=[${[...this.pendingAcks.keys()].join(',')}]`);
+  /**
+   * Handle a ROUTING_APP packet — these carry ACK/NAK for messages sent with want_ack=true.
+   *
+   * @param isRealAck  iOS's heuristic: when packet.to != packet.from, the ACK
+   *                   came from a remote peer/relay rather than the local
+   *                   firmware echoing its own queue confirmation. Useful in
+   *                   logs and analytics to distinguish "the mesh actually
+   *                   delivered this" from "our local radio accepted it".
+   * @param fromId     The hex id of the node that sent the ACK (the local node
+   *                   for self-ACKs, the remote peer for real ACKs).
+   */
+  private handleRoutingPacket(requestId: number, payload: Buffer | null, isRealAck = false, fromId = '') {
+    console.log(`[MeshtasticSerial] ROUTING pkt requestId=${requestId} from=${fromId || '?'} realAck=${isRealAck} pendingKeys=[${[...this.pendingAcks.keys()].join(',')}]`);
     if (!requestId) return;
 
     const pending = this.pendingAcks.get(requestId);
@@ -2624,6 +2910,31 @@ export class MeshtasticSerialBridge extends EventEmitter {
     clearTimeout(pending.timer);
     this.pendingAcks.delete(requestId);
 
+    // Errors 3 (TIMEOUT) and 5 (MAX_RETRANSMIT) are transient — the firmware
+    // already gave up internally, but the mesh might just have been busy. iOS
+    // retransmits one more time before surfacing the failure.
+    //
+    // Error 38 (RATE_LIMIT_EXCEEDED) is the local firmware's anti-flooding
+    // gate — too many sends to the same destination in a short window. The
+    // limit clears in seconds, so retrying with a longer backoff usually
+    // works. Particularly important for chatty BBS exchanges where multiple
+    // replies fire to the same peer within a single conversation.
+    //
+    // Skip the retry path if we've already burned our one retry.
+    const isTransientRouting = errorCode === 3 || errorCode === 5;
+    const isRateLimited = errorCode === 38;
+    const isRetryable = isTransientRouting || isRateLimited;
+    if (isRetryable && pending.retryCount < MeshtasticSerialBridge.MAX_AUTO_RETRIES && pending.context) {
+      // Rate-limit windows are typically 5-15s; back off longer than for
+      // routing errors so the retry doesn't just trip the limiter again.
+      const backoffMs = isRateLimited ? 10_000 : 2_000;
+      console.log(`[MeshtasticSerial] Routing error ${errorCode} for msg=${pending.msgId} — auto-retrying in ${backoffMs / 1000}s (attempt ${pending.retryCount + 1}/${MeshtasticSerialBridge.MAX_AUTO_RETRIES})`);
+      const ctx = pending.context;
+      const nextRetry = pending.retryCount + 1;
+      setTimeout(() => this.retrySend(pending.msgId, ctx, nextRetry), backoffMs);
+      return;
+    }
+
     const status: MeshMessage['status'] = errorCode === 0 ? 'acked' : 'error';
     const msg = this.messages.find(m => m.id === pending.msgId);
     if (msg) {
@@ -2635,14 +2946,21 @@ export class MeshtasticSerialBridge extends EventEmitter {
       this.persistMessage(msg);
     }
     this.emit('ackUpdate', pending.msgId, status, errorCode);
-    console.log(`[MeshtasticSerial] ACK for ${pending.msgId}: ${status} (err=${errorCode})`);
+    console.log(`[MeshtasticSerial] ACK resolved: msg=${pending.msgId} status=${status} err=${errorCode} ${isRealAck ? '(REAL peer ACK from ' + fromId + ')' : '(self-ACK from local radio)'}${isRetryable && pending.retryCount > 0 ? ' [after ' + pending.retryCount + ' retries]' : ''}`);
   }
 
   /**
    * FromRadio.queue_status (field 11) — QueueStatus { res=1, free=2, maxlen=3, mesh_packet_id=4 }
    * The firmware sends this when it accepts a packet into the TX queue.
-   * res=0 means SUCCESS; mesh_packet_id matches our sent packetId.
-   * This is the primary ACK path for broadcast channel messages since no remote node sends ROUTING ACKs.
+   *   res=0 + matching mesh_packet_id  → message marked 'queued'
+   *   res!=0                           → message marked 'error' (e.g. queue full)
+   *
+   * Important: 'queued' is NOT a delivery confirmation. The Meshtastic-Apple
+   * app explicitly treats QueueStatus as a heartbeat, not an ACK. We keep it
+   * as a positive intermediate state because broadcasts never reach 'acked'
+   * (no over-the-air ACKs by design), so for broadcasts 'queued' is the
+   * terminal happy path. For DMs we still wait for a real peer routing reply
+   * (`Routing.error_reason=NONE`) to graduate to 'acked'.
    */
   private handleQueueStatus(buf: Buffer) {
     let res = 0;
@@ -2684,19 +3002,31 @@ export class MeshtasticSerialBridge extends EventEmitter {
       return;
     }
 
-    // res=0 → radio accepted the packet for TX; treat as acknowledged for broadcast messages
+    // res=0 → radio accepted the packet for TX.
+    //
+    // For DMs we keep the pending-acks timer running so a real peer routing
+    // reply can still graduate the message to 'acked' (or a NAK can flip it
+    // to 'error'). For broadcasts there's no further signal coming, so we
+    // can clear the timer here.
     const pending = this.pendingAcks.get(meshPacketId);
     if (pending) {
-      clearTimeout(pending.timer);
-      this.pendingAcks.delete(meshPacketId);
       const msg = this.messages.find(m => m.id === pending.msgId);
+      const isBroadcast = msg?.to === '!ffffffff';
+
       if (msg) {
-        msg.status = 'acked';
+        msg.status = 'queued';
         msg.deliveryMs = Math.max(0, Date.now() - msg.timestamp);
         this.persistMessage(msg);
       }
-      this.emit('ackUpdate', pending.msgId, 'acked', 0);
-      console.log(`[MeshtasticSerial] QueueStatus ACK for ${pending.msgId} (pktId=${meshPacketId})`);
+      this.emit('ackUpdate', pending.msgId, 'queued', 0);
+
+      if (isBroadcast) {
+        // Broadcasts never get a real ACK — clear the timer now so we don't
+        // log a spurious "no QueueStatus for broadcast" line at the 30s mark.
+        clearTimeout(pending.timer);
+        this.pendingAcks.delete(meshPacketId);
+      }
+      console.log(`[MeshtasticSerial] QueueStatus queued ${pending.msgId} (pktId=${meshPacketId})${isBroadcast ? ' [broadcast — terminal]' : ' [DM — waiting for peer ACK]'}`);
     }
   }
 
@@ -2756,6 +3086,26 @@ export class MeshtasticSerialBridge extends EventEmitter {
       }
     }
 
+    // BBS-Mail interception. Direct messages to our local node that either
+    // start with the ":mail" trigger OR continue an active state machine are
+    // consumed by the BBS module and NOT persisted as normal chat traffic.
+    // We pass the inbound channelIndex through so the reply rides the same
+    // channel (and therefore the same PSK) — required for the recipient to
+    // be able to decrypt our response. Reactions ride through unchanged;
+    // broadcasts are never BBS.
+    if (
+      !isReaction &&
+      toId === this.localNodeId &&
+      this.bbs &&
+      this.bbs.isCommand(text, fromId)
+    ) {
+      console.log(`[MeshtasticSerial] BBS intercept: from=${fromId} ch=${channelIndex} text="${text.substring(0, 40)}"`);
+      this.bbs.handleInboundDm(fromId, text, channelIndex).catch(err =>
+        console.error('[MeshtasticSerial] BBS handler failed:', err?.message)
+      );
+      return;
+    }
+
     // Resolve the channel name so incoming messages appear in the right chat pane.
     // Fall back progressively: channel map → channel index string → primary default.
     const channelName = this.resolveChannelName(channelIndex, toId);
@@ -2789,11 +3139,27 @@ export class MeshtasticSerialBridge extends EventEmitter {
     this.emit('message', msg);
   }
 
-  private handlePosition(nodeId: string, payload: Buffer) {
-    // Position protobuf:
-    //   1=latitude_i (sfixed32)   2=longitude_i (sfixed32)   3=altitude (int32)
-    //   14=location_source (varint enum: 0=UNSET, 1=MANUAL, 2=INTERNAL/GPS, 3=EXTERNAL)
-    //   16=precision_bits (uint32) — channel-imposed location precision
+  /**
+   * Parse a Position submessage (mesh.proto):
+   *   1  latitude_i      (sfixed32, scale 1e-7)
+   *   2  longitude_i     (sfixed32, scale 1e-7)
+   *   3  altitude        (int32 metres)
+   *   14 location_source (varint enum: 0=UNSET, 1=MANUAL, 2=INTERNAL/GPS, 3=EXTERNAL)
+   *   16 precision_bits  (uint32) — channel-imposed location precision
+   *
+   * Used from two places: the POSITION_APP port handler AND the NodeInfo
+   * dispatcher, since NodeInfo embeds the node's last-known position as
+   * field 3 (a Position submessage). Parsing position from NodeInfo is
+   * critical for keeping the map populated across container restarts —
+   * radios re-emit their NodeDB via want_config_id on connect, but they
+   * generally do NOT re-emit a fresh POSITION_APP packet for every node.
+   *
+   * Returns null when no usable lat/lng was found.
+   */
+  private parsePositionSubmessage(payload: Buffer): {
+    lat: number; lng: number; alt: number;
+    locationSource: number; precisionBits: number;
+  } | null {
     let lat = 0;
     let lng = 0;
     let alt = 0;
@@ -2808,7 +3174,6 @@ export class MeshtasticSerialBridge extends EventEmitter {
       offset++;
 
       if (wireType === 5) {
-        // sfixed32
         if (offset + 4 > payload.length) break;
         const val = payload.readInt32LE(offset);
         offset += 4;
@@ -2828,20 +3193,65 @@ export class MeshtasticSerialBridge extends EventEmitter {
       }
     }
 
-    if (lat !== 0 || lng !== 0) {
-      const node = this.nodes.get(nodeId);
-      if (node) {
-        node.position = { lat, lng, alt };
-        // 1=MANUAL → fixed; 2=INTERNAL/3=EXTERNAL → live GPS; 0=UNSET → leave previous value alone
-        if (locationSource === 1) node.positionSource = 'manual';
-        else if (locationSource === 2 || locationSource === 3) node.positionSource = 'gps';
-        if (precisionBits > 0) node.positionPrecisionBits = precisionBits;
-        node.lastSeen = Date.now();
-        this.upsertNode(node);
-        const sourceLabel = node.positionSource === 'manual' ? ' [fixed]' : node.positionSource === 'gps' ? ' [gps]' : '';
-        this.addEvent('POSITION_UPDATE', nodeId, `${node.name} position: ${lat.toFixed(5)}, ${lng.toFixed(5)}${sourceLabel}`);
+    if (lat === 0 && lng === 0) return null;
+    return { lat, lng, alt, locationSource, precisionBits };
+  }
+
+  /** Apply a parsed position to an existing node (in-memory + DB). Centralized
+   *  so POSITION_APP and NodeInfo paths set the same fields the same way. */
+  private applyPositionToNode(
+    nodeId: string,
+    pos: { lat: number; lng: number; alt: number; locationSource: number; precisionBits: number },
+    eventSource: 'position-packet' | 'nodeinfo',
+  ): void {
+    const node = this.nodes.get(nodeId);
+    if (!node) return;
+    node.position = { lat: pos.lat, lng: pos.lng, alt: pos.alt };
+    if (pos.locationSource === 1) node.positionSource = 'manual';
+    else if (pos.locationSource === 2 || pos.locationSource === 3) node.positionSource = 'gps';
+    if (pos.precisionBits > 0) node.positionPrecisionBits = pos.precisionBits;
+    node.lastSeen = Date.now();
+    this.upsertNode(node);
+
+    // Append to per-node position history so the iOS-style Position Log can
+    // show a track over time. We dedupe lightly: if the new lat/lng match the
+    // most recent stored row exactly, skip (NodeInfo re-emits otherwise spam
+    // the table with no-change rows on every want_config_id).
+    try {
+      const lastTwo = this.db.loadPositionHistory(nodeId, 1);
+      const prev = lastTwo[0];
+      const unchanged = prev
+        && Math.abs(prev.lat - pos.lat) < 1e-6
+        && Math.abs(prev.lng - pos.lng) < 1e-6;
+      if (!unchanged) {
+        this.db.insertPositionHistory({
+          nodeId,
+          timestamp: Date.now(),
+          lat: pos.lat,
+          lng: pos.lng,
+          alt: pos.alt || null,
+          source: node.positionSource ?? null,
+          precisionBits: pos.precisionBits || null,
+        });
       }
+    } catch (err: any) {
+      console.error('[MeshtasticSerial] position history insert failed:', err.message);
     }
+
+    if (eventSource === 'position-packet') {
+      const sourceLabel = node.positionSource === 'manual'
+        ? ' [fixed]'
+        : node.positionSource === 'gps' ? ' [gps]' : '';
+      this.addEvent('POSITION_UPDATE', nodeId, `${node.name} position: ${pos.lat.toFixed(5)}, ${pos.lng.toFixed(5)}${sourceLabel}`);
+    }
+    // NodeInfo-embedded position arrivals are silent in the event log — they
+    // fire on every NodeDB re-emit and would flood it — but they DO populate
+    // the position_history table so the per-node log captures them.
+  }
+
+  private handlePosition(nodeId: string, payload: Buffer) {
+    const pos = this.parsePositionSubmessage(payload);
+    if (pos) this.applyPositionToNode(nodeId, pos, 'position-packet');
   }
 
   private handleTelemetry(nodeId: string, payload: Buffer) {
@@ -3027,6 +3437,20 @@ export class MeshtasticSerialBridge extends EventEmitter {
     }
   }
 
+  /**
+   * Public re-issue of `want_config_id`. Triggers the radio to re-emit its
+   * full node DB, channel set, and module configs. Use when a phone/BLE client
+   * has changed config out-of-band and the UI is showing stale node liveness
+   * or channel indices.
+   */
+  refreshNodeDb(): void {
+    if (!this.isLinkOpen()) {
+      throw new Error('Radio not connected');
+    }
+    console.log('[MeshtasticSerial] Manual refreshNodeDb requested');
+    this.requestConfig();
+  }
+
   /** Request the radio to send its full config/node list */
   private requestConfig() {
     if (!this.isLinkOpen()) return;
@@ -3082,12 +3506,23 @@ export class MeshtasticSerialBridge extends EventEmitter {
     to: string,
     channel: number,
     packetId: number,
-    opts: { replyTo?: number; isReaction?: boolean } = {},
+    opts: {
+      replyTo?: number;
+      isReaction?: boolean;
+      hopLimit?: number;
+      /** Base64-encoded recipient public key (32 bytes Curve25519). When set on
+       *  a DM, the firmware encrypts the payload per-recipient via PKI instead
+       *  of the channel PSK. Ignored for broadcasts. */
+      destPublicKey?: string;
+    } = {},
   ): Buffer {
     // Builds a ToRadio { packet: MeshPacket } frame using current Meshtastic protobuf field numbers.
     // Field layout (mesh.proto):
-    //   MeshPacket: to=2(fixed32), channel=3(varint), decoded=4(submsg), id=6(fixed32), want_ack=10(bool)
-    //   Data:       portnum=1(varint), payload=2(bytes), reply_id=7(fixed32), emoji=8(uint32)
+    //   MeshPacket: from=1(varint, optional), to=2(fixed32), channel=3(varint),
+    //               decoded=4(submsg), id=6(fixed32), hop_limit=9(varint),
+    //               want_ack=10(bool), pki_encrypted=16(bool), public_key=17(bytes)
+    //   Data:       portnum=1(varint), payload=2(bytes), request_id=6(fixed32),
+    //               reply_id=7(fixed32), emoji=8(fixed32), bitfield=9(varint)
     const textBuf = Buffer.from(text, 'utf-8');
 
     const dataParts: Buffer[] = [
@@ -3105,14 +3540,47 @@ export class MeshtasticSerialBridge extends EventEmitter {
 
     const toNum = to === '!ffffffff' ? 0xffffffff : parseInt(to.replace('!', ''), 16);
 
-    const meshPacket = Buffer.concat([
+    // PKI encryption is only meaningful for unicast DMs where we have the
+    // recipient's published Curve25519 public key (from their NodeInfo.User).
+    // For broadcasts the firmware always uses the channel PSK regardless.
+    const isBroadcast = toNum === 0xffffffff;
+    const pkiKeyBuf = (!isBroadcast && opts.destPublicKey)
+      ? Buffer.from(opts.destPublicKey, 'base64')
+      : null;
+    const usePki = pkiKeyBuf !== null && pkiKeyBuf.length === 32;
+
+    const meshPacketParts: Buffer[] = [];
+    // MeshPacket.from (field 1, fixed32). Optional when talking to the
+    // firmware over USB/TCP — the radio fills in the local node id if absent.
+    // Setting it explicitly matches iOS behavior and is forward-compatible
+    // with a future BLE transport where we'd be talking directly to a phone
+    // peer rather than a radio that knows who we are.
+    if (this.localNodeNum) {
+      meshPacketParts.push(this.encodeTagFixed32(1, this.localNodeNum));
+    }
+    meshPacketParts.push(
       this.encodeTagFixed32(2, toNum),                                     // field 2 = to
       this.encodeTagVarint(3, channel),                                    // field 3 = channel index
       Buffer.from([(4 << 3) | 2, ...this.encodeVarint(dataMsg.length)]),   // field 4 = decoded (len-delim)
       dataMsg,
       this.encodeTagFixed32(6, packetId),                                  // field 6 = id
-      this.encodeTagBool(10, true),                                        // field 10 = want_ack
-    ]);
+    );
+    // Only emit hop_limit when the caller provided a non-default value. The
+    // firmware fills in its operator-configured default (lora_config.hop_limit)
+    // when this field is absent, which is what we want for routine sends —
+    // emitting an explicit value here lets us escalate when a DM destination's
+    // hops_away exceeds the mesh default.
+    if (typeof opts.hopLimit === 'number' && opts.hopLimit > 0) {
+      meshPacketParts.push(this.encodeTagVarint(9, Math.min(7, opts.hopLimit)));
+    }
+    meshPacketParts.push(this.encodeTagBool(10, true));                    // field 10 = want_ack
+
+    if (usePki && pkiKeyBuf) {
+      meshPacketParts.push(this.encodeTagBool(16, true));                  // field 16 = pki_encrypted
+      meshPacketParts.push(this.encodeTagLen(17, pkiKeyBuf));               // field 17 = public_key
+    }
+
+    const meshPacket = Buffer.concat(meshPacketParts);
 
     // ToRadio: field 1 = packet (len-delimited)
     return Buffer.concat([
@@ -4389,13 +4857,22 @@ export class MeshtasticSerialBridge extends EventEmitter {
   }
 
   private addEvent(type: MeshEvent['type'], nodeId: string, details: string) {
-    const event: MeshEvent = {
+    this.recordEvent({
       id: randomId(),
       type,
       nodeId,
       timestamp: Date.now(),
       details,
-    };
+    });
+  }
+
+  /**
+   * Persist an event from an external source (e.g. the weather alert poller).
+   * Caller controls the id so they can dedupe across restarts — passing the
+   * same id twice silently no-ops on the DB insert (handled by ON CONFLICT
+   * in insertEvent) but still fans out SSE so late subscribers see it.
+   */
+  recordEvent(event: MeshEvent): void {
     this.events.unshift(event);
     if (this.events.length > 100) {
       this.events = this.events.slice(0, 100);
@@ -4471,6 +4948,36 @@ export class MeshtasticSerialBridge extends EventEmitter {
         console.log(`[MeshtasticSerial] message retention prune: -${msgBefore - this.messages.length} memory / -${msgDbRemoved} db (cutoff=${this.messageRetentionHours}h)`);
       }
     }
+
+    // BBS mail — hard 30-day retention regardless of read state (per the
+    // feature design; not operator-configurable). Adjust the constant here
+    // if we ever expose this in Settings.
+    const mailCutoff = Date.now() - 30 * 24 * 3600_000;
+    let mailDbRemoved = 0;
+    try { mailDbRemoved = this.db.pruneMailOlderThan(mailCutoff); }
+    catch (e: any) { console.error('[MeshtasticSerial] mail retention prune failed:', e.message); }
+    if (mailDbRemoved > 0) {
+      console.log(`[MeshtasticSerial] BBS mail retention prune: -${mailDbRemoved} db (cutoff=30d)`);
+    }
+
+    // Position history — 30-day retention matching BBS mail. Per-node Position
+    // Log keeps recent samples; older points are dropped to keep the table
+    // bounded on chatty meshes (a 100-node mesh broadcasting position every
+    // 15 min generates ~3.5 million rows/year without this prune).
+    const posCutoff = Date.now() - 30 * 24 * 3600_000;
+    let posDbRemoved = 0;
+    try { posDbRemoved = this.db.prunePositionHistoryOlderThan(posCutoff); }
+    catch (e: any) { console.error('[MeshtasticSerial] position history prune failed:', e.message); }
+    if (posDbRemoved > 0) {
+      console.log(`[MeshtasticSerial] Position history retention prune: -${posDbRemoved} db (cutoff=30d)`);
+    }
+
+    // Node sessions — bound at 100k rows. Helper existed but was never wired
+    // into the periodic prune; left unattended it would grow ~one row per
+    // online/offline transition per node forever. 100k is plenty for analytics
+    // (months to years of online/offline transitions on a mesh of any size).
+    try { this.db.pruneNodeSessions(100_000); }
+    catch (e: any) { console.error('[MeshtasticSerial] node_sessions prune failed:', e.message); }
   }
 }
 

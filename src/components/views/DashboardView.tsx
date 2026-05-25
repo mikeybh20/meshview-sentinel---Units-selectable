@@ -14,6 +14,11 @@ import {
   Check,
   X,
   Loader2,
+  Cpu,
+  Key,
+  Copy,
+  Clock,
+  History,
 } from 'lucide-react';
 import { Map, Marker } from "pigeon-maps";
 
@@ -23,6 +28,14 @@ import { StatCard } from '../ui/StatCard';
 import { TelemetryItem } from '../ui/TelemetryItem';
 import { SensorWidget } from '../SensorWidget';
 import { simulator } from '../../services/meshtasticSimulator';
+import { meshDataService } from '../../services/meshDataService';
+import {
+  hardwareLabel,
+  roleLabel,
+  messagingStatus,
+  hexToNodeNum,
+  relativeTimeLong,
+} from '../../lib/meshEnums';
 // TelemetryChart pulls in `recharts` (~120 KB). Lazy-load so the chart only
 // gets fetched when a node detail panel actually surfaces it.
 const TelemetryChart = React.lazy(() =>
@@ -290,6 +303,387 @@ function NodeUptimeWidget({ nodeId, currentlyOnline, dataSource }: {
 const FALLBACK_CENTER: [number, number] = [39.0, -76.7];
 const FALLBACK_ZOOM = 9;
 
+/**
+ * Sectioned node-detail panel modeled on the official iOS app's layout:
+ *   Hardware  → model name, role, public key + copy
+ *   Signal    → RSSI / SNR / distance / altitude tiles
+ *   Identity  → node number (decimal), user id (hex), messaging status
+ *   Timing    → first heard, last heard
+ *   Location  → lat / lng (when present)
+ *   Logs      → per-node history sections (P2 — separate component below)
+ *
+ * Each section is a labeled block; missing data renders as "—" rather than
+ * an absent row so the panel stays visually consistent across nodes.
+ */
+function NodeDetailSections({
+  node,
+  unitSystem,
+  dataSource,
+}: {
+  node: Node;
+  unitSystem: UnitSystem;
+  dataSource: 'live' | 'simulator';
+}) {
+  const [keyCopied, setKeyCopied] = React.useState(false);
+  const nodeNum = hexToNodeNum(node.id);
+  const hw = hardwareLabel(node.hwModel);
+  const role = roleLabel(node.role);
+  const msgStatus = messagingStatus(node.role);
+
+  const copyKey = async () => {
+    if (!node.publicKey) return;
+    try {
+      await navigator.clipboard.writeText(node.publicKey);
+      setKeyCopied(true);
+      setTimeout(() => setKeyCopied(false), 1500);
+    } catch { /* clipboard unavailable */ }
+  };
+
+  return (
+    <div className="space-y-5">
+      {/* Hardware */}
+      <Section label="Hardware" icon={<Cpu size={11} />}>
+        <Row label="Model" value={hw ?? '—'} />
+        <Row label="Role" value={role ?? '—'} />
+        <Row label="Licensed" value={node.isLicensed ? 'Yes' : 'No'} />
+      </Section>
+
+      {/* Signal */}
+      <Section label="Signal" icon={<Signal size={11} />}>
+        <div className="grid grid-cols-2 gap-3">
+          <TelemetryItem
+            icon={<Signal size={14}/>}
+            label="RSSI"
+            value={typeof node.telemetry?.rssi === 'number' && node.telemetry.rssi !== 0
+              ? `${Math.round(node.telemetry.rssi)} dBm`
+              : '—'}
+          />
+          <TelemetryItem
+            icon={<Activity size={14}/>}
+            label="SNR"
+            value={typeof node.telemetry?.snr === 'number' && node.telemetry.snr !== 0
+              ? `${node.telemetry.snr.toFixed(2)} dB`
+              : '—'}
+          />
+          {typeof node.telemetry?.distance === 'number' && node.telemetry.distance > 0 && (
+            <TelemetryItem
+              icon={<ArrowsUpFromLine size={14}/>}
+              label="Distance"
+              value={unitSystem === 'METRIC'
+                ? `${node.telemetry.distance.toFixed(2)} km`
+                : `${(node.telemetry.distance * 0.621371).toFixed(2)} mi`}
+            />
+          )}
+          {typeof node.position?.alt === 'number' && node.position.alt !== 0 && (
+            <TelemetryItem
+              icon={<Compass size={14}/>}
+              label="Altitude"
+              value={unitSystem === 'METRIC'
+                ? `${node.position.alt.toFixed(0)} m`
+                : `${(node.position.alt * 3.28084).toFixed(0)} ft`}
+            />
+          )}
+        </div>
+      </Section>
+
+      {/* Identity */}
+      <Section label="Identity">
+        <Row label="Node Number" mono value={nodeNum !== null ? String(nodeNum) : '—'} />
+        <Row label="User ID" mono value={node.id} />
+        <Row label="Messaging" value={msgStatus} />
+        {/* Public key with copy. Truncated to fit; full value goes via clipboard. */}
+        {node.publicKey ? (
+          <div className="flex items-baseline justify-between gap-2 text-xs">
+            <span className="text-brand-muted shrink-0 flex items-center gap-1.5">
+              <Key size={11} /> Public Key
+            </span>
+            <button
+              onClick={copyKey}
+              className="flex items-center gap-1.5 mono-text text-brand-accent hover:underline truncate text-right"
+              title="Click to copy full public key"
+            >
+              <span className="truncate">{node.publicKey.slice(0, 16)}…</span>
+              {keyCopied ? <Check size={11} /> : <Copy size={11} />}
+            </button>
+          </div>
+        ) : (
+          <Row label="Public Key" value="—" />
+        )}
+      </Section>
+
+      {/* Timing */}
+      <Section label="Timing" icon={<Clock size={11} />}>
+        <Row label="First heard" value={relativeTimeLong(node.firstSeen)} />
+        <Row label="Last heard"  value={relativeTimeLong(node.lastSeen)} />
+      </Section>
+
+      {/* Location (only when present) */}
+      {node.position && (
+        <Section label="Location">
+          <div className="p-2.5 bg-brand-line/30 rounded border border-brand-line mono-text space-y-1 text-[10px]">
+            <p className="flex justify-between"><span>LAT:</span> <span className="text-brand-ink">{node.position.lat.toFixed(6)}</span></p>
+            <p className="flex justify-between"><span>LNG:</span> <span className="text-brand-ink">{node.position.lng.toFixed(6)}</span></p>
+            {node.positionSource && (
+              <p className="flex justify-between">
+                <span>SOURCE:</span>
+                <span className="text-brand-ink uppercase">{node.positionSource}</span>
+              </p>
+            )}
+          </div>
+        </Section>
+      )}
+
+      {/* Time-series telemetry chart — battery, signal, environment.
+          Lazy-loaded; recharts is heavy. */}
+      <Section label="Telemetry History" icon={<History size={11} />}>
+        <React.Suspense fallback={
+          <div className="h-44 bg-brand-bg/40 rounded border border-brand-line/50 flex items-center justify-center">
+            <Loader2 size={16} className="animate-spin text-brand-muted" />
+          </div>
+        }>
+          <TelemetryChart nodeId={node.id} />
+        </React.Suspense>
+      </Section>
+
+      {/* Per-node uptime / availability sourced from node_sessions. */}
+      <NodeUptimeWidget
+        nodeId={node.id}
+        currentlyOnline={node.online}
+        dataSource={dataSource}
+      />
+
+      {/* Per-node history logs (P2 — Position / Trace Route / Power / Environment) */}
+      <NodeLogsSection nodeId={node.id} dataSource={dataSource} />
+    </div>
+  );
+}
+
+/** Section wrapper for the node detail panel — labeled block with consistent
+ *  spacing. Tiny helper so the body of NodeDetailSections stays scannable. */
+function Section({
+  label,
+  icon,
+  children,
+}: {
+  label: string;
+  icon?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="space-y-2">
+      <p className="text-[10px] text-brand-muted uppercase font-bold tracking-widest flex items-center gap-1.5">
+        {icon} {label}
+      </p>
+      <div className="space-y-1.5">{children}</div>
+    </div>
+  );
+}
+
+/** Single label / value row inside a Section. */
+function Row({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
+  return (
+    <div className="flex items-baseline justify-between gap-2 text-xs">
+      <span className="text-brand-muted shrink-0">{label}</span>
+      <span className={cn(
+        'text-right text-brand-ink truncate',
+        mono && 'mono-text'
+      )}>
+        {value}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * Per-node history logs. Each subsection is collapsible and fetches its data
+ * on expand so we don't pay API cost for nodes whose detail panel is opened
+ * but never drilled into.
+ */
+function NodeLogsSection({ nodeId, dataSource }: { nodeId: string; dataSource: 'live' | 'simulator' }) {
+  return (
+    <Section label="Logs" icon={<History size={11} />}>
+      <div className="space-y-1">
+        <CollapsibleLog
+          label="Position Log"
+          subtitle="Lat/lng samples over time"
+          dataSource={dataSource}
+        >
+          <PositionLog nodeId={nodeId} />
+        </CollapsibleLog>
+        <CollapsibleLog
+          label="Trace Route Log"
+          subtitle="Path discovery attempts"
+          dataSource={dataSource}
+        >
+          <TraceLog nodeId={nodeId} />
+        </CollapsibleLog>
+        {/* The Telemetry History block above already covers device metrics,
+            power, and environment time-series — we deliberately don't
+            re-render those here as separate log sections. */}
+      </div>
+    </Section>
+  );
+}
+
+function CollapsibleLog({
+  label,
+  subtitle,
+  dataSource,
+  children,
+}: {
+  label: string;
+  subtitle?: string;
+  dataSource: 'live' | 'simulator';
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = React.useState(false);
+  return (
+    <div className="border border-brand-line/40 rounded">
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="w-full flex items-center justify-between gap-2 px-2.5 py-1.5 hover:bg-brand-line/30 transition-colors text-left"
+      >
+        <div className="min-w-0">
+          <div className="text-[11px] font-bold uppercase tracking-tight text-brand-ink">{label}</div>
+          {subtitle && <div className="text-[9px] text-brand-muted truncate">{subtitle}</div>}
+        </div>
+        <ArrowRight
+          size={12}
+          className={cn(
+            'text-brand-muted shrink-0 transition-transform',
+            open && 'rotate-90'
+          )}
+        />
+      </button>
+      {open && (
+        <div className="px-2.5 py-2 border-t border-brand-line/40 bg-brand-bg/30">
+          {dataSource === 'simulator' ? (
+            <div className="text-[10px] text-brand-muted italic">
+              Switch to live mode to populate this log with real radio data.
+            </div>
+          ) : (
+            children
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PositionLog({ nodeId }: { nodeId: string }) {
+  const [rows, setRows] = React.useState<Array<{
+    id: number;
+    timestamp: number;
+    lat: number;
+    lng: number;
+    alt: number | null;
+    source: 'manual' | 'gps' | null;
+  }> | null>(null);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    meshDataService.getNodePositionHistory(nodeId, 100).then(r => {
+      if (!cancelled) setRows(r);
+    });
+    return () => { cancelled = true; };
+  }, [nodeId]);
+
+  if (rows === null) {
+    return (
+      <div className="text-[10px] text-brand-muted flex items-center gap-2">
+        <Loader2 size={11} className="animate-spin" /> Loading…
+      </div>
+    );
+  }
+  if (rows.length === 0) {
+    return <div className="text-[10px] text-brand-muted italic">No position history recorded yet.</div>;
+  }
+  return (
+    <div className="space-y-0.5 max-h-48 overflow-y-auto text-[10px] mono-text">
+      <div className="grid grid-cols-[auto_1fr_1fr_auto] gap-2 px-1 pb-1 text-brand-muted uppercase tracking-widest text-[9px] border-b border-brand-line/40">
+        <span>When</span>
+        <span>Lat</span>
+        <span>Lng</span>
+        <span className="text-right">Src</span>
+      </div>
+      {rows.map(r => (
+        <div key={r.id} className="grid grid-cols-[auto_1fr_1fr_auto] gap-2 px-1 py-0.5 hover:bg-brand-line/20 rounded">
+          <span className="text-brand-muted">{relativeTimeLong(r.timestamp)}</span>
+          <span className="text-brand-ink truncate">{r.lat.toFixed(5)}</span>
+          <span className="text-brand-ink truncate">{r.lng.toFixed(5)}</span>
+          <span className="text-brand-muted text-right uppercase">{r.source || '—'}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function TraceLog({ nodeId }: { nodeId: string }) {
+  const [rows, setRows] = React.useState<Array<{
+    id: string;
+    targetId: string;
+    startedAt: number;
+    completedAt: number | null;
+    status: string;
+    route: string[];
+    routeBack: string[];
+    errorMessage: string | null;
+  }> | null>(null);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    meshDataService.getNodeTraces(nodeId, 30).then(r => {
+      if (!cancelled) setRows(r as any);
+    });
+    return () => { cancelled = true; };
+  }, [nodeId]);
+
+  if (rows === null) {
+    return (
+      <div className="text-[10px] text-brand-muted flex items-center gap-2">
+        <Loader2 size={11} className="animate-spin" /> Loading…
+      </div>
+    );
+  }
+  if (rows.length === 0) {
+    return (
+      <div className="text-[10px] text-brand-muted italic">
+        No trace routes recorded yet. Use the trace button on a message from this node to record one.
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-1 max-h-48 overflow-y-auto text-[10px]">
+      {rows.map(r => (
+        <div key={r.id} className="px-1.5 py-1 rounded border border-brand-line/30 hover:bg-brand-line/20">
+          <div className="flex items-baseline justify-between gap-2">
+            <span className="text-brand-muted mono-text">{relativeTimeLong(r.startedAt)}</span>
+            <span className={cn(
+              'mono-text uppercase text-[9px] tracking-widest',
+              r.status === 'response' ? 'text-brand-accent'
+                : r.status === 'timeout' ? 'text-brand-warning'
+                : 'text-brand-muted'
+            )}>{r.status}</span>
+          </div>
+          {r.route.length > 0 && (
+            <div className="text-brand-ink mono-text truncate">
+              → {r.route.map(h => h.slice(-4)).join(' → ')}
+            </div>
+          )}
+          {r.routeBack.length > 0 && (
+            <div className="text-brand-muted mono-text truncate">
+              ← {r.routeBack.map(h => h.slice(-4)).join(' ← ')}
+            </div>
+          )}
+          {r.errorMessage && (
+            <div className="text-brand-warning text-[9px] mt-0.5">{r.errorMessage}</div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function DashboardMapWidget({ nodes }: { nodes: Node[] }) {
   const positioned = nodes.filter(n => n.position);
 
@@ -330,7 +724,7 @@ function DashboardMapWidget({ nodes }: { nodes: Node[] }) {
   }, [derivedCenter, derivedZoom]);
 
   return (
-    <div className="technical-panel h-[360px] overflow-hidden relative">
+    <div className="technical-panel h-[720px] overflow-hidden relative">
       <div className="absolute inset-0 z-0">
         <Map
           center={center}
@@ -502,7 +896,17 @@ export function DashboardView({
          </button>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+      {/*
+        Row sizing matters here because NODE_DETAILS spans 2 rows via row-span-2.
+        Without an explicit grid-template-rows, CSS Grid's auto-row algorithm
+        distributes the row-spanning item's height across the rows it spans —
+        which inflated row 1 (where STATS lives) to half of NODE_DETAILS's
+        full height, leaving a big visual gap between STATS and NODE_LIST.
+        Pinning row 1 to min-content keeps STATS at its natural height; row 2
+        takes "1fr" so it absorbs the remaining height NODE_DETAILS needs.
+        Row 3 (MAP) is min-content again.
+      */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 lg:grid-rows-[min-content_1fr_min-content]">
         {dashboardWidgets.filter(w => w.visible).sort((a, b) => a.order - b.order).map(widget => {
           const colSpan = {
             full: 'lg:col-span-12',
@@ -511,30 +915,41 @@ export function DashboardView({
             small: 'lg:col-span-4'
           }[widget.width];
 
+          // Per-widget grid-cell modifiers:
+          //  NODE_LIST    — height-matching trick (min-h-0 + overflow-hidden +
+          //                 h-full) so NODE_DETAILS drives the row height and
+          //                 the list scrolls internally. lg:max-h-screen is a
+          //                 safety net for pathologically tall details panels.
+          //  NODE_DETAILS — row-span-2 so it spans both the STATS row above
+          //                 and the NODE_LIST row below, sitting flush with
+          //                 the top of the overview cards.
+          const cellModifiers = (() => {
+            if (widget.type === 'NODE_LIST') return 'min-h-0 overflow-hidden h-full lg:max-h-screen';
+            if (widget.type === 'NODE_DETAILS') return 'lg:row-span-2';
+            return '';
+          })();
+
           return (
-            <div key={widget.id} className={colSpan}>
+            <div key={widget.id} className={cn(colSpan, cellModifiers)}>
               {widget.type === 'STATS' && (
-                 <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                // Three overview cards (Nodes Online / Total Messages /
+                // Favorites). The Environment card was retired — average
+                // temperature across the mesh wasn't actionable and the live
+                // env data already surfaces on the Node Info panel per node.
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                   <StatCard label="Nodes Online" value={`${stats.offline + stats.online}`} subValue={`${stats.online} Active`} icon={<Wifi size={20} className="text-brand-accent"/>} />
                   <StatCard label="Total Messages" value={`${messages.length}`} subValue="Last hour" icon={<MessageSquare size={20} className="text-blue-400"/>} />
                   <StatCard label="Favorites" value={`${stats.favorites}`} subValue="Prioritized" icon={<Star size={20} className="text-yellow-400"/>} />
-                  <StatCard 
-                    label="Environment" 
-                    value={nodes.some(n => n.sensors?.temperature) 
-                      ? unitSystem === 'METRIC' 
-                        ? `${(nodes.filter(n => n.sensors?.temperature).reduce((acc, n) => acc + n.sensors!.temperature!, 0) / nodes.filter(n => n.sensors?.temperature).length).toFixed(1)}°C`
-                        : `${((nodes.filter(n => n.sensors?.temperature).reduce((acc, n) => acc + n.sensors!.temperature!, 0) / nodes.filter(n => n.sensors?.temperature).length) * 9/5 + 32).toFixed(1)}°F` 
-                      : "N/A"} 
-                    subValue={nodes.some(n => n.sensors?.humidity)
-                      ? `Humidity ${(nodes.filter(n => n.sensors?.humidity).reduce((acc, n) => acc + n.sensors!.humidity!, 0) / nodes.filter(n => n.sensors?.humidity).length).toFixed(0)}%`
-                      : "No Data"} 
-                    icon={<Activity size={20} className="text-purple-400"/>} 
-                  />
                 </div>
               )}
 
               {widget.type === 'NODE_LIST' && (
-                <div className="technical-panel h-full flex flex-col min-h-0 max-h-[70vh] relative">
+                // h-full + flex-col so the panel fills the grid cell whose
+                // height comes from NODE_DETAILS. The min-h-0 + overflow-hidden
+                // on the OUTER grid cell (set up above via nodeListClasses)
+                // is what actually makes this work — the cell can shrink
+                // below its content height, so NODE_DETAILS drives the row.
+                <div className="technical-panel h-full flex flex-col min-h-0">
                   <div className="p-4 border-b border-brand-line flex items-center justify-between flex-shrink-0">
                     <h3 className="font-bold flex items-center gap-2 text-xs uppercase tracking-widest text-brand-muted">
                       Active Network Peers
@@ -721,7 +1136,17 @@ export function DashboardView({
               )}
 
               {widget.type === 'NODE_DETAILS' && (
-                <div className="technical-panel p-4 h-full">
+                <div className="technical-panel h-full flex flex-col">
+                  {/* "NODE INFO" label — matches the typographic treatment of
+                      "NETWORK OVERVIEW" / "ACTIVE NETWORK PEERS" so the panel
+                      reads as a peer to the two stacked panels on its left. */}
+                  <div className="px-4 pt-4 pb-2 border-b border-brand-line">
+                    <h3 className="text-base font-bold tracking-tight uppercase">Node Info</h3>
+                    <p className="text-[10px] text-brand-muted mono-text uppercase tracking-widest mt-0.5">
+                      {selectedNode ? 'Selected node detail' : 'Select a node from the list'}
+                    </p>
+                  </div>
+                  <div className="flex-1 overflow-y-auto p-4">
                   {selectedNode ? (
                     <div className="space-y-6">
                       <div className="flex items-start justify-between gap-2">
@@ -780,55 +1205,9 @@ export function DashboardView({
                           )}
                         </div>
                       )}
-                        <div className="grid grid-cols-2 gap-4">
-                          <TelemetryItem icon={<Signal size={14}/>} label="RSSI" value={`${selectedNode.telemetry?.rssi} dBm`} />
-                          <TelemetryItem icon={<Activity size={14}/>} label="SNR" value={`${selectedNode.telemetry?.snr} dB`} />
-                          {selectedNode.telemetry?.distance && (
-                            <TelemetryItem 
-                              icon={<ArrowsUpFromLine size={14}/>} 
-                              label="Distance" 
-                              value={unitSystem === 'METRIC' 
-                                ? `${selectedNode.telemetry.distance.toFixed(2)} km` 
-                                : `${(selectedNode.telemetry.distance * 0.621371).toFixed(2)} mi`
-                              } 
-                            />
-                          )}
-                          {selectedNode.position?.alt && (
-                            <TelemetryItem 
-                              icon={<Compass size={14}/>} 
-                              label="Altitude" 
-                              value={unitSystem === 'METRIC' 
-                                ? `${selectedNode.position.alt.toFixed(0)} m` 
-                                : `${(selectedNode.position.alt * 3.28084).toFixed(0)} ft`
-                              } 
-                            />
-                          )}
-                        </div>
-                      <div className="space-y-2">
-                        <p className="text-[10px] text-brand-muted uppercase font-bold tracking-widest">Location Data</p>
-                        <div className="p-3 bg-brand-line/30 rounded border border-brand-line mono-text space-y-1 text-[10px]">
-                          <p className="flex justify-between"><span>LAT:</span> <span className="text-brand-ink">{selectedNode.position?.lat.toFixed(6)}</span></p>
-                          <p className="flex justify-between"><span>LNG:</span> <span className="text-brand-ink">{selectedNode.position?.lng.toFixed(6)}</span></p>
-                        </div>
-                      </div>
-
-                      {/* Time-series telemetry chart — battery, signal, environment.
-                          Lazy-loaded; recharts is heavy. */}
-                      <React.Suspense fallback={
-                        <div className="h-44 bg-brand-bg/40 rounded border border-brand-line/50 flex items-center justify-center">
-                          <Loader2 size={16} className="animate-spin text-brand-muted" />
-                        </div>
-                      }>
-                        <TelemetryChart nodeId={selectedNode.id} />
-                      </React.Suspense>
-
-                      {/* Per-node uptime / availability stats sourced from the
-                          `node_sessions` table. Not all nodes have enough history
-                          to show meaningful peak hours yet — the widget gracefully
-                          degrades when we have no observations in the window. */}
-                      <NodeUptimeWidget
-                        nodeId={selectedNode.id}
-                        currentlyOnline={selectedNode.online}
+                      <NodeDetailSections
+                        node={selectedNode}
+                        unitSystem={unitSystem}
                         dataSource={dataSource}
                       />
                     </div>
@@ -838,40 +1217,12 @@ export function DashboardView({
                       <p className="text-xs">Select node to view data</p>
                     </div>
                   )}
-                </div>
-              )}
-
-              {widget.type === 'MESSAGES' && (
-                <div className="technical-panel h-[360px] flex flex-col">
-                  <div className="p-4 border-b border-brand-line">
-                    <h3 className="text-xs font-bold uppercase tracking-widest text-brand-muted flex items-center gap-2">
-                      <MessageSquare size={14} /> Recent Network Traffic
-                    </h3>
-                  </div>
-                  <div className="flex-1 overflow-y-auto p-4 space-y-3">
-                    {messages.slice(-10).reverse().map(m => (
-                      <div key={m.id} className="text-[10px]">
-                        <div className="flex justify-between text-brand-muted mb-0.5">
-                          <span className="font-bold">{nodes.find(n => n.id === m.from)?.name || m.from}</span>
-                          <span>{new Date(m.timestamp).toLocaleTimeString()}</span>
-                        </div>
-                        <div className="p-2 bg-brand-line/20 rounded border border-brand-line italic">
-                          {m.text}
-                        </div>
-                      </div>
-                    ))}
                   </div>
                 </div>
               )}
 
               {widget.type === 'MAP' && (
                 <DashboardMapWidget nodes={nodes} />
-              )}
-
-              {widget.type === 'SENSOR_DATA' && (
-                <div className="technical-panel p-4 h-full">
-                  <SensorWidget node={selectedNode || null} allNodes={nodes} unitSystem={unitSystem} />
-                </div>
               )}
             </div>
           );

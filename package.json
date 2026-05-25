@@ -1,6 +1,7 @@
 {
   "name": "meshview-sentinel",
-  "version": "1.0.0rc1",
+  "_versionNote": "Canonical version lives in .env (SYSTEM_VERSION). This field is npm metadata only and is not displayed or referenced by the app.",
+  "version": "0.0.0",
   "description": "Web dashboard, control center, and diagnostic tool for Meshtastic LoRa mesh networks. Personal open-source project; not affiliated with any employer.",
   "license": "MIT",
   "author": {

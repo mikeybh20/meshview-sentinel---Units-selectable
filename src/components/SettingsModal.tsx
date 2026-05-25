@@ -3,16 +3,17 @@ import { motion } from 'motion/react';
 import {
   X, Wifi, Bell, Globe, FileDown, FileUp, Bot, Plug, AlertCircle,
   Check, Loader2, Eye, EyeOff, Radio, Ban, Undo2, Network, RefreshCw,
-  HelpCircle, ChevronDown, Activity,
+  HelpCircle, ChevronDown, Activity, Mail, HardDrive, Database, BookOpen,
+  Copy, Download, Cpu,
 } from 'lucide-react';
 
-import { meshDataService, TransportInfo } from '../services/meshDataService';
+import { meshDataService, TransportInfo, DataSource } from '../services/meshDataService';
 import { LocalModuleConfigSnapshot, Node, UnitSystem } from '../types';
 import { cn } from '../lib/utils';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
-type SectionKey = 'connection' | 'modules' | 'notifications' | 'display' | 'blocked' | 'data' | 'ai';
+type SectionKey = 'connection' | 'mode' | 'modules' | 'notifications' | 'display' | 'blocked' | 'data' | 'disk' | 'guide' | 'jetson' | 'ai' | 'bbs';
 
 interface SectionDef {
   key: SectionKey;
@@ -22,12 +23,17 @@ interface SectionDef {
 
 const SECTIONS: SectionDef[] = [
   { key: 'connection',    label: 'Connection',    icon: <Wifi size={14} /> },
+  { key: 'mode',          label: 'Mode',          icon: <Radio size={14} /> },
   { key: 'modules',       label: 'Modules',       icon: <Network size={14} /> },
   { key: 'notifications', label: 'Notifications', icon: <Bell size={14} /> },
   { key: 'display',       label: 'Display',       icon: <Globe size={14} /> },
   { key: 'blocked',       label: 'Blocked',       icon: <Ban size={14} /> },
   { key: 'data',          label: 'Data',          icon: <FileDown size={14} /> },
+  { key: 'disk',          label: 'Disk',          icon: <HardDrive size={14} /> },
+  { key: 'bbs',           label: 'BBS',           icon: <Mail size={14} /> },
   { key: 'ai',            label: 'AI',            icon: <Bot size={14} /> },
+  { key: 'guide',         label: 'Install Guide', icon: <BookOpen size={14} /> },
+  { key: 'jetson',        label: 'Jetson Nano',   icon: <Cpu size={14} /> },
 ];
 
 interface SettingsModalProps {
@@ -63,6 +69,10 @@ interface SettingsModalProps {
   // Modules section (also reuses `radioConnected` declared above)
   /** Current authoritative module config (undefined fields mean "not yet read"). */
   localModuleConfig: LocalModuleConfigSnapshot;
+
+  // Mode section
+  dataSource: DataSource;
+  setDataSource: (v: DataSource) => void;
 }
 
 export function SettingsModal(props: SettingsModalProps) {
@@ -122,8 +132,13 @@ export function SettingsModal(props: SettingsModalProps) {
             {active === 'notifications' && <NotificationsSection {...props} />}
             {active === 'display'       && <DisplaySection {...props} />}
             {active === 'blocked'       && <BlockedSection {...props} />}
+            {active === 'mode'          && <ModeSection {...props} />}
             {active === 'data'          && <DataSection {...props} />}
+            {active === 'disk'          && <DiskSection />}
+            {active === 'bbs'           && <BbsSection />}
             {active === 'ai'            && <AiSection />}
+            {active === 'guide'         && <InstallGuideSection />}
+            {active === 'jetson'        && <JetsonGuideSection />}
           </div>
         </div>
       </motion.div>
@@ -536,6 +551,7 @@ function DataSection({ onOpenExport, onOpenImport, onClose }: SettingsModalProps
 type AIProvider = 'anthropic' | 'gemini' | 'ollama';
 
 interface AIConfig {
+  enabled: boolean;
   provider: AIProvider;
   anthropicModel: string;
   geminiModel: string;
@@ -565,6 +581,860 @@ function formatOllamaModelLabel(m: OllamaModelInfo): string {
   return parts.join(' · ');
 }
 
+// ----------------------------------------------------------------------------
+// BBS section — enable/disable + triggers + caps + home ZIP for weather alerts.
+// ----------------------------------------------------------------------------
+
+// ----------------------------------------------------------------------------
+// Mode section — switch between LIVE radio and SIMULATOR (demo) data.
+// ----------------------------------------------------------------------------
+
+function ModeSection({ dataSource, setDataSource, radioConnected, transport }: SettingsModalProps) {
+  const isLive = dataSource === 'live';
+  return (
+    <div className="space-y-5 max-w-2xl">
+      <div>
+        <h3 className="text-base font-bold tracking-tight uppercase flex items-center gap-2">
+          <Radio size={16} className="text-brand-accent" />
+          Data Source
+        </h3>
+        <p className="text-xs text-brand-muted leading-snug mt-1">
+          Choose what populates the dashboard. <strong>Live</strong> draws from your attached
+          Meshtastic radio (USB or TCP). <strong>Simulator</strong> generates synthetic mesh
+          traffic for demos and UI testing; nothing is transmitted on-air. Defaults to Live.
+        </p>
+      </div>
+
+      {/* Two-card layout — click either card to switch modes. */}
+      <div className="grid grid-cols-2 gap-3">
+        <button
+          onClick={() => setDataSource('live')}
+          className={cn(
+            "technical-panel p-4 text-left transition-colors",
+            isLive
+              ? "border-brand-accent/60 bg-brand-accent/10"
+              : "hover:border-brand-line/70 hover:bg-brand-line/20"
+          )}
+        >
+          <div className="flex items-start justify-between gap-2 mb-2">
+            <div className="flex items-center gap-2">
+              <Radio size={16} className={isLive ? "text-brand-accent" : "text-brand-muted"} />
+              <span className="text-sm font-bold uppercase tracking-tight">Live</span>
+            </div>
+            {isLive && (
+              <span className="text-[9px] mono-text uppercase tracking-widest px-1.5 py-0.5 rounded-full bg-brand-accent/20 text-brand-accent">
+                Active
+              </span>
+            )}
+          </div>
+          <p className="text-[11px] text-brand-muted leading-snug mb-2">
+            Real radio over USB or TCP. Default mode for production use.
+          </p>
+          <div className="text-[10px] mono-text">
+            <span className={radioConnected ? "text-brand-accent" : "text-brand-warning"}>
+              {radioConnected
+                ? (transport?.mode === 'tcp' && transport.tcp
+                    ? `Connected · ${transport.tcp.host}:${transport.tcp.port}`
+                  : transport?.mode === 'serial' && transport.serial
+                    ? `Connected · ${transport.serial.port}`
+                  : 'Connected')
+                : 'No radio detected'}
+            </span>
+          </div>
+        </button>
+
+        <button
+          onClick={() => setDataSource('simulator')}
+          className={cn(
+            "technical-panel p-4 text-left transition-colors",
+            !isLive
+              ? "border-brand-warning/60 bg-brand-warning/10"
+              : "hover:border-brand-line/70 hover:bg-brand-line/20"
+          )}
+        >
+          <div className="flex items-start justify-between gap-2 mb-2">
+            <div className="flex items-center gap-2">
+              <Activity size={16} className={!isLive ? "text-brand-warning" : "text-brand-muted"} />
+              <span className="text-sm font-bold uppercase tracking-tight">Simulator</span>
+            </div>
+            {!isLive && (
+              <span className="text-[9px] mono-text uppercase tracking-widest px-1.5 py-0.5 rounded-full bg-brand-warning/20 text-brand-warning">
+                Active
+              </span>
+            )}
+          </div>
+          <p className="text-[11px] text-brand-muted leading-snug mb-2">
+            Synthetic mesh data for demos and UI work. Nothing on the air.
+          </p>
+          <div className="text-[10px] mono-text text-brand-muted">
+            ~50 nodes · scripted topology
+          </div>
+        </button>
+      </div>
+
+      <div className="text-[10px] text-brand-muted leading-snug px-1">
+        The mode you choose persists across reloads. The sidebar radio badge remains visible in
+        either mode and shows the current state at a glance — green for connected Live, amber
+        for Simulator, red for Live without a connected radio.
+      </div>
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------
+// Installation Guide section — embedded markdown + Copy/Download (moved here
+// from the main nav per operator request; the main page no longer carries it).
+// ----------------------------------------------------------------------------
+
+/**
+ * Reusable markdown-guide panel. Used by both the general Installation Guide
+ * and the platform-specific (Jetson Nano) guide. Each consumer provides a
+ * title, description, icon, lazy content loader, and the download filename;
+ * everything else (Copy / Download buttons, terminal-styled viewer) is shared.
+ */
+function MarkdownGuide({
+  title,
+  description,
+  icon,
+  loadContent,
+  downloadFilename,
+  displayFilename,
+}: {
+  title: string;
+  description: string;
+  icon: React.ReactNode;
+  loadContent: () => Promise<string>;
+  downloadFilename: string;
+  displayFilename: string;
+}) {
+  const [copied, setCopied] = React.useState(false);
+  const [content, setContent] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    loadContent().then(c => { if (!cancelled) setContent(c); });
+    return () => { cancelled = true; };
+  }, [loadContent]);
+
+  const handleCopy = async () => {
+    if (!content) return;
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch { /* clipboard unavailable */ }
+  };
+
+  const handleDownload = () => {
+    if (!content) return;
+    const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = downloadFilename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <div className="space-y-4 max-w-3xl">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h3 className="text-base font-bold tracking-tight uppercase flex items-center gap-2">
+            {icon}
+            {title}
+          </h3>
+          <p className="text-xs text-brand-muted leading-snug mt-1">{description}</p>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            onClick={handleCopy}
+            disabled={!content}
+            className="flex items-center gap-2 px-3 py-1.5 rounded border border-brand-line bg-brand-line/10 hover:bg-brand-line/30 text-[10px] font-bold uppercase tracking-widest disabled:opacity-40"
+            title="Copy markdown source to clipboard"
+          >
+            {copied ? <Check size={12} className="text-brand-accent" /> : <Copy size={12} />}
+            {copied ? 'Copied' : 'Copy Source'}
+          </button>
+          <button
+            onClick={handleDownload}
+            disabled={!content}
+            className="flex items-center gap-2 px-3 py-1.5 rounded bg-brand-accent text-black hover:brightness-110 text-[10px] font-bold uppercase tracking-widest disabled:opacity-40"
+            title="Download as .md file"
+          >
+            <Download size={12} />
+            Download MD
+          </button>
+        </div>
+      </div>
+
+      <div className="technical-panel overflow-hidden">
+        <div className="flex items-center gap-2 px-3 py-1.5 bg-brand-line/30 border-b border-brand-line">
+          <div className="w-2 h-2 rounded-full bg-brand-error/40" />
+          <div className="w-2 h-2 rounded-full bg-brand-warning/40" />
+          <div className="w-2 h-2 rounded-full bg-brand-accent/40" />
+          <span className="ml-2 text-[10px] mono-text text-brand-muted uppercase">{displayFilename}</span>
+        </div>
+        <div className="max-h-[60vh] overflow-y-auto p-4 bg-brand-bg/40">
+          {!content ? (
+            <div className="flex items-center gap-2 text-xs text-brand-muted">
+              <Loader2 size={14} className="animate-spin" /> Loading guide…
+            </div>
+          ) : (
+            <pre className="text-[11px] mono-text text-brand-ink whitespace-pre-wrap leading-relaxed">
+              {content}
+            </pre>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function InstallGuideSection() {
+  return (
+    <MarkdownGuide
+      title="Installation Guide"
+      description="Step-by-step deployment recipe — gateway prep, install, dashboard tour, BBS configuration, troubleshooting. Copy the markdown source or download the file for offline reference."
+      icon={<BookOpen size={16} className="text-brand-accent" />}
+      loadContent={async () => {
+        const m = await import('../constants/installationGuide');
+        return m.INSTALLATION_GUIDE_DELL_GB10;
+      }}
+      downloadFilename="MeshView-Sentinel-Installation-Guide.md"
+      displayFilename="install-guide.md"
+    />
+  );
+}
+
+function JetsonGuideSection() {
+  return (
+    <MarkdownGuide
+      title="Jetson Nano Deployment"
+      description="Considerations for running Sentinel on a Jetson Nano 2GB — RAM budget, microSD wear vs. SSD recommendations, pre-deployment checklist, and common gotchas specific to the Jetson platform."
+      icon={<Cpu size={16} className="text-brand-accent" />}
+      loadContent={async () => {
+        const m = await import('../constants/jetsonNanoGuide');
+        return m.JETSON_NANO_GUIDE;
+      }}
+      downloadFilename="MeshView-Sentinel-Jetson-Nano-Guide.md"
+      displayFilename="jetson-nano.md"
+    />
+  );
+}
+
+// ----------------------------------------------------------------------------
+// Disk section — per-table inventory + on-disk file size + VACUUM trigger.
+// ----------------------------------------------------------------------------
+
+interface DiskTableRow {
+  table: string;
+  rows: number;
+  oldest: number | null;
+  newest: number | null;
+  retention: string;
+}
+
+interface DiskStats {
+  dbPath: string;
+  onDisk: { main: number; wal: number; shm: number; total: number };
+  logicalBytes: number;
+  tables: DiskTableRow[];
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)} MB`;
+  return `${(n / 1024 ** 3).toFixed(2)} GB`;
+}
+
+function formatTs(ts: number | null): string {
+  if (!ts) return '—';
+  const d = new Date(ts);
+  return d.toLocaleString([], { month: 'numeric', day: 'numeric', year: '2-digit', hour: 'numeric', minute: '2-digit' });
+}
+
+function DiskSection() {
+  const [stats, setStats] = React.useState<DiskStats | null>(null);
+  const [loading, setLoading] = React.useState(true);
+  const [error, setError] = React.useState('');
+  const [vacuuming, setVacuuming] = React.useState(false);
+  const [vacuumResult, setVacuumResult] = React.useState<string | null>(null);
+
+  const refresh = React.useCallback(async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/db/disk`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data: DiskStats = await res.json();
+      setStats(data);
+    } catch (err: any) {
+      setError(err?.message || 'Failed to load disk stats');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    refresh();
+    // Auto-refresh every 30s so the panel stays current while open without
+    // hammering the endpoint.
+    const t = setInterval(refresh, 30_000);
+    return () => clearInterval(t);
+  }, [refresh]);
+
+  const handleVacuum = async () => {
+    if (!confirm(
+      'VACUUM rewrites the entire database to reclaim space from deleted rows.\n\n'
+      + 'This can take several seconds on a large DB and pauses all reads/writes '
+      + 'during execution. Continue?'
+    )) return;
+    setVacuuming(true);
+    setVacuumResult(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/db/vacuum`, { method: 'POST' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const r = await res.json() as { freedBytes: number; finalBytes: number };
+      setVacuumResult(`Reclaimed ${formatBytes(r.freedBytes)} — DB now ${formatBytes(r.finalBytes)}`);
+      await refresh();
+    } catch (err: any) {
+      setVacuumResult(`VACUUM failed: ${err?.message || 'unknown error'}`);
+    } finally {
+      setVacuuming(false);
+    }
+  };
+
+  if (loading && !stats) {
+    return (
+      <div className="flex items-center gap-2 text-sm text-brand-muted">
+        <Loader2 size={14} className="animate-spin" /> Loading disk stats…
+      </div>
+    );
+  }
+
+  if (!stats) {
+    return (
+      <div className="text-sm text-brand-error">
+        Failed to load disk stats{error ? `: ${error}` : '.'}
+        <button onClick={refresh} className="ml-2 underline text-brand-accent">Retry</button>
+      </div>
+    );
+  }
+
+  const totalRows = stats.tables.reduce((s, t) => s + t.rows, 0);
+
+  return (
+    <div className="space-y-5 max-w-3xl">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <h3 className="text-base font-bold tracking-tight uppercase flex items-center gap-2">
+            <HardDrive size={16} className="text-brand-accent" />
+            Disk Usage
+          </h3>
+          <p className="text-xs text-brand-muted leading-snug mt-1">
+            Per-table row counts, retention policies, and on-disk footprint for{' '}
+            <code className="text-brand-accent">{stats.dbPath}</code>.
+          </p>
+        </div>
+        <button
+          onClick={refresh}
+          disabled={loading}
+          className="flex items-center gap-2 px-3 py-1.5 text-[10px] font-bold uppercase tracking-widest text-brand-muted hover:text-brand-accent border border-brand-line hover:border-brand-accent/50 rounded transition-colors"
+        >
+          <RefreshCw size={11} className={cn(loading && 'animate-spin')} />
+          Refresh
+        </button>
+      </div>
+
+      {/* On-disk summary */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+        <SummaryTile label="On-disk total" value={formatBytes(stats.onDisk.total)} hint="mesh.sqlite + WAL + shm" />
+        <SummaryTile label="Logical size"  value={formatBytes(stats.logicalBytes)} hint="After VACUUM" />
+        <SummaryTile label="Total rows"    value={totalRows.toLocaleString()} hint="Across all tables" />
+        <SummaryTile label="Tables"        value={String(stats.tables.length)} hint="Tracked persistently" />
+      </div>
+
+      {/* File-level breakdown */}
+      <div className="technical-panel p-3 space-y-1.5 text-xs">
+        <div className="flex items-baseline justify-between">
+          <span className="text-brand-muted mono-text">mesh.sqlite (main file)</span>
+          <span className="mono-text">{formatBytes(stats.onDisk.main)}</span>
+        </div>
+        <div className="flex items-baseline justify-between">
+          <span className="text-brand-muted mono-text">mesh.sqlite-wal (write-ahead log)</span>
+          <span className="mono-text">{formatBytes(stats.onDisk.wal)}</span>
+        </div>
+        <div className="flex items-baseline justify-between">
+          <span className="text-brand-muted mono-text">mesh.sqlite-shm (shared memory)</span>
+          <span className="mono-text">{formatBytes(stats.onDisk.shm)}</span>
+        </div>
+      </div>
+
+      {/* Per-table inventory */}
+      <div className="space-y-2">
+        <h4 className="text-xs font-bold uppercase tracking-widest text-brand-muted flex items-center gap-2">
+          <Database size={11} /> Tables
+        </h4>
+        <div className="technical-panel overflow-hidden">
+          {/* Header */}
+          <div className="grid grid-cols-[1.4fr_auto_1.2fr_1.4fr] gap-3 px-3 py-2 border-b border-brand-line bg-brand-line/30 text-[10px] uppercase font-bold tracking-widest text-brand-muted">
+            <span>Table</span>
+            <span className="text-right w-16">Rows</span>
+            <span>Oldest → Newest</span>
+            <span>Retention</span>
+          </div>
+          {stats.tables.map(t => (
+            <div
+              key={t.table}
+              className="grid grid-cols-[1.4fr_auto_1.2fr_1.4fr] gap-3 px-3 py-1.5 border-b border-brand-line/40 last:border-b-0 text-[11px] hover:bg-brand-line/20 transition-colors"
+            >
+              <span className="mono-text font-bold text-brand-ink truncate">{t.table}</span>
+              <span className={cn(
+                'text-right w-16 mono-text',
+                t.rows === 0 ? 'text-brand-muted' : 'text-brand-ink'
+              )}>
+                {t.rows.toLocaleString()}
+              </span>
+              <span className="text-brand-muted mono-text text-[10px] truncate">
+                {t.oldest && t.newest
+                  ? `${formatTs(t.oldest)} → ${formatTs(t.newest)}`
+                  : t.newest ? formatTs(t.newest) : '—'}
+              </span>
+              <span className="text-brand-muted text-[10px] leading-snug">
+                {t.retention}
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Maintenance: VACUUM */}
+      <div className="technical-panel p-4 space-y-2">
+        <h4 className="text-xs font-bold uppercase tracking-widest text-brand-muted">Maintenance</h4>
+        <p className="text-[11px] text-brand-muted leading-snug">
+          SQLite reuses freed pages automatically but doesn't shrink the file. When the on-disk
+          total is much larger than the logical size, a VACUUM rewrites the database compactly to
+          reclaim the difference. Safe to run; expect a brief pause (seconds on a normal-sized DB).
+        </p>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={handleVacuum}
+            disabled={vacuuming}
+            className="flex items-center gap-2 bg-brand-accent text-black px-3 py-1.5 rounded text-[10px] font-bold uppercase tracking-widest hover:brightness-110 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {vacuuming ? <Loader2 size={12} className="animate-spin" /> : <Database size={12} />}
+            {vacuuming ? 'Vacuuming…' : 'VACUUM Now'}
+          </button>
+          {vacuumResult && (
+            <span className="text-[11px] text-brand-accent flex items-center gap-1.5">
+              <Check size={12} /> {vacuumResult}
+            </span>
+          )}
+        </div>
+      </div>
+
+      <p className="text-[10px] text-brand-muted leading-snug">
+        The Disk panel polls every 30 seconds while open. All listed tables are auto-pruned by the
+        5-minute retention loop (see the Recipe Guide → Disk retention section for the full policy).
+        Docker stdout logs aren't shown here — they're capped separately by the{' '}
+        <code className="text-brand-accent">logging:</code> block in <code className="text-brand-accent">docker-compose.yml</code>.
+      </p>
+    </div>
+  );
+}
+
+function SummaryTile({ label, value, hint }: { label: string; value: string; hint?: string }) {
+  return (
+    <div className="technical-panel p-3">
+      <p className="text-[9px] uppercase font-bold tracking-widest text-brand-muted">{label}</p>
+      <p className="text-base font-bold mono-text text-brand-ink mt-1">{value}</p>
+      {hint && <p className="text-[9px] text-brand-muted mt-0.5">{hint}</p>}
+    </div>
+  );
+}
+
+interface BbsConfigShape {
+  enabled: boolean;
+  mailTrigger: string;
+  weatherTrigger: string;
+  bodyMaxChars: number;
+  retentionDays: number;
+  replyPaceMs: number;
+  homeZipCode: string;
+}
+
+function BbsSection() {
+  const [cfg, setCfg] = React.useState<BbsConfigShape | null>(null);
+  const [loading, setLoading] = React.useState(true);
+  const [saving, setSaving] = React.useState(false);
+  const [saved, setSaved] = React.useState(false);
+  const [error, setError] = React.useState('');
+
+  React.useEffect(() => {
+    fetch(`${API_BASE}/api/mesh/bbs/config`)
+      .then(r => r.json())
+      .then((c: BbsConfigShape) => setCfg(c))
+      .catch(err => setError(err?.message || 'Failed to load BBS config'))
+      .finally(() => setLoading(false));
+  }, []);
+
+  const update = <K extends keyof BbsConfigShape>(key: K, val: BbsConfigShape[K]) => {
+    setCfg(prev => prev ? { ...prev, [key]: val } : prev);
+  };
+
+  // Trigger validation: must start with `:`, 2-16 chars, lowercase alnum/-/_.
+  const validateTrigger = (t: string): string | null => {
+    if (!t.startsWith(':')) return 'Must start with ":"';
+    if (t.length < 2 || t.length > 16) return '2-16 characters';
+    if (!/^:[a-z0-9_-]+$/.test(t)) return 'Lowercase letters, digits, - or _ only';
+    return null;
+  };
+
+  const mailErr = cfg ? validateTrigger(cfg.mailTrigger) : null;
+  const weatherErr = cfg ? validateTrigger(cfg.weatherTrigger) : null;
+  const triggersIdentical = cfg ? cfg.mailTrigger === cfg.weatherTrigger : false;
+  const zipErr = cfg && cfg.homeZipCode && !/^\d{5}$/.test(cfg.homeZipCode)
+    ? 'Must be exactly 5 digits (or empty)'
+    : null;
+
+  const canSave = cfg && !mailErr && !weatherErr && !triggersIdentical && !zipErr;
+
+  const handleSave = async () => {
+    if (!cfg || !canSave) return;
+    setSaving(true);
+    setError('');
+    setSaved(false);
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/bbs/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(cfg),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || `HTTP ${res.status}`);
+      }
+      const body = await res.json() as { config: BbsConfigShape };
+      setCfg(body.config); // server may have normalized values
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2_000);
+    } catch (err: any) {
+      setError(err?.message || 'Save failed');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center gap-2 text-sm text-brand-muted">
+        <Loader2 size={14} className="animate-spin" />
+        Loading BBS configuration…
+      </div>
+    );
+  }
+
+  if (!cfg) {
+    return (
+      <div className="text-sm text-brand-error">
+        Failed to load BBS configuration{error ? `: ${error}` : '.'}
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6 max-w-2xl">
+      <div>
+        <h3 className="text-base font-bold tracking-tight uppercase">BBS Mail &amp; Weather</h3>
+        <p className="text-xs text-brand-muted leading-snug mt-1">
+          Configure the bulletin-board state machine that handles inbound <code className="text-brand-accent">:</code>-prefixed
+          DMs to your local node. Trigger keywords are matched case-insensitively. All changes apply immediately —
+          no radio restart needed.
+        </p>
+      </div>
+
+      {/* Master switch */}
+      <div className="technical-panel p-4 space-y-3">
+        <label className="flex items-center gap-3 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={cfg.enabled}
+            onChange={e => update('enabled', e.target.checked)}
+            className="w-4 h-4 accent-brand-accent"
+          />
+          <div>
+            <div className="text-sm font-bold uppercase tracking-tight">BBS Enabled</div>
+            <div className="text-[10px] text-brand-muted mt-0.5">
+              When off, all BBS triggers are ignored and incoming :mail / :weather DMs flow through to the normal message log.
+            </div>
+          </div>
+        </label>
+      </div>
+
+      {/* Triggers */}
+      <div className="space-y-3">
+        <h4 className="text-xs font-bold uppercase tracking-widest text-brand-muted">Trigger Keywords</h4>
+        <div className="grid grid-cols-2 gap-3">
+          <div className="space-y-1">
+            <label className="text-[10px] uppercase font-bold tracking-widest text-brand-muted">Mail trigger</label>
+            <input
+              type="text"
+              value={cfg.mailTrigger}
+              onChange={e => update('mailTrigger', e.target.value.toLowerCase())}
+              placeholder=":mail"
+              className={cn(
+                "w-full bg-brand-line/50 border rounded px-2 py-1.5 text-sm mono-text focus:outline-none",
+                mailErr ? "border-brand-error" : "border-brand-line focus:border-brand-accent"
+              )}
+            />
+            {mailErr && <div className="text-[10px] text-brand-error">{mailErr}</div>}
+          </div>
+          <div className="space-y-1">
+            <label className="text-[10px] uppercase font-bold tracking-widest text-brand-muted">Weather trigger</label>
+            <input
+              type="text"
+              value={cfg.weatherTrigger}
+              onChange={e => update('weatherTrigger', e.target.value.toLowerCase())}
+              placeholder=":weather"
+              className={cn(
+                "w-full bg-brand-line/50 border rounded px-2 py-1.5 text-sm mono-text focus:outline-none",
+                weatherErr ? "border-brand-error" : "border-brand-line focus:border-brand-accent"
+              )}
+            />
+            {weatherErr && <div className="text-[10px] text-brand-error">{weatherErr}</div>}
+          </div>
+        </div>
+        {triggersIdentical && (
+          <div className="text-[11px] text-brand-error flex items-center gap-1.5">
+            <AlertCircle size={11} /> Mail and weather triggers must be different.
+          </div>
+        )}
+      </div>
+
+      {/* Limits */}
+      <div className="space-y-3">
+        <h4 className="text-xs font-bold uppercase tracking-widest text-brand-muted">Limits</h4>
+        <div className="grid grid-cols-3 gap-3">
+          <NumberInput
+            label="Body cap (chars)"
+            value={cfg.bodyMaxChars}
+            min={50}
+            max={228}
+            onChange={v => update('bodyMaxChars', v)}
+            hint="50-228 (default 200)"
+          />
+          <NumberInput
+            label="Retention (days)"
+            value={cfg.retentionDays}
+            min={1}
+            max={365}
+            onChange={v => update('retentionDays', v)}
+            hint="1-365 (default 30)"
+          />
+          <NumberInput
+            label="Reply pace (ms)"
+            value={cfg.replyPaceMs}
+            min={0}
+            max={10_000}
+            step={100}
+            onChange={v => update('replyPaceMs', v)}
+            hint="0-10000 (default 2000)"
+          />
+        </div>
+      </div>
+
+      {/* Home ZIP + weather */}
+      <div className="space-y-3">
+        <h4 className="text-xs font-bold uppercase tracking-widest text-brand-muted">Home Weather Alerts</h4>
+        <div className="space-y-1">
+          <label className="text-[10px] uppercase font-bold tracking-widest text-brand-muted">Home ZIP code</label>
+          <input
+            type="text"
+            value={cfg.homeZipCode}
+            onChange={e => update('homeZipCode', e.target.value.replace(/\D/g, '').slice(0, 5))}
+            placeholder="(empty = no alerts)"
+            inputMode="numeric"
+            className={cn(
+              "w-32 bg-brand-line/50 border rounded px-2 py-1.5 text-sm mono-text focus:outline-none",
+              zipErr ? "border-brand-error" : "border-brand-line focus:border-brand-accent"
+            )}
+          />
+          {zipErr && <div className="text-[10px] text-brand-error">{zipErr}</div>}
+          <p className="text-[10px] text-brand-muted leading-snug pt-1">
+            When set, the server polls the National Weather Service every 20 minutes for active alerts
+            (warnings, watches, advisories) at this ZIP. New alerts post to the Event Log as <span className="text-brand-error font-bold">WEATHER_ALERT</span> entries,
+            trigger a browser notification if you've granted permission, AND get pushed to every node that
+            subscribed via <code className="text-brand-accent">:weather subscribe</code>. Leave empty to disable.
+            The on-demand <code className="text-brand-accent">:weather</code> command works regardless.
+          </p>
+        </div>
+      </div>
+
+      <WeatherSubscribers />
+
+      {error && (
+        <div className="px-3 py-2 rounded border border-brand-error/30 bg-brand-error/10 text-xs text-brand-error flex items-start gap-2">
+          <AlertCircle size={12} className="mt-0.5 shrink-0" />
+          {error}
+        </div>
+      )}
+
+      <div className="flex items-center justify-end gap-3 pt-2 border-t border-brand-line">
+        {saved && (
+          <span className="text-xs text-brand-accent flex items-center gap-1.5">
+            <Check size={12} /> Saved
+          </span>
+        )}
+        <button
+          onClick={handleSave}
+          disabled={!canSave || saving}
+          className="bg-brand-accent text-black px-4 py-1.5 rounded text-xs font-bold uppercase tracking-widest hover:brightness-110 transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2"
+        >
+          {saving ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
+          {saving ? 'Saving…' : 'Save BBS Config'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+interface WeatherSubscriber {
+  nodeId: string;
+  subscribedAt: number;
+  channelIndex: number;
+  lastAlertAt: number | null;
+}
+
+/**
+ * Lists nodes that have DM'd `:weather subscribe` and gives the operator a
+ * remove button per row. Subscribers add/remove themselves over the air; this
+ * panel is purely management visibility for the operator.
+ */
+function WeatherSubscribers() {
+  const [subs, setSubs] = React.useState<WeatherSubscriber[]>([]);
+  const [loading, setLoading] = React.useState(true);
+  const [removing, setRemoving] = React.useState<string | null>(null);
+
+  const refresh = React.useCallback(async () => {
+    setLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/bbs/weather/subscribers`);
+      if (!res.ok) return;
+      const body = await res.json() as { subscribers: WeatherSubscriber[] };
+      setSubs(body.subscribers);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    refresh();
+    // Re-fetch on SSE bbsSubscriber events so the panel updates live as
+    // remote nodes subscribe / unsubscribe over the air.
+    const es = new EventSource(`${API_BASE}/api/mesh/stream`);
+    es.addEventListener('bbsSubscriber', () => { refresh(); });
+    return () => es.close();
+  }, [refresh]);
+
+  const handleRemove = async (nodeId: string) => {
+    setRemoving(nodeId);
+    try {
+      await fetch(`${API_BASE}/api/mesh/bbs/weather/subscribers/${encodeURIComponent(nodeId)}`, { method: 'DELETE' });
+      await refresh();
+    } finally {
+      setRemoving(null);
+    }
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-baseline justify-between">
+        <h4 className="text-xs font-bold uppercase tracking-widest text-brand-muted">
+          Subscribers ({subs.length})
+        </h4>
+        <button
+          onClick={refresh}
+          className="text-[10px] mono-text uppercase tracking-widest text-brand-muted hover:text-brand-accent flex items-center gap-1 transition-colors"
+          disabled={loading}
+        >
+          <RefreshCw size={11} className={loading ? 'animate-spin' : ''} />
+          Refresh
+        </button>
+      </div>
+      {subs.length === 0 ? (
+        <p className="text-[11px] text-brand-muted italic">
+          No subscribers yet. Remote nodes can opt in by DMing <code className="text-brand-accent">:weather subscribe</code> to your node.
+        </p>
+      ) : (
+        <div className="border border-brand-line rounded overflow-hidden">
+          {subs.map(s => (
+            <div
+              key={s.nodeId}
+              className="flex items-center gap-2 px-2 py-1.5 text-xs border-b border-brand-line/40 last:border-b-0 hover:bg-brand-line/30 transition-colors"
+            >
+              <span className="mono-text text-brand-ink shrink-0 w-28">{s.nodeId}</span>
+              <span className="mono-text text-[10px] text-brand-muted shrink-0">ch{s.channelIndex}</span>
+              <span className="text-[10px] text-brand-muted flex-1 truncate">
+                subscribed {relTime(s.subscribedAt)}
+                {s.lastAlertAt && ` · last alert ${relTime(s.lastAlertAt)}`}
+              </span>
+              <button
+                onClick={() => handleRemove(s.nodeId)}
+                disabled={removing === s.nodeId}
+                className="text-[10px] mono-text uppercase tracking-widest text-brand-muted hover:text-brand-error transition-colors disabled:opacity-40"
+                title="Remove this subscriber"
+              >
+                {removing === s.nodeId ? '…' : 'Remove'}
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function relTime(ts: number): string {
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86_400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86_400)}d ago`;
+}
+
+function NumberInput({ label, value, min, max, step = 1, onChange, hint }: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step?: number;
+  onChange: (v: number) => void;
+  hint?: string;
+}) {
+  return (
+    <div className="space-y-1">
+      <label className="text-[10px] uppercase font-bold tracking-widest text-brand-muted">{label}</label>
+      <input
+        type="number"
+        value={value}
+        min={min}
+        max={max}
+        step={step}
+        onChange={e => {
+          const n = parseInt(e.target.value, 10);
+          if (Number.isFinite(n)) onChange(Math.max(min, Math.min(max, n)));
+        }}
+        className="w-full bg-brand-line/50 border border-brand-line rounded px-2 py-1.5 text-sm mono-text focus:outline-none focus:border-brand-accent"
+      />
+      {hint && <div className="text-[9px] text-brand-muted mono-text tracking-widest">{hint}</div>}
+    </div>
+  );
+}
+
 function AiSection() {
   const [config, setConfig] = React.useState<AIConfig | null>(null);
   const [loading, setLoading] = React.useState(true);
@@ -589,11 +1459,17 @@ function AiSection() {
   // reach the AI provider.
   const [redactPii, setRedactPii] = React.useState(false);
 
+  // Master switch. Disabled by default on fresh installs; persists immediately
+  // on toggle (no Save needed) so flipping it has instant effect.
+  const [enabled, setEnabled] = React.useState(false);
+  const [togglingEnabled, setTogglingEnabled] = React.useState(false);
+
   React.useEffect(() => {
     fetch(`${API_BASE}/api/ai/config`)
       .then(r => r.json())
       .then((cfg: AIConfig) => {
         setConfig(cfg);
+        setEnabled(!!cfg.enabled);
         setProvider(cfg.provider);
         setOllamaBaseUrl(cfg.ollamaBaseUrl ?? '');
         setOllamaModel(cfg.ollamaModel ?? '');
@@ -602,6 +1478,29 @@ function AiSection() {
       .catch(() => setError('Failed to load AI config'))
       .finally(() => setLoading(false));
   }, []);
+
+  const handleToggleEnabled = async (next: boolean) => {
+    setTogglingEnabled(true);
+    setError('');
+    // Optimistic update — flip locally so the UI feels instant; revert on
+    // failure. The window event signals App.tsx to hide/show the launcher
+    // without waiting for the next config poll.
+    setEnabled(next);
+    try {
+      const res = await fetch(`${API_BASE}/api/ai/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: next }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      window.dispatchEvent(new CustomEvent('mesh:aiEnabledChanged', { detail: { enabled: next } }));
+    } catch (err: any) {
+      setEnabled(!next); // revert
+      setError(err?.message || 'Failed to toggle AI');
+    } finally {
+      setTogglingEnabled(false);
+    }
+  };
 
   const handleTestOllama = async () => {
     setOllamaTesting(true);
@@ -683,6 +1582,37 @@ function AiSection() {
 
   return (
     <div className="space-y-5">
+      {/* Master switch — operator can turn the whole AI feature off without
+          erasing keys / models. Persists on toggle; no Save click needed. */}
+      <div className="technical-panel p-4">
+        <label className="flex items-start gap-3 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={e => handleToggleEnabled(e.target.checked)}
+            disabled={togglingEnabled || loading}
+            className="w-4 h-4 accent-brand-accent mt-0.5"
+          />
+          <div>
+            <div className="text-sm font-bold uppercase tracking-tight flex items-center gap-2">
+              AI Assistant
+              {togglingEnabled && <Loader2 size={11} className="animate-spin text-brand-muted" />}
+              {enabled ? (
+                <span className="text-[9px] mono-text uppercase tracking-widest px-1.5 py-0.5 rounded-full bg-brand-accent/15 text-brand-accent">enabled</span>
+              ) : (
+                <span className="text-[9px] mono-text uppercase tracking-widest px-1.5 py-0.5 rounded-full bg-brand-line text-brand-muted">disabled</span>
+              )}
+            </div>
+            <div className="text-[10px] text-brand-muted leading-snug mt-0.5">
+              When off, the AI launcher is hidden from the dashboard and the
+              <code className="text-brand-accent mx-1">/api/ai/chat</code>
+              endpoint returns 503. Keys, models, and preferences below stay
+              persisted so flipping back on doesn't require re-entering them.
+            </div>
+          </div>
+        </label>
+      </div>
+
       <SectionHeader title="AI Provider" subtitle="API keys are stored server-side and never sent to the browser." />
 
       {loading ? (

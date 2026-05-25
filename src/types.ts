@@ -2,7 +2,13 @@ export type UnitSystem = 'METRIC' | 'IMPERIAL';
 
 export interface WidgetConfig {
   id: string;
-  type: 'STATS' | 'NODE_LIST' | 'NODE_DETAILS' | 'MESSAGES' | 'MAP' | 'SENSOR_DATA';
+  /**
+   * Dashboard widget kinds. MESSAGES and SENSOR_DATA were retired from the
+   * default layout — Messages have their own dedicated nav item (with full
+   * thread management) and sensor data surfaces inline on the Node Details
+   * panel for the currently-selected node.
+   */
+  type: 'STATS' | 'NODE_LIST' | 'NODE_DETAILS' | 'MAP';
   visible: boolean;
   order: number;
   width: 'full' | 'large' | 'medium' | 'small'; // mapping to grid spans
@@ -53,6 +59,8 @@ export interface Node {
   id: string;
   name: string;
   shortName: string;
+  /** Epoch ms of the first packet we ever observed from this node. */
+  firstSeen?: number;
   lastSeen: number;
   online: boolean;
   favorite: boolean;
@@ -69,6 +77,8 @@ export interface Node {
   isLicensed?: boolean;
   /** Meshtastic HardwareModel enum (TBEAM, HELTEC_V3, RAK4631, etc.). */
   hwModel?: number;
+  /** Mesh distance in hops as last reported by the local radio's NodeInfo. */
+  hopsAway?: number;
   /** Last-observed inbound transport ('lora' = direct over RF, 'mqtt' = bridged). */
   lastVia?: 'lora' | 'mqtt';
   settings?: NodeSettings;
@@ -95,7 +105,19 @@ export interface Group {
   color: string;
 }
 
-export type MessageStatus = 'sending' | 'sent' | 'acked' | 'error';
+/**
+ * Outbound-message lifecycle:
+ *   sending — we've created the optimistic bubble; haven't yet written to radio
+ *   sent    — bytes successfully delivered to the radio over USB/TCP
+ *   queued  — local radio confirmed packet sat in its TX queue (QueueStatus res=0).
+ *             For broadcasts this is the terminal positive state (broadcasts get
+ *             no over-the-air ACK by design). For DMs it's an intermediate step;
+ *             the destination's routing ACK will upgrade us to 'acked'.
+ *   acked   — destination peer (or relay) sent a real routing-reply ACK.
+ *             DMs only — broadcasts can never legitimately reach this state.
+ *   error   — TX-queue error, ACK timeout (DM only), or sync write failure.
+ */
+export type MessageStatus = 'sending' | 'sent' | 'queued' | 'acked' | 'error';
 
 export interface Message {
   id: string;
@@ -126,7 +148,7 @@ export interface Message {
 
 export interface RadioEvent {
   id: string;
-  type: 'NODE_JOINED' | 'NODE_LOST' | 'MESSAGE' | 'TELEMETRY' | 'POSITION_UPDATE';
+  type: 'NODE_JOINED' | 'NODE_LOST' | 'MESSAGE' | 'TELEMETRY' | 'POSITION_UPDATE' | 'WEATHER_ALERT';
   nodeId: string;
   timestamp: number;
   details: string;

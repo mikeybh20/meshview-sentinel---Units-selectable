@@ -105,3 +105,149 @@ export function buildChannelShareUrl(channels: Channel[]): string {
   const set = buildChannelSet(channels);
   return `https://meshtastic.org/e/#${toBase64Url(set)}`;
 }
+
+// -------- Inverse: parse a Meshtastic channel-share URL/string --------
+
+function fromBase64Url(input: string): Uint8Array {
+  // Tolerate either base64url ('-_') or standard base64 ('+/') and the
+  // optional '=' padding the spec drops.
+  let s = input.replace(/-/g, '+').replace(/_/g, '/');
+  const pad = s.length % 4;
+  if (pad) s += '='.repeat(4 - pad);
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function readVarint(buf: Uint8Array, off: number): { value: number; bytesRead: number } {
+  let value = 0;
+  let shift = 0;
+  let bytesRead = 0;
+  while (off + bytesRead < buf.length) {
+    const byte = buf[off + bytesRead++];
+    value |= (byte & 0x7f) << shift;
+    if (!(byte & 0x80)) break;
+    shift += 7;
+  }
+  return { value: value >>> 0, bytesRead };
+}
+
+function pskBytesToBase64(bytes: Uint8Array): string {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+/**
+ * Parse a Meshtastic channel-share string (full URL `https://meshtastic.org/e/#...`,
+ * the short form `meshtastic.org/e/#...`, or the bare base64url payload) into
+ * the channel list it encodes. Returns `null` if the input doesn't look like a
+ * channel-share string at all (rather than throwing) so callers can show a
+ * friendly "doesn't look right" message.
+ *
+ * Slot indices are assigned 0..N-1 in the order the URL lists them, matching
+ * the iOS/Android behavior. Role is inferred as PRIMARY for index 0 and
+ * SECONDARY for the rest. The caller is responsible for confirming with the
+ * operator before writing this to the radio — channel imports overwrite the
+ * existing set.
+ */
+export function parseChannelShareUrl(input: string): Channel[] | null {
+  if (!input || typeof input !== 'string') return null;
+  const trimmed = input.trim();
+  // Extract the payload after the `#`. Tolerate full URL, host-only, or raw.
+  let payload: string;
+  if (trimmed.includes('#')) {
+    payload = trimmed.split('#').slice(1).join('#'); // everything after first '#'
+  } else if (/^[A-Za-z0-9_+/=-]+$/.test(trimmed)) {
+    payload = trimmed; // bare base64url body
+  } else {
+    return null;
+  }
+  if (!payload) return null;
+
+  let buf: Uint8Array;
+  try {
+    buf = fromBase64Url(payload);
+  } catch {
+    return null;
+  }
+
+  const channels: Channel[] = [];
+  let off = 0;
+  // ChannelSet: repeated ChannelSettings @ field 1 (length-delimited). lora_config
+  // (field 2) is intentionally ignored — we never want a shared URL to clobber
+  // the receiving radio's regional/modem settings.
+  while (off < buf.length) {
+    const tag = buf[off++];
+    const fieldNumber = tag >> 3;
+    const wireType = tag & 0x07;
+    if (wireType !== 2) {
+      // Unknown wire type at the top level — skip the rest rather than fail.
+      // Most fields we care about are length-delimited.
+      break;
+    }
+    const { value: len, bytesRead } = readVarint(buf, off);
+    off += bytesRead;
+    const sub = buf.subarray(off, off + len);
+    off += len;
+    if (fieldNumber !== 1) continue; // not ChannelSettings — skip
+
+    // Parse ChannelSettings: psk=2, name=3, uplink=5, downlink=6, module_settings=7
+    let name = '';
+    let pskBase64 = '';
+    let uplinkEnabled = true;
+    let downlinkEnabled = true;
+    let positionPrecision: number | undefined;
+    let so = 0;
+    while (so < sub.length) {
+      const sTag = sub[so++];
+      const sFn = sTag >> 3;
+      const sWt = sTag & 0x07;
+      if (sWt === 0) {
+        const { value, bytesRead: sbr } = readVarint(sub, so);
+        so += sbr;
+        if (sFn === 5) uplinkEnabled = !!value;
+        else if (sFn === 6) downlinkEnabled = !!value;
+      } else if (sWt === 2) {
+        const { value: subLen, bytesRead: sbr } = readVarint(sub, so);
+        so += sbr;
+        const inner = sub.subarray(so, so + subLen);
+        so += subLen;
+        if (sFn === 2) pskBase64 = pskBytesToBase64(inner);
+        else if (sFn === 3) name = new TextDecoder().decode(inner);
+        else if (sFn === 7) {
+          // ModuleSettings.position_precision (field 1, varint)
+          let mo = 0;
+          while (mo < inner.length) {
+            const mTag = inner[mo++];
+            const mFn = mTag >> 3;
+            const mWt = mTag & 0x07;
+            if (mWt === 0) {
+              const { value: mv, bytesRead: mbr } = readVarint(inner, mo);
+              mo += mbr;
+              if (mFn === 1) positionPrecision = mv;
+            } else {
+              break;
+            }
+          }
+        }
+      } else {
+        break;
+      }
+    }
+
+    const index = channels.length;
+    channels.push({
+      index,
+      name,
+      role: index === 0 ? 'PRIMARY' : 'SECONDARY',
+      pskBase64,
+      uplinkEnabled,
+      downlinkEnabled,
+      ...(positionPrecision !== undefined ? { positionPrecision } : {}),
+    });
+  }
+
+  return channels.length > 0 ? channels : null;
+}

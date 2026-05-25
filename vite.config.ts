@@ -1,18 +1,19 @@
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
-import { readFileSync } from 'fs';
 import path from 'path';
 import {defineConfig, loadEnv} from 'vite';
 
-// Read the package version once at config time so the UI stays in sync with
-// package.json without needing a manual update on every release.
-const pkg = JSON.parse(readFileSync('./package.json', 'utf-8'));
-
+// Version is sourced solely from .env (SYSTEM_VERSION) — see app's docs.
+// We do NOT fall back to package.json because keeping versions in sync
+// across two files invites drift. If SYSTEM_VERSION is missing or empty
+// at build time we surface "dev" so the failure is visible in the UI
+// rather than silently using a stale number.
 export default defineConfig(({mode}) => {
   const env = loadEnv(mode, '.', '');
+  const version = (env.SYSTEM_VERSION || '').trim() || 'dev';
   return {
     define: {
-      __APP_VERSION__: JSON.stringify(pkg.version),
+      __APP_VERSION__: JSON.stringify(version),
     },
     plugins: [react(), tailwindcss()],
     resolve: {

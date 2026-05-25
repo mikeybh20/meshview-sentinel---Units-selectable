@@ -17,6 +17,8 @@ import {
   Plus,
   FileDown,
   Radio,
+  RefreshCw,
+  Mail,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -25,6 +27,7 @@ import { meshDataService, DataSource, TransportInfo } from './services/meshDataS
 import { SettingsModal } from './components/SettingsModal';
 import { IncomingContactToast } from './components/IncomingContactToast';
 import { useMeshNotifications } from './hooks/useMeshNotifications';
+import { useReadStatus } from './hooks/useReadStatus';
 import { parseDeepLinkFromHash, clearHash, DeepLink } from './lib/deepLink';
 import { useBlockList } from './hooks/useBlockList';
 import { useTheme } from './hooks/useTheme';
@@ -36,23 +39,27 @@ import { ChannelsModal } from './components/ChannelsModal';
 import { ExportModal } from './components/ExportModal';
 import { ImportModal } from './components/ImportModal';
 import { DashboardDesigner } from './components/DashboardDesigner';
-import { RecipeView } from './components/RecipeView';
+// RecipeView moved into SettingsModal as the "Install Guide" tab; the standalone
+// dashboard page was removed per operator request to keep the main nav focused
+// on operational views.
 import { AIAssistant } from './components/AIAssistant';
 
 import { NavItem } from './components/ui/NavItem';
 import { GroupItem } from './components/ui/GroupItem';
+import { RadioActivityLEDs } from './components/ui/RadioActivityLEDs';
 import { DashboardView } from './components/views/DashboardView';
 import { MapView } from './components/views/MapView';
 import { MessagesView } from './components/views/MessagesView';
 import { LogsView } from './components/views/LogsView';
 import { MatrixView } from './components/views/MatrixView';
+import { MailView } from './components/views/MailView';
 
 export default function App() {
   const theme = useTheme();
   const [nodes, setNodes] = React.useState<Node[]>([]);
   const [messages, setMessages] = React.useState<Message[]>([]);
   const [events, setEvents] = React.useState<RadioEvent[]>([]);
-  const [activeTab, setActiveTab] = React.useState<'dashboard' | 'map' | 'messages' | 'logs' | 'matrix' | 'topology' | 'recipe'>('dashboard');
+  const [activeTab, setActiveTab] = React.useState<'dashboard' | 'map' | 'messages' | 'logs' | 'matrix' | 'topology' | 'mail'>('dashboard');
   const [selectedNodeId, setSelectedNodeId] = React.useState<string | null>(null);
   const [configuringNodeId, setConfiguringNodeId] = React.useState<string | null>(null);
   const [showExportModal, setShowExportModal] = React.useState(false);
@@ -60,14 +67,79 @@ export default function App() {
   const [showSettings, setShowSettings] = React.useState(false);
   const blockList = useBlockList();
   const [isEditingDashboard, setIsEditingDashboard] = React.useState(false);
-  const [dashboardWidgets, setDashboardWidgets] = React.useState<WidgetConfig[]>([
-    { id: 'w1', type: 'STATS', visible: true, order: 0, width: 'full' },
-    { id: 'w2', type: 'NODE_LIST', visible: true, order: 1, width: 'large' },
-    { id: 'w3', type: 'NODE_DETAILS', visible: true, order: 2, width: 'small' },
-    { id: 'w4', type: 'MESSAGES', visible: true, order: 3, width: 'medium' },
-    { id: 'w5', type: 'MAP', visible: true, order: 4, width: 'medium' },
-    { id: 'w6', type: 'SENSOR_DATA', visible: true, order: 5, width: 'large' },
-  ]);
+
+  // Default dashboard layout. Four widgets arranged to put Node Info flush
+  // with the top of the stats row, so the right column has more vertical real
+  // estate to surface per-node detail:
+  //
+  //   ┌──────── STATS (large) ────────┬─ NODE_DETAILS (small, row-span 2) ─┐
+  //   │                               │                                    │
+  //   ├──── NODE_LIST (large) ────────┤                                    │
+  //   │                               │                                    │
+  //   ├───────────────────────────────┴────────────────────────────────────┤
+  //   │                       MAP (full width)                             │
+  //   └────────────────────────────────────────────────────────────────────┘
+  //
+  // The operator-customized layout (visibility + order + width) is persisted
+  // to localStorage so it survives reloads AND container rebuilds.
+  const DEFAULT_DASHBOARD_WIDGETS: WidgetConfig[] = React.useMemo(() => ([
+    { id: 'w1', type: 'STATS',        visible: true, order: 0, width: 'large' },
+    { id: 'w2', type: 'NODE_DETAILS', visible: true, order: 1, width: 'small' },
+    { id: 'w3', type: 'NODE_LIST',    visible: true, order: 2, width: 'large' },
+    { id: 'w4', type: 'MAP',          visible: true, order: 3, width: 'full'  },
+  ]), []);
+  /** Types we still know how to render. Older saved layouts may include
+   *  retired types (MESSAGES, SENSOR_DATA) — those get filtered out on load. */
+  const VALID_WIDGET_TYPES = new Set<WidgetConfig['type']>(['STATS', 'NODE_LIST', 'NODE_DETAILS', 'MAP']);
+  // Storage key gets bumped whenever we change the widget schema OR the
+  // canonical default widths so old layouts don't haunt the new dashboard.
+  //  v3: MAP forced full width (no more half-row map)
+  //  v4: STATS forced 'large' (was 'full'); NODE_DETAILS placed after STATS
+  //      in DOM order so it lands in the top-right with row-span 2.
+  const DASHBOARD_STORAGE_KEY = 'mesh.dashboardWidgets.v4';
+
+  const [dashboardWidgets, setDashboardWidgets] = React.useState<WidgetConfig[]>(() => {
+    try {
+      // Migrate any older key we find — strip retired widgets, force the canonical
+      // widths for STATS / MAP, normalize order for NODE_DETAILS placement.
+      const oldKeys = ['mesh.dashboardWidgets.v1', 'mesh.dashboardWidgets.v2', 'mesh.dashboardWidgets.v3'];
+      const current = localStorage.getItem(DASHBOARD_STORAGE_KEY);
+      let raw = current;
+      for (const k of oldKeys) {
+        if (!raw) raw = localStorage.getItem(k);
+        // Clean up stale keys so we don't leave them around indefinitely.
+        if (!current) {
+          try { localStorage.removeItem(k); } catch { /* */ }
+        }
+      }
+      if (!raw) return DEFAULT_DASHBOARD_WIDGETS;
+      const parsed = JSON.parse(raw) as WidgetConfig[];
+      if (!Array.isArray(parsed)) return DEFAULT_DASHBOARD_WIDGETS;
+      // Force canonical widths/visibility/order for widgets whose layout the
+      // new design assumes. Operator's order overrides for NODE_LIST and
+      // others stay intact; STATS + NODE_DETAILS + MAP are repositioned.
+      const cleaned = parsed
+        .filter(w => VALID_WIDGET_TYPES.has(w.type))
+        .map(w => {
+          if (w.type === 'STATS')        return { ...w, width: 'large' as const, visible: true, order: 0 };
+          if (w.type === 'NODE_DETAILS') return { ...w, width: 'small' as const, visible: true, order: 1 };
+          if (w.type === 'NODE_LIST')    return { ...w, width: 'large' as const, visible: true, order: 2 };
+          if (w.type === 'MAP')          return { ...w, width: 'full'  as const, visible: true, order: 3 };
+          return w;
+        });
+      const savedTypes = new Set(cleaned.map(w => w.type));
+      const missing = DEFAULT_DASHBOARD_WIDGETS.filter(w => !savedTypes.has(w.type));
+      return [...cleaned, ...missing].sort((a, b) => a.order - b.order);
+    } catch {
+      return DEFAULT_DASHBOARD_WIDGETS;
+    }
+  });
+  // Persist on every change so the latest layout always wins on reload.
+  React.useEffect(() => {
+    try {
+      localStorage.setItem(DASHBOARD_STORAGE_KEY, JSON.stringify(dashboardWidgets));
+    } catch { /* private mode or storage full */ }
+  }, [dashboardWidgets]);
   const [traceMessageId, setTraceMessageId] = React.useState<string | null>(null);
   const [waypoints, setWaypoints] = React.useState<Waypoint[]>([]);
   const [traces, setTraces] = React.useState<TraceResult[]>([]);
@@ -90,7 +162,21 @@ export default function App() {
   const [newGroupName, setNewGroupName] = React.useState('');
   const [newGroupColor, setNewGroupColor] = React.useState<string>('#10b981');
   const [unitSystem, setUnitSystem] = React.useState<UnitSystem>('METRIC');
-  const [dataSource, setDataSource] = React.useState<DataSource>('simulator');
+  // Default to live mode — production users have a radio attached and don't
+  // want to flip the toggle every load. If no radio is connected the UI shows
+  // a red "Radio Offline" indicator; the operator can switch to simulator
+  // mode from Settings → Mode if they want demo data instead.
+  const [dataSource, setDataSource] = React.useState<DataSource>(() => {
+    try {
+      const persisted = localStorage.getItem('mesh.dataSource');
+      if (persisted === 'live' || persisted === 'simulator') return persisted;
+    } catch { /* private mode */ }
+    return 'live';
+  });
+  // Persist on change so a deliberate switch survives reloads.
+  React.useEffect(() => {
+    try { localStorage.setItem('mesh.dataSource', dataSource); } catch { /* */ }
+  }, [dataSource]);
   const [radioConnected, setRadioConnected] = React.useState(false);
   const [transport, setTransport] = React.useState<TransportInfo | null>(null);
   const [notificationsEnabled, setNotificationsEnabled] = React.useState<boolean>(() => {
@@ -101,18 +187,52 @@ export default function App() {
     if (typeof Notification === 'undefined') return 'unsupported';
     return Notification.permission;
   });
+  const [refreshState, setRefreshState] = React.useState<'idle' | 'pending' | 'ok' | 'err'>('idle');
 
-  // Check if a real radio is available on mount
+  // AI master switch — controls whether the floating AI Assistant launcher
+  // surfaces in the corner. Fetched once on mount and refreshed when the
+  // operator toggles it in Settings (via the 'mesh:aiEnabledChanged' event
+  // the AI settings panel dispatches).
+  const [aiEnabled, setAiEnabled] = React.useState(false);
+  React.useEffect(() => {
+    let cancelled = false;
+    fetch('/api/ai/config')
+      .then(r => r.json())
+      .then(c => { if (!cancelled) setAiEnabled(!!c?.enabled); })
+      .catch(() => { /* leave default false */ });
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (typeof detail?.enabled === 'boolean') setAiEnabled(detail.enabled);
+    };
+    window.addEventListener('mesh:aiEnabledChanged', handler);
+    return () => { cancelled = true; window.removeEventListener('mesh:aiEnabledChanged', handler); };
+  }, []);
+
+  const handleRefreshNodeDb = React.useCallback(async () => {
+    if (dataSource !== 'live' || !radioConnected) return;
+    setRefreshState('pending');
+    const result = await meshDataService.refreshNodeDb();
+    setRefreshState(result.ok ? 'ok' : 'err');
+    setTimeout(() => setRefreshState('idle'), 2000);
+  }, [dataSource, radioConnected]);
+
+  // Version comes from the server at runtime (sourced from .env SYSTEM_VERSION
+   // via docker-compose env_file). We can't bake it at build time because the
+   // .env file is intentionally excluded from the Docker build context to keep
+   // API keys out of the image.
+  const [systemVersion, setSystemVersion] = React.useState<string>('');
+
+  // Pull system version + initial radio status. We no longer auto-flip the
+  // dataSource here because live is now the default; the operator explicitly
+  // switches to simulator from Settings → Mode when they want demo data.
   React.useEffect(() => {
     fetch('/api/mesh/status')
       .then(r => r.json())
       .then(status => {
-        if (status.radioConnected) {
-          setRadioConnected(true);
-          setDataSource('live');
-        }
+        if (status.systemVersion) setSystemVersion(status.systemVersion);
+        if (status.radioConnected) setRadioConnected(true);
       })
-      .catch(() => { /* server not running, stay on simulator */ });
+      .catch(() => { /* server not running yet — fine, status will update via SSE */ });
   }, []);
 
   // Subscribe to the active data source
@@ -244,6 +364,35 @@ export default function App() {
     activeChatId,
     enabled: notificationsEnabled && notificationPermission === 'granted',
   });
+
+  // Shared read/unread state — drives both the sidebar Messages badge and the
+  // in-view "—— New ——" divider. Only marks as read while user is actually
+  // on the messages tab; otherwise unread counts keep accruing.
+  const { unreadCounts, totalUnread, firstUnreadAt } = useReadStatus({
+    messages,
+    channels,
+    localNodeId,
+    activeChatId,
+    markActiveAsRead: activeTab === 'messages',
+  });
+
+  // BBS unread mail counter — drives the Mail nav badge. Refreshed on mount,
+  // when localNodeId changes, and on every bbsMail SSE event from the server.
+  const [bbsUnread, setBbsUnread] = React.useState(0);
+  React.useEffect(() => {
+    if (!localNodeId || dataSource !== 'live') {
+      setBbsUnread(0);
+      return;
+    }
+    let cancelled = false;
+    const fetchUnread = async () => {
+      const r = await meshDataService.getBbsInbox(localNodeId);
+      if (!cancelled && r) setBbsUnread(r.unread);
+    };
+    fetchUnread();
+    const unsub = meshDataService.onBbsMail(() => { fetchUnread(); });
+    return () => { cancelled = true; unsub(); };
+  }, [localNodeId, dataSource]);
 
   // Notification click → switch tab + chat
   React.useEffect(() => {
@@ -380,14 +529,22 @@ export default function App() {
             icon={<MapIcon size={20} />}
             label="Map Network"
           />
-          <NavItem 
-            active={activeTab === 'messages'} 
+          <NavItem
+            active={activeTab === 'messages'}
             onClick={() => setActiveTab('messages')}
             icon={<MessageSquare size={20} />}
             label="Messages"
+            badge={totalUnread}
           />
-          <NavItem 
-            active={activeTab === 'logs'} 
+          <NavItem
+            active={activeTab === 'mail'}
+            onClick={() => setActiveTab('mail')}
+            icon={<Mail size={20} />}
+            label="BBS Mail"
+            badge={bbsUnread}
+          />
+          <NavItem
+            active={activeTab === 'logs'}
             onClick={() => setActiveTab('logs')}
             icon={<History size={20} />}
             label="Event Logs"
@@ -404,29 +561,27 @@ export default function App() {
             icon={<Activity size={20} />}
             label="Topology"
           />
-          <NavItem
-            active={activeTab === 'recipe'}
-            onClick={() => setActiveTab('recipe')}
-            icon={<FileDown size={20} />}
-            label="Recipe Guide"
-          />
+          {/* Recipe / Installation Guide moved to Settings → Install Guide. */}
           
           <div className="mt-auto pt-4 border-t border-brand-line space-y-1">
-            <button 
-              onClick={() => setDataSource(prev => prev === 'simulator' ? 'live' : 'simulator')}
+            {/* Radio status display. Click-to-toggle was removed — switching
+                between live and simulator now lives in Settings → Mode so
+                operators can't accidentally flip into demo data mid-session. */}
+            <button
+              onClick={() => setShowSettings(true)}
+              title="Open Settings → Mode to switch between Live and Simulator"
               className={cn(
-                "w-full h-10 flex items-center justify-center md:justify-start gap-3 px-3 rounded-lg transition-all group",
-                dataSource === 'live' 
-                  ? "text-brand-accent bg-brand-accent/10 hover:bg-brand-accent/20" 
-                  : "text-brand-muted hover:bg-brand-line/10 hover:text-brand-accent"
+                "w-full h-10 flex items-center justify-center md:justify-start gap-3 px-3 rounded-lg transition-all group cursor-pointer",
+                dataSource === 'live'
+                  ? "text-brand-accent bg-brand-accent/10 hover:bg-brand-accent/20"
+                  : "text-brand-warning bg-brand-warning/10 hover:bg-brand-warning/20"
               )}
             >
               <Radio size={20} className={cn(
                 "flex-shrink-0 transition-colors",
-                dataSource === 'live' ? "text-brand-accent" : "group-hover:text-brand-accent",
-                radioConnected && dataSource === 'live' && "animate-pulse"
+                dataSource === 'live' ? "text-brand-accent" : "text-brand-warning"
               )} />
-              <div className="hidden md:flex flex-col items-start overflow-hidden">
+              <div className="hidden md:flex flex-col items-start overflow-hidden flex-1">
                 <span className="text-[10px] font-bold uppercase tracking-widest leading-none">
                   {dataSource === 'live'
                     ? (radioConnected && transport?.mode === 'tcp' ? 'TCP RADIO'
@@ -436,7 +591,9 @@ export default function App() {
                 </span>
                 <span className={cn(
                   "text-[8px] uppercase truncate leading-none mt-1",
-                  dataSource === 'live' && radioConnected ? "text-brand-accent" : "text-brand-muted"
+                  dataSource === 'live' && radioConnected ? "text-brand-accent"
+                    : dataSource === 'simulator' ? "text-brand-warning"
+                    : "text-brand-muted"
                 )}>
                   {dataSource === 'live'
                     ? (radioConnected
@@ -447,6 +604,7 @@ export default function App() {
                     : 'Demo Data'}
                 </span>
               </div>
+              <RadioActivityLEDs enabled={dataSource === 'live' && radioConnected} />
             </button>
           </div>
 
@@ -499,10 +657,34 @@ export default function App() {
         <div className="p-4 border-t border-brand-line space-y-4">
           <div className="hidden md:block">
             <p className="text-[10px] text-brand-muted uppercase font-bold tracking-widest mb-2">SYSTEM STATUS</p>
-            <div className="flex items-center gap-2 mb-2">
-              <div className="w-2 h-2 rounded-full bg-brand-accent animate-pulse" />
-              <span className="mono-text text-brand-accent uppercase">Link Active</span>
-            </div>
+            {(() => {
+              // Three states: live + radio = green pulse, live + no radio = red,
+              // simulator = amber static (link is "active" in a sense but it's
+              // synthetic, so we don't want to mislead the operator).
+              const liveOk = dataSource === 'live' && radioConnected;
+              const liveOff = dataSource === 'live' && !radioConnected;
+              const dotClass = liveOk
+                ? 'bg-brand-accent animate-pulse'
+                : liveOff
+                  ? 'bg-brand-error'
+                  : 'bg-brand-warning';
+              const labelClass = liveOk
+                ? 'text-brand-accent'
+                : liveOff
+                  ? 'text-brand-error'
+                  : 'text-brand-warning';
+              const label = liveOk
+                ? 'Link Active'
+                : liveOff
+                  ? 'Radio Offline'
+                  : 'Simulator Mode';
+              return (
+                <div className="flex items-center gap-2 mb-2">
+                  <div className={cn('w-2 h-2 rounded-full', dotClass)} />
+                  <span className={cn('mono-text uppercase', labelClass)}>{label}</span>
+                </div>
+              );
+            })()}
           </div>
           <button
             onClick={() => setShowSettings(true)}
@@ -523,7 +705,7 @@ export default function App() {
             <div className="flex items-baseline gap-2">
               <span className="text-2xl font-light">{activeTab.toUpperCase()}</span>
               <span className="text-xs text-brand-muted mono-text tracking-widest hidden sm:inline" title="Application version">
-                v{__APP_VERSION__}
+                v{systemVersion || '—'}
               </span>
             </div>
           </div>
@@ -531,14 +713,42 @@ export default function App() {
           <div className="flex items-center gap-4">
             <div className="relative hidden sm:block">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-brand-muted" size={16} />
-              <input 
-                type="text" 
-                placeholder="Filter nodes..." 
+              <input
+                type="text"
+                placeholder="Filter nodes..."
                 className="bg-brand-line/50 border border-brand-line rounded-full py-1.5 pl-10 pr-4 text-sm focus:outline-none focus:border-brand-accent transition-colors w-64"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
               />
             </div>
+            {dataSource === 'live' && (
+              <button
+                onClick={handleRefreshNodeDb}
+                disabled={!radioConnected || refreshState === 'pending'}
+                className={cn(
+                  "flex items-center gap-2 px-3 py-1.5 rounded-full border transition-colors",
+                  refreshState === 'ok' && "border-brand-accent text-brand-accent",
+                  refreshState === 'err' && "border-brand-danger text-brand-danger",
+                  refreshState !== 'ok' && refreshState !== 'err' && "border-brand-line text-brand-muted hover:text-brand-accent hover:border-brand-accent/40",
+                  (!radioConnected || refreshState === 'pending') && "opacity-50 cursor-not-allowed"
+                )}
+                title={
+                  !radioConnected
+                    ? 'Connect a radio first'
+                    : refreshState === 'err'
+                      ? 'Refresh failed — see server logs'
+                      : 'Re-pull NodeDB / channels / module configs from the radio'
+                }
+              >
+                <RefreshCw
+                  size={14}
+                  className={cn(refreshState === 'pending' && 'animate-spin')}
+                />
+                <span className="text-xs font-medium mono-text hidden md:inline">
+                  {refreshState === 'pending' ? 'REFRESHING' : refreshState === 'ok' ? 'REFRESHED' : refreshState === 'err' ? 'FAILED' : 'REFRESH'}
+                </span>
+              </button>
+            )}
             {(() => {
               // Truthful MQTT status pill. Three states:
               //   active   — local radio's MQTT module is enabled (authoritative readback)
@@ -774,12 +984,14 @@ export default function App() {
                   onManageChannels={() => setShowChannelsModal(true)}
                   localNodeId={localNodeId}
                   blockedNodeIds={blockList.blocked}
+                  unreadCounts={unreadCounts}
+                  firstUnreadAt={firstUnreadAt[activeChatId] || 0}
                 />
               </motion.div>
             )}
 
             {activeTab === 'matrix' && (
-              <motion.div 
+              <motion.div
                 key="matrix"
                 initial={{ opacity: 0, scale: 0.95 }}
                 animate={{ opacity: 1, scale: 1 }}
@@ -787,6 +999,18 @@ export default function App() {
                 className="p-6 h-full flex flex-col gap-6"
               >
                 <MatrixView nodes={nodes} messages={messages} channels={channels} />
+              </motion.div>
+            )}
+
+            {activeTab === 'mail' && (
+              <motion.div
+                key="mail"
+                initial={{ opacity: 0, scale: 0.98 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.98 }}
+                className="h-full overflow-hidden"
+              >
+                <MailView nodes={nodes} localNodeId={localNodeId} />
               </motion.div>
             )}
 
@@ -822,18 +1046,6 @@ export default function App() {
                       onNodeSelect={(id) => { setSelectedNodeId(id); }}
                     />
                   </div>
-              </motion.div>
-            )}
-
-            {activeTab === 'recipe' && (
-              <motion.div 
-                key="recipe"
-                initial={{ opacity: 0, y: 20 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -20 }}
-                className="p-6 h-full overflow-hidden"
-              >
-                <RecipeView />
               </motion.div>
             )}
 
@@ -913,6 +1125,8 @@ export default function App() {
               nodes={nodes}
               onUnblockNode={blockList.unblock}
               localModuleConfig={localModuleConfig}
+              dataSource={dataSource}
+              setDataSource={setDataSource}
             />
           )}
         </AnimatePresence>
@@ -930,11 +1144,13 @@ export default function App() {
           onOpenChat={(nodeId) => { setActiveChatId(nodeId); setActiveTab('messages'); }}
         />
 
-        <AIAssistant 
-          nodes={nodes}
-          messages={messages}
-          events={events}
-        />
+        {aiEnabled && (
+          <AIAssistant
+            nodes={nodes}
+            messages={messages}
+            events={events}
+          />
+        )}
       </main>
     </div>
   );

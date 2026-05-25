@@ -8,7 +8,6 @@ import { Node, Message, Channel } from '../../types';
 import { cn } from '../../lib/utils';
 import { ChannelItem } from '../ui/ChannelItem';
 import { HopNode } from '../ui/HopNode';
-import { useReadStatus } from '../../hooks/useReadStatus';
 import { meshDataService } from '../../services/meshDataService';
 import { parseMentions } from '../../lib/mentions';
 
@@ -30,6 +29,11 @@ interface MessagesViewProps {
   onManageChannels: () => void;
   localNodeId: string | null;
   blockedNodeIds: Set<string>;
+  /** Per-chat unread counts (sidebar pills). */
+  unreadCounts: Record<string, number>;
+  /** Snapshot of lastReadAt for the active chat at the moment we entered it.
+   *  Used to position the "—— New ——" divider — frozen during the visit. */
+  firstUnreadAt: number;
 }
 
 function channelLabel(c: Channel): string {
@@ -141,15 +145,24 @@ function describeMessageError(errorCode: number | undefined): { short: string; l
   }
 }
 
-function MessageStatusIcon({ status, errorCode, onRetry }: {
+function MessageStatusIcon({ status, errorCode, onRetry, isBroadcast }: {
   status?: Message['status'];
   errorCode?: number;
   onRetry?: () => void;
+  /** Broadcasts never reach 'acked' — render 'queued' as the terminal positive state for them. */
+  isBroadcast?: boolean;
 }) {
-  if (!status || status === 'acked') {
-    return status === 'acked'
-      ? <span title="Delivered"><CheckCheck size={11} className="text-brand-accent" /></span>
-      : null;
+  if (!status) return null;
+  if (status === 'acked') {
+    return <span title="Delivered (peer ACK received)"><CheckCheck size={11} className="text-brand-accent" /></span>;
+  }
+  if (status === 'queued') {
+    // For broadcasts this is the happy-path terminal state; for DMs it's
+    // a halfway signal while we wait for the peer's routing reply.
+    const tooltip = isBroadcast
+      ? 'Queued for transmit (broadcasts get no over-the-air ACK)'
+      : 'Queued for transmit — waiting for peer ACK…';
+    return <span title={tooltip}><CheckCheck size={11} className="text-brand-muted" /></span>;
   }
   if (status === 'sending') {
     return <span title="Sending…"><Clock size={11} className="text-brand-muted animate-pulse" /></span>;
@@ -199,6 +212,8 @@ export function MessagesView({
   onManageChannels,
   localNodeId,
   blockedNodeIds,
+  unreadCounts,
+  firstUnreadAt,
 }: MessagesViewProps) {
   const messagesEndRef = React.useRef<HTMLDivElement>(null);
   const messageRefs = React.useRef<Map<string, HTMLDivElement>>(new Map());
@@ -220,13 +235,14 @@ export function MessagesView({
     return () => clearTimeout(t);
   }, [highlightId]);
 
-  const { unreadCounts } = useReadStatus({
-    messages,
-    channels,
-    localNodeId,
-    activeChatId,
-    markActiveAsRead: true, // mounted = user is on the messages tab
-  });
+  // Index of the first unread message in the current chat — frozen at chat entry.
+  // Used to render the "—— New ——" divider above that message. -1 if none.
+  const firstUnreadIndex = React.useMemo(() => {
+    if (!firstUnreadAt) return -1;
+    return filteredMessages.findIndex(
+      m => !m.isOwn && !m.isReaction && m.timestamp > firstUnreadAt
+    );
+  }, [filteredMessages, firstUnreadAt]);
 
   const [replyingTo, setReplyingTo] = React.useState<Message | null>(null);
   const [reactPickerForId, setReactPickerForId] = React.useState<string | null>(null);
@@ -428,7 +444,18 @@ export function MessagesView({
 
           <div className="p-2">
             <p className="text-[10px] text-brand-muted px-2 py-1 uppercase font-bold tracking-widest">Direct Messages</p>
-            {nodes.filter(n => n.online && n.id !== '!abcdef01' && !blockedNodeIds.has(n.id)).map(n => (
+            {nodes
+              // Filter out: the placeholder demo node, blocked nodes, and
+              // the local node itself. The local node can't be DMed —
+              // self-DMs don't actually transmit, they just consume rate-
+              // limit budget — so we don't show it as a target at all.
+              .filter(n =>
+                n.online
+                && n.id !== '!abcdef01'
+                && n.id !== localNodeId
+                && !blockedNodeIds.has(n.id)
+              )
+              .map(n => (
               <ChannelItem
                 key={n.id}
                 name={n.name}
@@ -503,7 +530,7 @@ export function MessagesView({
 
           {/* Messages */}
           <div className="flex-1 p-4 overflow-y-auto space-y-4">
-            {filteredMessages.length > 0 ? filteredMessages.map((m) => {
+            {filteredMessages.length > 0 ? filteredMessages.map((m, idx) => {
               // Reactions don't render as standalone messages — they appear as
               // chips under the parent message they're reacting to.
               if (m.isReaction) return null;
@@ -515,17 +542,29 @@ export function MessagesView({
               const canReplyOrReact = typeof m.packetId === 'number' && !m.isReaction;
 
               const isHighlighted = highlightId === m.id;
+              const isNew = !isOwn && firstUnreadAt > 0 && m.timestamp > firstUnreadAt;
+              const showUnreadDivider = idx === firstUnreadIndex;
               return (
+                <React.Fragment key={m.id}>
+                  {showUnreadDivider && (
+                    <div className="flex items-center gap-3 py-1 select-none" aria-label="New messages divider">
+                      <div className="flex-1 h-px bg-brand-warning/40" />
+                      <span className="text-[9px] font-bold mono-text uppercase tracking-widest text-brand-warning px-2 py-0.5 rounded-full bg-brand-warning/10 border border-brand-warning/30">
+                        New
+                      </span>
+                      <div className="flex-1 h-px bg-brand-warning/40" />
+                    </div>
+                  )}
                 <div
-                  key={m.id}
                   ref={(el) => {
                     if (el) messageRefs.current.set(m.id, el);
                     else messageRefs.current.delete(m.id);
                   }}
                   className={cn(
-                    'flex flex-col gap-1 group/msg transition-all rounded-lg',
+                    'flex flex-col gap-1 group/msg transition-all rounded-lg relative',
                     isOwn ? 'items-end' : 'items-start',
-                    isHighlighted && 'bg-brand-accent/10 ring-1 ring-brand-accent/40 -mx-2 px-2 py-2'
+                    isHighlighted && 'bg-brand-accent/10 ring-1 ring-brand-accent/40 -mx-2 px-2 py-2',
+                    isNew && !isHighlighted && 'animate-[pulse_2s_ease-out_1]'
                   )}
                 >
                   <div className="flex items-center gap-2 px-2">
@@ -533,6 +572,14 @@ export function MessagesView({
                       {isOwn ? 'You' : senderName}
                     </span>
                     <span className="text-[10px] mono-text text-brand-muted">{new Date(m.timestamp).toLocaleTimeString()}</span>
+                    {isNew && (
+                      <span
+                        className="text-[8px] mono-text uppercase font-bold tracking-widest text-brand-warning bg-brand-warning/10 border border-brand-warning/30 rounded px-1 py-px"
+                        title="Arrived since you last opened this chat"
+                      >
+                        New
+                      </span>
+                    )}
                   </div>
 
                   {/* Reply indicator — shown above the bubble if this message is a reply */}
@@ -669,6 +716,7 @@ export function MessagesView({
                         status={m.status}
                         errorCode={m.errorCode}
                         onRetry={m.status === 'error' ? () => handleSendMessage(m.text) : undefined}
+                        isBroadcast={m.to === '!ffffffff'}
                       />
                       {m.status !== 'error' && m.status !== 'sending' && m.hops && m.hops.length > 0 && (
                         <button
@@ -703,6 +751,7 @@ export function MessagesView({
                     </button>
                   )}
                 </div>
+                </React.Fragment>
               );
             }) : (
               <div className="h-full flex items-center justify-center opacity-30 italic text-sm">
@@ -732,25 +781,51 @@ export function MessagesView({
                 </button>
               </div>
             )}
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={draftMessage}
-                onChange={(e) => setDraftMessage(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && handleSendWithReply()}
-                placeholder={
-                  replyingTo ? 'Reply…'
-                  : `Message ${activeChannel ? channelLabel(activeChannel) : activeChatPartner?.name || 'the network'}…`
-                }
-                className="flex-1 bg-brand-line border border-brand-line rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-brand-accent"
-              />
-              <button
-                onClick={handleSendWithReply}
-                className="bg-brand-accent text-black px-4 py-2 rounded-lg font-bold text-sm hover:brightness-110 transition-all"
-              >
-                SEND
-              </button>
-            </div>
+            {(() => {
+              // Self-DM guard. DMing your own local node doesn't transmit
+              // anything useful — the firmware sees `to == my_node_num` and
+              // loops the packet back internally — but each attempt still
+              // consumes a slot in the per-destination rate limiter, which
+              // can block legitimate outbound traffic. Block the compose
+              // surface entirely when the active chat IS the local node.
+              const isSelfDm = !activeChannel
+                && !!localNodeId
+                && !!activeChatPartner
+                && activeChatPartner.id === localNodeId;
+              if (isSelfDm) {
+                return (
+                  <div className="flex items-center gap-2 px-4 py-3 rounded-lg border border-brand-warning/30 bg-brand-warning/10 text-xs text-brand-warning">
+                    <Activity size={14} className="shrink-0" />
+                    <span>
+                      You can't DM your own node. The radio loops self-DMs back internally
+                      and they consume rate-limit budget without going on-air. Pick a different
+                      chat to compose a message.
+                    </span>
+                  </div>
+                );
+              }
+              return (
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={draftMessage}
+                    onChange={(e) => setDraftMessage(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && handleSendWithReply()}
+                    placeholder={
+                      replyingTo ? 'Reply…'
+                      : `Message ${activeChannel ? channelLabel(activeChannel) : activeChatPartner?.name || 'the network'}…`
+                    }
+                    className="flex-1 bg-brand-line border border-brand-line rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-brand-accent"
+                  />
+                  <button
+                    onClick={handleSendWithReply}
+                    className="bg-brand-accent text-black px-4 py-2 rounded-lg font-bold text-sm hover:brightness-110 transition-all"
+                  >
+                    SEND
+                  </button>
+                </div>
+              );
+            })()}
           </div>
         </div>
 

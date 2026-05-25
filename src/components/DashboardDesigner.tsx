@@ -1,5 +1,6 @@
 import React from 'react';
-import { X, GripVertical, Eye, EyeOff, LayoutTemplate, Trash2, ArrowUp, ArrowDown } from 'lucide-react';
+import { Reorder, useDragControls } from 'motion/react';
+import { X, GripVertical, Eye, EyeOff, LayoutTemplate, RotateCcw } from 'lucide-react';
 import { WidgetConfig } from '../types';
 import { cn } from '../lib/utils';
 
@@ -9,14 +10,22 @@ interface DashboardDesignerProps {
   onClose: () => void;
 }
 
+/**
+ * Drag-to-reorder dashboard layout editor. The motion/react Reorder primitive
+ * handles the actual drag mechanics (touch + mouse, with FLIP animation between
+ * positions); we just feed it the widgets array and persist on every change.
+ *
+ * The grip handle is the drag target rather than the whole row so toggling
+ * visibility / clicking width buttons doesn't accidentally start a drag.
+ *
+ * Layout (visibility / order / width) persists to localStorage from App.tsx —
+ * changes here survive reloads AND container rebuilds.
+ */
 export function DashboardDesigner({ widgets, onUpdate, onClose }: DashboardDesignerProps) {
-  const moveWidget = (index: number, direction: 'up' | 'down') => {
-    const newWidgets = [...widgets];
-    const targetIndex = direction === 'up' ? index - 1 : index + 1;
-    if (targetIndex >= 0 && targetIndex < newWidgets.length) {
-      [newWidgets[index], newWidgets[targetIndex]] = [newWidgets[targetIndex], newWidgets[index]];
-      onUpdate(newWidgets.map((w, i) => ({ ...w, order: i })));
-    }
+  const handleReorder = (next: WidgetConfig[]) => {
+    // Rewrite `order` to match the new array index so callers that sort by it
+    // see the latest layout.
+    onUpdate(next.map((w, i) => ({ ...w, order: i })));
   };
 
   const toggleVisibility = (id: string) => {
@@ -25,6 +34,13 @@ export function DashboardDesigner({ widgets, onUpdate, onClose }: DashboardDesig
 
   const updateWidth = (id: string, width: WidgetConfig['width']) => {
     onUpdate(widgets.map(w => w.id === id ? { ...w, width } : w));
+  };
+
+  const resetToDefaults = () => {
+    if (!confirm('Reset dashboard layout to factory defaults? Your widget visibility, order, and widths will be replaced.')) return;
+    // Drop the persisted layout and reload so App.tsx repopulates from defaults.
+    try { localStorage.removeItem('mesh.dashboardWidgets.v1'); } catch { /* */ }
+    window.location.reload();
   };
 
   return (
@@ -40,77 +56,118 @@ export function DashboardDesigner({ widgets, onUpdate, onClose }: DashboardDesig
           </button>
         </div>
 
-        <div className="flex-1 overflow-y-auto p-6 space-y-4">
-          {widgets.map((widget, index) => (
-            <div 
-              key={widget.id}
-              className={cn(
-                "p-4 rounded-lg border transition-all flex items-center gap-4 bg-brand-bg/40",
-                widget.visible ? "border-brand-line" : "border-brand-line/30 opacity-50"
-              )}
-            >
-              <div className="flex flex-col gap-1">
-                <button 
-                  disabled={index === 0}
-                  onClick={() => moveWidget(index, 'up')}
-                  className="p-1 hover:text-brand-accent disabled:opacity-30"
-                >
-                  <ArrowUp size={14} />
-                </button>
-                <button 
-                  disabled={index === widgets.length - 1}
-                  onClick={() => moveWidget(index, 'down')}
-                  className="p-1 hover:text-brand-accent disabled:opacity-30"
-                >
-                  <ArrowDown size={14} />
-                </button>
-              </div>
-
-              <div className="flex-1">
-                <div className="flex items-center gap-2 mb-1">
-                  <h4 className="text-xs font-bold uppercase tracking-widest">{widget.type.replace('_', ' ')}</h4>
-                  <span className="text-[9px] mono-text opacity-40 bg-brand-line px-1 rounded">{widget.id}</span>
-                </div>
-                <div className="flex gap-2">
-                  {(['full', 'large', 'medium', 'small'] as const).map(w => (
-                    <button
-                      key={w}
-                      onClick={() => updateWidth(widget.id, w)}
-                      className={cn(
-                        "text-[9px] px-2 py-0.5 rounded border transition-all uppercase font-bold",
-                        widget.width === w 
-                          ? "bg-brand-accent border-brand-accent text-black" 
-                          : "border-brand-line hover:border-brand-muted"
-                      )}
-                    >
-                      {w}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              <button 
-                onClick={() => toggleVisibility(widget.id)}
-                className={cn(
-                  "p-2 rounded hover:bg-brand-line transition-all",
-                  widget.visible ? "text-brand-accent" : "text-brand-muted"
-                )}
-              >
-                {widget.visible ? <Eye size={18} /> : <EyeOff size={18} />}
-              </button>
-            </div>
-          ))}
+        <div className="px-6 py-3 border-b border-brand-line bg-brand-line/10">
+          <p className="text-[11px] text-brand-muted leading-snug">
+            Drag the <GripVertical size={11} className="inline mb-0.5" /> handle to reorder widgets.
+            Toggle the eye to show / hide. Pick a width per widget. Changes persist across reloads and rebuilds.
+          </p>
         </div>
 
-        <div className="p-4 border-t border-brand-line flex justify-end bg-brand-line/10">
-          <button 
+        <div className="flex-1 overflow-y-auto p-4">
+          <Reorder.Group axis="y" values={widgets} onReorder={handleReorder} className="space-y-2">
+            {widgets.map(widget => (
+              <DesignerRow
+                key={widget.id}
+                widget={widget}
+                onToggleVisibility={() => toggleVisibility(widget.id)}
+                onUpdateWidth={w => updateWidth(widget.id, w)}
+              />
+            ))}
+          </Reorder.Group>
+        </div>
+
+        <div className="p-4 border-t border-brand-line flex items-center justify-between bg-brand-line/10">
+          <button
+            onClick={resetToDefaults}
+            className="flex items-center gap-2 px-3 py-1.5 text-[10px] font-bold uppercase tracking-widest text-brand-muted hover:text-brand-error border border-brand-line hover:border-brand-error/50 rounded transition-colors"
+            title="Reset to factory layout"
+          >
+            <RotateCcw size={11} />
+            Reset
+          </button>
+          <button
             onClick={onClose}
             className="bg-brand-accent text-black px-8 py-2 rounded text-sm font-bold uppercase tracking-widest hover:brightness-110 transition-all"
           >
-            Finish Customization
+            Finish
           </button>
         </div>
       </div>
     </div>
+  );
+}
+
+function DesignerRow({
+  widget,
+  onToggleVisibility,
+  onUpdateWidth,
+}: {
+  widget: WidgetConfig;
+  onToggleVisibility: () => void;
+  onUpdateWidth: (w: WidgetConfig['width']) => void;
+}) {
+  // Scoping drag controls per row so only the grip handle starts a drag —
+  // tapping width / visibility buttons mustn't accidentally pick up the row.
+  const dragControls = useDragControls();
+
+  return (
+    <Reorder.Item
+      value={widget}
+      dragListener={false}
+      dragControls={dragControls}
+      className={cn(
+        "p-3 rounded-lg border transition-all flex items-center gap-3 bg-brand-bg/40 select-none",
+        widget.visible ? "border-brand-line" : "border-brand-line/30 opacity-50"
+      )}
+    >
+      {/* Drag handle — only this element initiates a drag */}
+      <button
+        type="button"
+        onPointerDown={e => dragControls.start(e)}
+        className="cursor-grab active:cursor-grabbing text-brand-muted hover:text-brand-accent shrink-0 px-1"
+        title="Drag to reorder"
+        aria-label="Drag handle"
+      >
+        <GripVertical size={16} />
+      </button>
+
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2 mb-1">
+          <h4 className="text-xs font-bold uppercase tracking-widest truncate">
+            {widget.type.replace(/_/g, ' ')}
+          </h4>
+          <span className="text-[9px] mono-text opacity-40 bg-brand-line px-1 rounded shrink-0">
+            {widget.id}
+          </span>
+        </div>
+        <div className="flex gap-1.5 flex-wrap">
+          {(['full', 'large', 'medium', 'small'] as const).map(w => (
+            <button
+              key={w}
+              onClick={() => onUpdateWidth(w)}
+              className={cn(
+                "text-[9px] px-2 py-0.5 rounded border transition-all uppercase font-bold",
+                widget.width === w
+                  ? "bg-brand-accent border-brand-accent text-black"
+                  : "border-brand-line hover:border-brand-muted"
+              )}
+            >
+              {w}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <button
+        onClick={onToggleVisibility}
+        className={cn(
+          "p-2 rounded hover:bg-brand-line transition-all shrink-0",
+          widget.visible ? "text-brand-accent" : "text-brand-muted"
+        )}
+        title={widget.visible ? 'Hide widget' : 'Show widget'}
+      >
+        {widget.visible ? <Eye size={16} /> : <EyeOff size={16} />}
+      </button>
+    </Reorder.Item>
   );
 }

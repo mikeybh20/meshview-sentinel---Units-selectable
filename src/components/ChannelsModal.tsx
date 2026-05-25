@@ -1,9 +1,10 @@
 import React, { useEffect, useState } from 'react';
-import { X, Save, Plus, Trash2, Activity, AlertTriangle, Share2, Check, Copy } from 'lucide-react';
+import { X, Save, Plus, Trash2, Activity, AlertTriangle, Share2, Check, Copy, Download } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
 import { Channel, ChannelRole } from '../types';
 import { meshDataService } from '../services/meshDataService';
-import { buildChannelShareUrl } from '../lib/channelShare';
+import { buildChannelShareUrl, parseChannelShareUrl } from '../lib/channelShare';
+import { cn } from '../lib/utils';
 
 interface ChannelsModalProps {
   onClose: () => void;
@@ -95,6 +96,7 @@ export function ChannelsModal({ onClose }: ChannelsModalProps) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showShare, setShowShare] = useState(false);
+  const [showImport, setShowImport] = useState(false);
 
   useEffect(() => {
     // Refresh from latest snapshot when the modal opens
@@ -132,24 +134,42 @@ export function ChannelsModal({ onClose }: ChannelsModalProps) {
   };
 
   const handleSave = async () => {
+    // Visible diagnostic — open browser devtools (F12) → Console to see the
+    // POST payload and the response. Helps pinpoint silent-save failures.
+    console.log('[ChannelsModal] handleSave fired', { channelCount: channels.length, channels });
     setError(null);
 
-    // Validate: at most one PRIMARY
+    // Validate: at most one PRIMARY. If the operator somehow ends up with
+    // zero PRIMARY channels (every slot SECONDARY/DISABLED) the radio still
+    // accepts the write, but it's almost always a mistake — surface it.
     const primaries = channels.filter(c => c.role === 'PRIMARY');
     if (primaries.length > 1) {
       setError('Only one channel may be marked PRIMARY.');
       return;
     }
-
-    setSaving(true);
-    const result = await meshDataService.saveChannels(channels);
-    setSaving(false);
-
-    if (!result.ok) {
-      setError(result.error || 'Save failed.');
+    if (primaries.length === 0) {
+      setError('At least one channel must be marked PRIMARY before saving.');
       return;
     }
-    onClose();
+
+    setSaving(true);
+    try {
+      const result = await meshDataService.saveChannels(channels);
+      console.log('[ChannelsModal] saveChannels result', result);
+      if (!result.ok) {
+        setError(result.error || 'Save failed — see server logs.');
+        return;
+      }
+      onClose();
+    } catch (err: any) {
+      // saveChannels is supposed to swallow errors and return {ok:false},
+      // but belt-and-suspenders: if anything escapes, surface it here so the
+      // button doesn't stay locked in "saving" state forever.
+      console.error('[ChannelsModal] unexpected save error', err);
+      setError(err?.message || 'Unexpected error during save');
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -198,7 +218,21 @@ export function ChannelsModal({ onClose }: ChannelsModalProps) {
 
               <div className="grid grid-cols-2 gap-3">
                 <div className="space-y-1">
-                  <label className="text-[10px] uppercase font-bold text-brand-muted">Name</label>
+                  <div className="flex items-baseline justify-between">
+                    <label className="text-[10px] uppercase font-bold text-brand-muted">Name</label>
+                    {/* Counter is muted at low fill, accent near the cap, warning at exact cap. */}
+                    <span
+                      className={cn(
+                        'text-[9px] mono-text tracking-widest',
+                        ch.name.length >= 11 && 'text-brand-warning',
+                        ch.name.length >= 8 && ch.name.length < 11 && 'text-brand-accent',
+                        ch.name.length < 8 && 'text-brand-muted',
+                      )}
+                      title="Meshtastic firmware caps channel names at 11 bytes (mesh.proto ChannelSettings.name, max_size=12 incl. terminator). Names like 'Primary Channel' (15) cannot be sent — try 'Primary' or 'PriChannel'."
+                    >
+                      {ch.name.length}/11
+                    </span>
+                  </div>
                   <input
                     type="text"
                     maxLength={11}
@@ -292,24 +326,43 @@ export function ChannelsModal({ onClose }: ChannelsModalProps) {
             </button>
           )}
 
-          {error && (
-            <div className="flex items-start gap-2 text-xs text-brand-error bg-brand-error/10 border border-brand-error/30 rounded p-2">
+        </div>
+
+        {/* Error banner — pinned just above the footer so it's always visible
+            after a failed save attempt. Previously rendered inside the
+            scrollable channel list, where it could land below the fold when
+            the operator had scrolled to find the channel they were editing
+            (the practical effect was "Save does nothing" — the validation
+            error was there, just invisible). */}
+        {error && (
+          <div className="px-4 py-2 border-t border-brand-error/30 bg-brand-error/10">
+            <div className="flex items-start gap-2 text-xs text-brand-error">
               <AlertTriangle size={14} className="flex-shrink-0 mt-0.5" />
               <span>{error}</span>
             </div>
-          )}
-        </div>
+          </div>
+        )}
 
         <div className="p-4 border-t border-brand-line flex justify-between items-center gap-3 bg-brand-line/10">
-          <button
-            onClick={() => setShowShare(true)}
-            disabled={sortedActive.length === 0}
-            title={sortedActive.length === 0 ? 'No channels to share yet' : 'Generate a Meshtastic-compatible QR + URL for these channels'}
-            className="flex items-center gap-2 px-3 py-2 text-xs font-bold uppercase tracking-widest text-brand-muted hover:text-brand-accent border border-brand-line hover:border-brand-accent/50 rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-          >
-            <Share2 size={14} />
-            Share via QR
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setShowShare(true)}
+              disabled={sortedActive.length === 0}
+              title={sortedActive.length === 0 ? 'No channels to share yet' : 'Generate a Meshtastic-compatible QR + URL for these channels'}
+              className="flex items-center gap-2 px-3 py-2 text-xs font-bold uppercase tracking-widest text-brand-muted hover:text-brand-accent border border-brand-line hover:border-brand-accent/50 rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <Share2 size={14} />
+              Share via QR
+            </button>
+            <button
+              onClick={() => setShowImport(true)}
+              title="Paste a Meshtastic channel-share URL to import its channel set"
+              className="flex items-center gap-2 px-3 py-2 text-xs font-bold uppercase tracking-widest text-brand-muted hover:text-brand-accent border border-brand-line hover:border-brand-accent/50 rounded transition-colors"
+            >
+              <Download size={14} />
+              Import URL
+            </button>
+          </div>
           <div className="flex items-center gap-3">
             <button
               onClick={onClose}
@@ -334,6 +387,16 @@ export function ChannelsModal({ onClose }: ChannelsModalProps) {
         <ChannelShareQrOverlay
           channels={sortedActive}
           onClose={() => setShowShare(false)}
+        />
+      )}
+
+      {showImport && (
+        <ChannelShareImportOverlay
+          onClose={() => setShowImport(false)}
+          onApply={(imported) => {
+            setChannels(imported);
+            setShowImport(false);
+          }}
         />
       )}
     </div>
@@ -402,6 +465,115 @@ function ChannelShareQrOverlay({ channels, onClose }: { channels: Channel[]; onC
           <p className="text-[10px] text-brand-muted leading-snug">
             Anyone scanning this code (or opening the URL) on a Meshtastic client will be prompted to import the channel set, including PSKs and module settings. Treat it like a password — it grants full access to your private channels.
           </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Paste a Meshtastic channel-share URL (the same format we generate via Share
+ * via QR) and preview the parsed channel set before applying. We deliberately
+ * don't auto-write to the radio — the operator clicks "Stage" to load it into
+ * the editor, then Save & Commit on the outer dialog runs the actual radio
+ * write. This gives them a chance to inspect / tweak before destructive ops.
+ *
+ * Camera scanning isn't supported here because browsers gate `getUserMedia`
+ * behind a secure context (HTTPS or localhost). Most MeshView Sentinel users
+ * hit the dashboard over plain HTTP on a LAN IP, where camera access is
+ * blocked outright. Pasting works in every browser, on every transport.
+ */
+function ChannelShareImportOverlay({
+  onClose,
+  onApply,
+}: {
+  onClose: () => void;
+  onApply: (channels: Channel[]) => void;
+}) {
+  const [input, setInput] = useState('');
+  const trimmed = input.trim();
+  const preview = React.useMemo(() => {
+    if (!trimmed) return null;
+    return parseChannelShareUrl(trimmed);
+  }, [trimmed]);
+
+  const error = trimmed.length > 0 && preview === null
+    ? "Doesn't look like a Meshtastic channel-share URL. Expected something like https://meshtastic.org/e/#<base64>."
+    : null;
+
+  return (
+    <div className="fixed inset-0 bg-brand-bg/90 backdrop-blur-md z-[110] flex items-center justify-center p-6">
+      <div className="technical-panel w-full max-w-lg bg-brand-bg flex flex-col max-h-[80vh]">
+        <div className="px-4 py-3 border-b border-brand-line flex items-center justify-between">
+          <div>
+            <h3 className="text-base font-bold tracking-tight uppercase text-brand-ink">Import Channel Set</h3>
+            <p className="text-[10px] text-brand-muted mt-0.5">
+              Paste a Meshtastic share URL to stage its channels
+            </p>
+          </div>
+          <button onClick={onClose} className="p-1 hover:bg-brand-line rounded-full transition-colors">
+            <X size={18} />
+          </button>
+        </div>
+
+        <div className="p-4 space-y-4 overflow-y-auto">
+          <div>
+            <label className="text-[10px] uppercase font-bold text-brand-muted">Share URL</label>
+            <textarea
+              value={input}
+              onChange={e => setInput(e.target.value)}
+              placeholder="https://meshtastic.org/e/#…"
+              rows={3}
+              className="w-full mt-1 bg-brand-line/50 border border-brand-line rounded px-2 py-1.5 text-[11px] mono-text text-brand-ink focus:outline-none focus:border-brand-accent"
+              autoFocus
+            />
+            {error && (
+              <div className="mt-2 flex items-start gap-2 text-[11px] text-brand-warning">
+                <AlertTriangle size={12} className="shrink-0 mt-0.5" />
+                <span>{error}</span>
+              </div>
+            )}
+          </div>
+
+          {preview && preview.length > 0 && (
+            <div className="space-y-2">
+              <p className="text-[10px] uppercase font-bold text-brand-muted">
+                Preview ({preview.length} channel{preview.length === 1 ? '' : 's'})
+              </p>
+              <div className="space-y-1 max-h-40 overflow-y-auto rounded border border-brand-line bg-brand-line/20 p-2">
+                {preview.map(ch => (
+                  <div key={ch.index} className="flex items-center gap-2 text-[11px] mono-text">
+                    <span className="text-brand-muted shrink-0 w-12">slot {ch.index}</span>
+                    <span className="font-bold uppercase text-brand-accent shrink-0 w-16">{ch.role}</span>
+                    <span className="text-brand-ink truncate">{ch.name || '(default LongFast)'}</span>
+                    <span className="text-brand-muted ml-auto shrink-0">
+                      {ch.pskBase64 ? 'PSK set' : 'no PSK'}
+                    </span>
+                  </div>
+                ))}
+              </div>
+              <p className="text-[10px] text-brand-warning leading-snug">
+                Staging this replaces the current channel set in the editor. Nothing is written to the radio until you click <strong>Save &amp; Commit</strong>.
+              </p>
+            </div>
+          )}
+        </div>
+
+        <div className="px-4 py-3 border-t border-brand-line flex justify-end gap-2 bg-brand-line/10">
+          <button
+            onClick={onClose}
+            className="px-3 py-1.5 text-xs font-bold uppercase tracking-widest text-brand-muted hover:text-brand-ink transition-colors"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => preview && onApply(preview)}
+            disabled={!preview}
+            className="flex items-center gap-2 bg-brand-accent text-black px-4 py-1.5 rounded text-xs font-bold uppercase tracking-widest hover:brightness-110 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            <Download size={14} />
+            Stage Channels
+          </button>
         </div>
       </div>
     </div>

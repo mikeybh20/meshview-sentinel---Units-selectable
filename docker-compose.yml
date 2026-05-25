@@ -2,6 +2,13 @@ services:
   meshview:
     build: .
     ports:
+      # Host port 3000 → container port 3001 (the API server's listen port).
+      # We deliberately keep this on a high port: port 80 binding succeeds at
+      # the Docker daemon level but the host's iptables FORWARD chain on some
+      # systems silently drops external traffic to privileged ports, leading
+      # to a "hangs forever" symptom that's hard to diagnose. Operators who
+      # want port-less URLs (http://<host>/) can run a reverse proxy in
+      # front (Caddy, nginx) and forward to localhost:3000.
       - "3000:3001"
     env_file:
       - .env
@@ -27,6 +34,14 @@ services:
       - "c 188:* rmw"   # /dev/ttyUSB*
       - "c 166:* rmw"   # /dev/ttyACM*
     restart: unless-stopped
+    # Cap the json-file log driver so stdout doesn't fill the host disk over
+    # long runs (Sentinel logs every packet at debug level — useful diagnostics
+    # but unbounded by default). 5 × 10MB = 50MB ceiling per container.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
 
 volumes:
   meshview-data:

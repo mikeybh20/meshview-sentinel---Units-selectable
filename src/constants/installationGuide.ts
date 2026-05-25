@@ -70,7 +70,7 @@ cd meshview-sentinel
 docker compose up --build -d
 \`\`\`
 
-That's it. The container builds, exposes the API + web UI on host port \`3000\` (mapped to container \`3001\`), bind-mounts \`/dev\` so it can see the radio when you plug one in, and persists data to a named volume (\`meshview-data\`) at \`/app/data\` inside the container.
+That's it. The container builds, exposes the API + web UI on host port \`3000\` (mapped to container \`3001\` internally), bind-mounts \`/dev\` so it can see the radio when you plug one in, and persists data to a named volume (\`meshview-data\`) at \`/app/data\` inside the container.
 
 ### 3. Verify
 
@@ -97,10 +97,13 @@ http://<dell-gb10-ip>:3000
 On first load you land on the Dashboard. Open **Settings** (gear icon, sidebar) for first-time setup:
 
 - **Connection** — confirms the radio is detected. Switches between serial auto-discover and a TCP endpoint (\`host:port\`, default Meshtastic TCP port is \`4403\`).
-- **Modules** — enable / disable / tune modules on the local radio without leaving the browser. Currently shipped: NeighborInfo, Range Test, Telemetry, Store & Forward, External Notification.
+- **Modules** — enable / disable / tune the eight Meshtastic firmware modules from the browser: NeighborInfo, Range Test, Telemetry, Store & Forward, External Notification, MQTT, Detection Sensor, Audio. Admin writes go directly to the local radio; nothing crosses the mesh.
 - **Notifications** — desktop notifications for new messages, mentions, and node-lost events.
 - **Display** — light / dark / auto theme, message retention window, unit system (metric / imperial).
-- **AI** — drop in your Anthropic or Google Gemini API key if you want the AI assistant. Keys are stored server-side at \`data/ai-config.json\`; nothing about them ever reaches the browser.
+- **BBS** — bulletin-board state machine that handles \`:mail\` and \`:weather\` DMs from other nodes (see Phase 6 for the full feature set).
+- **Blocked** — node-level mute list; blocked senders are dropped before reaching the UI.
+- **Data** — retention windows + DB stats; export / import for backup.
+- **AI** — drop in your Anthropic or Google Gemini API key (or point at a local Ollama instance) if you want the AI assistant. Keys are stored server-side at \`data/ai-config.json\`; nothing about them ever reaches the browser.
 
 ---
 
@@ -158,9 +161,156 @@ sudo tar xzf meshview-backup-YYYY-MM-DD.tgz -C /
 docker compose up -d
 \`\`\`
 
+### Disk retention — what auto-prunes vs. what doesn't
+
+Sentinel runs a 5-minute retention loop that bounds every growing table so the SQLite database stays small over time:
+
+| Data | Bound | Operator-tunable? |
+|---|---|---|
+| Chat messages | 5000-row cap + configurable time window | Settings → Data |
+| Event log | 1000-row cap + 24h time window (default) | Settings → Data |
+| Telemetry samples | 500 per node | No |
+| Trace results | 500 total | No |
+| Range test observations | 5000 total | No |
+| BBS mail | 30 days | No |
+| Position history | 30 days | No |
+| Node sessions | 100k rows | No |
+| Per-node Mail / Subscribers / Channels / Groups / Waypoints | Operator-controlled, one row each | n/a |
+
+For a 100-node mesh with active position broadcasts, expect the SQLite DB to plateau around 50-150 MB.
+
+### Docker log rotation (important for long-running deployments)
+
+Sentinel's container writes a lot of useful diagnostic lines to stdout (every packet, every BBS interaction, every retry). Docker's default \`json-file\` log driver has **no built-in size cap** — left alone, \`/var/lib/docker/containers/<id>/<id>-json.log\` will grow indefinitely and can swallow gigabytes over a few months.
+
+Two options, pick one:
+
+**A. Rotate per-container in your compose file** (recommended for single-host setups):
+
+\`\`\`yaml
+# docker-compose.yml — under the meshview service
+logging:
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "5"
+\`\`\`
+
+Cap is then 50 MB total per container, with old chunks rotated out automatically.
+
+**B. Set host-wide defaults** in \`/etc/docker/daemon.json\` (applies to every container on this host):
+
+\`\`\`json
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "5"
+  }
+}
+\`\`\`
+
+Restart Docker (\`sudo systemctl restart docker\`) after editing. Existing containers keep their old behavior until recreated; new ones inherit the new defaults.
+
+Either way, you should never see Docker logs grow past tens of megabytes for the meshview container.
+
 ---
 
-## Phase 6: Troubleshooting
+## Phase 6: BBS Mail & Weather
+
+The BBS subsystem turns your Sentinel node into a self-service bulletin board reachable from any other node on the mesh. Remote operators interact entirely over Direct Messages — no special client needed; the stock Meshtastic phone app or any \`meshtastic --send-text\` invocation works.
+
+There are two subsystems, both triggered by lowercase \`:\`-prefixed keywords:
+
+### Mail (\`:mail\`)
+
+A persistent store-and-forward inbox for short text messages. Body cap is 200 chars (≈one Meshtastic packet) and mail is retained for 30 days regardless of read state.
+
+**Sender flow (from a remote node):**
+
+\`\`\`text
+DM ":mail"                  →  "MAIL: no new. Reply S=send, X=exit."
+DM "S"                      →  "Send TO: short name (4 chars) or X."
+DM "BH20"                   →  "TO BH20 (Mike Broadwater). Send body, max 200, X to cancel."
+DM "Hey can you grab milk?" →  "✉ Sent to BH20 (id=1)."
+\`\`\`
+
+The recipient gets a push DM notification (\`✉ Mail from <SENDER>. DM :mail R to read.\`) and a row in their inbox they can pull later.
+
+**Reader flow:**
+
+\`\`\`text
+DM ":mail"  →  "MAIL: 1 new. Reply R=read, S=send, X=exit."
+DM "R"      →  "From BH20 2m ago: Hey can you grab milk?  N=next D=delete X=exit"
+DM "D"      →  deletes; serves next unread (or "No unread mail.")
+DM "X"      →  exits the session.
+\`\`\`
+
+Shortcuts: \`:mail send\`, \`:mail read\`, \`:mail BH20\` (skip the menu and prompt for body), \`!02eb3bec\` instead of a short name (hex form bypasses short-name lookup), reply-by-typing during a read session.
+
+### Weather (\`:weather\`)
+
+On-demand US weather lookup against the National Weather Service + zippopotam.us. Returns ≤200-char compact summary:
+
+\`\`\`text
+DM ":weather"      →  "WEATHER: send 5-digit US ZIP or X to cancel."
+DM "21001"         →  "Aberdeen, MD: 42°F now, Sunny. High 48°/Low 31° today."
+
+# Shortcut form (skips the prompt)
+DM ":weather 60601" →  "Chicago, IL: 58°F now, Partly Cloudy. High 64°/Low 49° today."
+\`\`\`
+
+### Weather subscriptions
+
+Remote nodes can opt in to **proactive alerts** for the operator's configured home ZIP:
+
+\`\`\`text
+DM ":weather subscribe"    →  "Subscribed to Aberdeen, MD alerts. Reply :weather stop to unsubscribe."
+DM ":weather status"        →  "Subscribed to Aberdeen, MD alerts. :weather stop to opt out."
+DM ":weather unsubscribe"   →  "Unsubscribed. You'll no longer receive weather alerts."
+                              # Also accepted: ":weather stop", ":weather off"
+\`\`\`
+
+When a new NWS alert (warning / watch / advisory) fires for the home ZIP, every subscriber receives **both**:
+
+1. A **DM** with the compact alert text on the channel they subscribed via
+2. A **mail row** in their inbox with sender_short_name = \`WX\` (persistent — survives offline periods)
+
+The poller runs every 20 minutes. Alerts active at container start are silently absorbed (no spam after restart); only newly-issued alerts trigger fanout.
+
+### Operator-side dashboard surfaces
+
+**Mail nav item** (left sidebar) — badge shows unread count for the local node. Four tabs:
+
+- **Inbox / Outbox** — view threads with read-receipt indicators ("Read 30s ago" vs "Unread by recipient")
+- **Compose** — send mail to any node from the dashboard (recipient picker with online status, 200-char body counter)
+- **Users** — every distinct node that has used the BBS, with sent / received / unread counts and last-activity timestamp
+
+**Settings → BBS** — all configuration plus a live **Subscribers** panel showing each subscribed node, the channel they subscribed via, subscribe time, last alert delivered, and a per-row Remove button.
+
+### Configuration knobs (Settings → BBS)
+
+| Setting | Default | Range | Notes |
+|---|---|---|---|
+| **Enabled** | on | toggle | Master switch. When off, all \`:\`-prefixed DMs flow through to the normal message log instead of the BBS state machine. |
+| **Mail trigger** | \`:mail\` | colon + 1-15 chars, lowercase | Validated client-side. Custom triggers let you match a network convention. |
+| **Weather trigger** | \`:weather\` | colon + 1-15 chars, lowercase | Must differ from the mail trigger. |
+| **Body cap** | 200 chars | 50-228 | Hard limit on mail body length. 228 = the firmware payload ceiling. |
+| **Retention** | 30 days | 1-365 | Mail older than this is pruned automatically, regardless of read state. |
+| **Reply pace** | 2000 ms | 0-10000 | Minimum gap between successive BBS replies to the same destination. Prevents tripping the firmware's per-destination rate limiter. |
+| **Home ZIP** | (empty) | 5 digits or empty | When set, the alert poller runs every 20 min for this ZIP. Subscribers receive alerts from here. Leave empty to disable the proactive alert path (the on-demand \`:weather\` command is unaffected). |
+
+All changes apply immediately — no radio restart needed.
+
+### Conflicts and routing
+
+- **AI assistant DMs**: any DM whose text starts with \`:\` and matches a configured trigger is consumed by BBS first and never reaches the AI. Non-prefixed DMs flow to the AI as before.
+- **Self-DMs to local node**: blocked at the UI layer; the Messages view shows a "you can't DM your own node" notice instead of the compose input. Self-DMs would otherwise consume rate-limit budget without going on-air.
+- **Per-destination rate limit (err=38)**: the bridge auto-retries with a 10-second backoff if the firmware throttles us. Combined with the 2-second BBS reply pacing, this is rarely visible in practice.
+
+---
+
+## Phase 7: Troubleshooting
 
 ### Radio not detected
 
@@ -203,8 +353,10 @@ Open **Settings → Modules → NeighborInfo → Enabled**. The bridge issues an
 | Component | Path | Notes |
 |---|---|---|
 | API + bridge | \`server/api.ts\` + \`server/meshtasticSerial.ts\` | Express + a hand-rolled raw-protobuf Meshtastic decoder/encoder. Tiny dependency tree, full visibility into parser bugs. |
+| BBS state machine | \`server/bbs.ts\` + \`server/bbsConfig.ts\` | In-process state machine handling \`:mail\` / \`:weather\` DMs. Config persisted to \`data/bbs-config.json\`. |
+| Weather + alerts | \`server/weather.ts\` + \`server/weatherAlertPoller.ts\` | NWS forecast / alerts client; 20-min background poller dedupes by NWS alert id. |
 | Web UI | \`src/\` | React 19 + Vite + Tailwind v4 |
-| Storage | SQLite via better-sqlite3 | Single \`mesh.sqlite\` file in the data volume; FTS5 over messages |
+| Storage | SQLite via better-sqlite3 | Single \`mesh.sqlite\` file in the data volume; FTS5 over messages. BBS adds \`bbs_mail\` + \`bbs_weather_subscribers\` tables. |
 | Real-time sync | Server-Sent Events | Multi-tab live updates within ~250 ms |
 | Container | \`Dockerfile\` + \`docker-compose.yml\` | Single-service stack; data in a named volume |
 
