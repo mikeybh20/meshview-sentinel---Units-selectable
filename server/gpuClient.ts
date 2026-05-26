@@ -93,6 +93,134 @@ export async function callSidecar<TReq, TRes>(
 }
 
 // ---------------------------------------------------------------------
+// Phase 3: spatial clustering for map pins (DBSCAN).
+// ---------------------------------------------------------------------
+
+export interface ClusterPoint {
+  lat: number;
+  lng: number;
+  radio_id?: string | null;
+  node_id?: string | null;
+}
+
+export interface ClusterRequest {
+  points: ClusterPoint[];
+  eps_meters: number;
+  min_samples?: number;
+}
+
+export interface ClusterSummary {
+  id: number;
+  count: number;
+  lat: number;
+  lng: number;
+  node_ids: string[];
+  radio_ids: string[];
+}
+
+export interface ClusterResponse {
+  labels: number[];
+  clusters: ClusterSummary[];
+  /** Where the work ran: `cuml` (GPU), `cpu` (pure-Python sidecar), or `cpu_ts` (fallback in this process). */
+  backend: 'cuml' | 'cpu' | 'cpu_ts' | 'noop';
+}
+
+/**
+ * Cluster lat/lng points via the GPU sidecar. Falls back to a TS DBSCAN
+ * implementation when the sidecar is unreachable. Functionally equivalent;
+ * the TS path is slower but accurate enough for the dev path.
+ */
+export async function clusterDbscan(req: ClusterRequest): Promise<ClusterResponse> {
+  if (req.points.length === 0) {
+    return { labels: [], clusters: [], backend: 'noop' };
+  }
+  const remote = await callSidecar<ClusterRequest, ClusterResponse>('/cluster/dbscan', {
+    points: req.points,
+    eps_meters: req.eps_meters,
+    min_samples: req.min_samples ?? 2,
+  });
+  if (remote) return remote;
+  return clusterDbscanCpu(req);
+}
+
+// ---- CPU fallback in TS (pure-JS DBSCAN) ----
+
+function haversineMeters(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const R = 6371000;
+  const p1 = (lat1 * Math.PI) / 180;
+  const p2 = (lat2 * Math.PI) / 180;
+  const dp = ((lat2 - lat1) * Math.PI) / 180;
+  const dl = ((lng2 - lng1) * Math.PI) / 180;
+  const a = Math.sin(dp / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+export function clusterDbscanCpu(req: ClusterRequest): ClusterResponse {
+  const pts = req.points;
+  const n = pts.length;
+  const eps = req.eps_meters;
+  const minSamples = req.min_samples ?? 2;
+  const labels: number[] = new Array(n).fill(-1);
+  let clusterId = 0;
+
+  const neighborsOf = (i: number): number[] => {
+    const out: number[] = [];
+    for (let j = 0; j < n; j++) {
+      if (i === j) continue;
+      if (haversineMeters(pts[i].lat, pts[i].lng, pts[j].lat, pts[j].lng) <= eps) out.push(j);
+    }
+    return out;
+  };
+
+  for (let i = 0; i < n; i++) {
+    if (labels[i] !== -1) continue;
+    const nbrs = neighborsOf(i);
+    if (nbrs.length + 1 < minSamples) continue;
+    labels[i] = clusterId;
+    const queue = [...nbrs];
+    while (queue.length) {
+      const q = queue.pop()!;
+      if (labels[q] !== -1) continue;
+      labels[q] = clusterId;
+      const qn = neighborsOf(q);
+      if (qn.length + 1 >= minSamples) queue.push(...qn);
+    }
+    clusterId++;
+  }
+
+  // Promote noise to singleton clusters so the client treats each as its own marker.
+  let nextId = labels.some(l => l >= 0) ? Math.max(...labels) + 1 : 0;
+  const outLabels = labels.map(l => {
+    if (l === -1) {
+      const v = nextId++;
+      return v;
+    }
+    return l;
+  });
+
+  const cmap = new Map<number, { id: number; count: number; latSum: number; lngSum: number; nodeIds: string[]; radioIds: Set<string> }>();
+  for (let i = 0; i < n; i++) {
+    const lbl = outLabels[i];
+    let c = cmap.get(lbl);
+    if (!c) { c = { id: lbl, count: 0, latSum: 0, lngSum: 0, nodeIds: [], radioIds: new Set() }; cmap.set(lbl, c); }
+    c.count++;
+    c.latSum += pts[i].lat;
+    c.lngSum += pts[i].lng;
+    if (pts[i].node_id) c.nodeIds.push(pts[i].node_id!);
+    if (pts[i].radio_id) c.radioIds.add(pts[i].radio_id!);
+  }
+  const clusters: ClusterSummary[] = Array.from(cmap.values())
+    .map(c => ({
+      id: c.id, count: c.count,
+      lat: c.latSum / c.count, lng: c.lngSum / c.count,
+      node_ids: c.nodeIds, radio_ids: Array.from(c.radioIds).sort(),
+    }))
+    .sort((a, b) => a.id - b.id);
+
+  return { labels: outLabels, clusters, backend: 'cpu_ts' };
+}
+
+// ---------------------------------------------------------------------
 // Boot probe — logs the sidecar status at startup so the operator knows
 // what acceleration tier they have. Non-blocking; sidecar may not be up
 // yet when this runs.

@@ -685,6 +685,17 @@ function TraceLog({ nodeId }: { nodeId: string }) {
   );
 }
 
+// Pigeon-maps meters-per-pixel at a given latitude + zoom (Web Mercator).
+// Used to convert a "pixel collision radius" into a real-world DBSCAN eps.
+function metersPerPixel(lat: number, zoom: number): number {
+  return (156543.03392 * Math.cos((lat * Math.PI) / 180)) / Math.pow(2, zoom);
+}
+
+// We want pins to merge when they sit within ~24 px of each other on screen.
+// Smaller eps at high zoom (pins resolve individually); larger at low zoom
+// (pins collapse aggressively).
+const PIN_COLLISION_PIXELS = 24;
+
 function DashboardMapWidget({ nodes }: { nodes: Node[] }) {
   const positioned = nodes.filter(n => n.position);
   const { radios } = useRadios();
@@ -731,6 +742,40 @@ function DashboardMapWidget({ nodes }: { nodes: Node[] }) {
     setZoom(derivedZoom);
   }, [derivedCenter, derivedZoom]);
 
+  // v2.0 Phase 3c: GPU-accelerated spatial clustering. Eps is derived from
+  // current zoom so pins merge once their screen distance falls below
+  // PIN_COLLISION_PIXELS. Debounced so pan-jitter doesn't hammer the sidecar.
+  type ClusterMarker = {
+    id: number;
+    lat: number;
+    lng: number;
+    count: number;
+    nodeIds: string[];
+    radioIds: string[];
+  };
+  const [clusters, setClusters] = React.useState<ClusterMarker[]>([]);
+  const [backend, setBackend] = React.useState<'cuml' | 'cpu' | 'cpu_ts' | 'noop' | null>(null);
+
+  React.useEffect(() => {
+    if (positioned.length === 0) { setClusters([]); return; }
+    const epsM = metersPerPixel(center[0], zoom) * PIN_COLLISION_PIXELS;
+    const points = positioned.map(n => ({
+      lat: n.position!.lat,
+      lng: n.position!.lng,
+      node_id: n.id,
+      radio_id: n.heardByRadios?.[0] ?? null,
+    }));
+    const timer = setTimeout(async () => {
+      const res = await meshDataService.clusterMapPoints({ points, eps_meters: epsM, min_samples: 2 });
+      if (!res) return;
+      setBackend(res.backend);
+      setClusters(res.clusters.map(c => ({
+        id: c.id, lat: c.lat, lng: c.lng, count: c.count, nodeIds: c.node_ids, radioIds: c.radio_ids,
+      })));
+    }, 200);
+    return () => clearTimeout(timer);
+  }, [positioned, center, zoom]);
+
   return (
     <div className="technical-panel h-[720px] overflow-hidden relative">
       <div className="absolute inset-0 z-0">
@@ -745,26 +790,48 @@ function DashboardMapWidget({ nodes }: { nodes: Node[] }) {
             setZoom(z);
           }}
         >
-          {positioned.map(node => {
-            // v2.0: tint pin by the most-recent hearing radio's color when
-            // available; fall back to the brand accent for nodes without
-            // heard-by data (legacy 1.x rows or simulator).
-            const mruRadio = node.heardByRadios?.[0];
-            const pinColor = (mruRadio && radioColors[mruRadio])
+          {clusters.map(cl => {
+            // v2.0 Phase 3c: one marker per spatial cluster. Multi-radio
+            // clusters get the first hearing radio's color; singletons fall
+            // back to the brand accent when there's no heard-by data.
+            const pinColor = (cl.radioIds[0] && radioColors[cl.radioIds[0]])
               || 'var(--color-brand-accent)';
             return (
               <Marker
-                key={node.id}
-                width={20}
-                anchor={[node.position!.lat, node.position!.lng]}
+                key={cl.id}
+                width={cl.count > 1 ? 28 : 20}
+                anchor={[cl.lat, cl.lng]}
                 color={pinColor}
-              />
+              >
+                {cl.count > 1 && (
+                  <div
+                    title={`${cl.count} nodes clustered\n${cl.nodeIds.slice(0, 8).join(', ')}${cl.nodeIds.length > 8 ? ', …' : ''}`}
+                    className="absolute -top-1 -right-1 min-w-[16px] h-[16px] px-1 rounded-full bg-brand-bg border border-brand-accent text-brand-accent text-[9px] font-bold flex items-center justify-center pointer-events-none"
+                  >
+                    +{cl.count}
+                  </div>
+                )}
+              </Marker>
             );
           })}
         </Map>
       </div>
-      <div className="absolute top-2 left-2 px-2 py-1 bg-brand-bg/80 backdrop-blur-md rounded text-[10px] font-bold uppercase tracking-widest border border-brand-line">
-        Mesh Coverage
+      <div className="absolute top-2 left-2 flex items-center gap-2">
+        <div className="px-2 py-1 bg-brand-bg/80 backdrop-blur-md rounded text-[10px] font-bold uppercase tracking-widest border border-brand-line">
+          Mesh Coverage
+        </div>
+        {backend && backend !== 'noop' && (
+          <div
+            title={
+              backend === 'cuml' ? 'GPU sidecar (cuML DBSCAN)' :
+              backend === 'cpu' ? 'Python sidecar (CPU DBSCAN)' :
+              'TS CPU fallback (sidecar unreachable)'
+            }
+            className="px-2 py-1 bg-brand-bg/80 backdrop-blur-md rounded text-[9px] mono-text uppercase tracking-widest border border-brand-line text-brand-muted"
+          >
+            {backend === 'cuml' ? 'GPU' : backend === 'cpu' ? 'SIDECAR' : 'CPU'}
+          </div>
+        )}
       </div>
     </div>
   );

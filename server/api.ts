@@ -17,7 +17,7 @@ import { WeatherAlertPoller } from './weatherAlertPoller.js';
 import { bridgeManager } from './bridgeManager.js';
 // v2.0 GPU sidecar boot probe. Logs sidecar reachability + detected GPU
 // at startup so the operator immediately knows their acceleration tier.
-import { probeGpuOnBoot, health as gpuHealth } from './gpuClient.js';
+import { probeGpuOnBoot, health as gpuHealth, clusterDbscan } from './gpuClient.js';
 probeGpuOnBoot();
 
 // Wire BBS-Mail. The bridge type-imports BbsService so we attach it after
@@ -554,6 +554,32 @@ app.put('/api/mesh/radios/:radioId/lora', async (req, res) => {
 app.get('/api/gpu/health', async (_req, res) => {
   const h = await gpuHealth();
   return res.json(h);
+});
+
+// --- v2.0 Phase 3 GPU clustering passthrough. ---
+// The dashboard map calls this when its viewport / zoom / node set changes
+// so overlapping pins collapse into a `+N` cluster badge instead of stacking
+// invisibly. Falls back to a pure-TS DBSCAN if the sidecar is unreachable
+// (the gpuClient does this transparently — clients always get a result).
+app.post('/api/gpu/cluster', async (req, res) => {
+  const body = req.body ?? {};
+  if (!Array.isArray(body.points)) {
+    return res.status(400).json({ error: 'points must be an array of {lat, lng, ...}' });
+  }
+  const eps = Number(body.eps_meters);
+  if (!Number.isFinite(eps) || eps <= 0) {
+    return res.status(400).json({ error: 'eps_meters must be a positive number' });
+  }
+  try {
+    const result = await clusterDbscan({
+      points: body.points,
+      eps_meters: eps,
+      min_samples: Number.isFinite(body.min_samples) ? body.min_samples : 2,
+    });
+    return res.json(result);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'clustering failed' });
+  }
 });
 
 // --- TCP transport: connect / disconnect ---

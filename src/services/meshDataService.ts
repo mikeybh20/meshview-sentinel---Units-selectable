@@ -550,6 +550,30 @@ export class MeshDataService {
     }
   }
 
+  // -------------------------------------------------------------------
+  // v2.0 Phase 3 GPU clustering for map pins.
+  // -------------------------------------------------------------------
+
+  async clusterMapPoints(input: {
+    points: Array<{ lat: number; lng: number; radio_id?: string | null; node_id?: string | null }>;
+    eps_meters: number;
+    min_samples?: number;
+  }): Promise<{
+    labels: number[];
+    clusters: Array<{ id: number; count: number; lat: number; lng: number; node_ids: string[]; radio_ids: string[] }>;
+    backend: 'cuml' | 'cpu' | 'cpu_ts' | 'noop';
+  } | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/gpu/cluster`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(input),
+      });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  }
+
   /** Subscribe to channel list updates (replays the last known list immediately). */
   onChannels(callback: (channels: Channel[]) => void) {
     this.channelListeners.push(callback);
