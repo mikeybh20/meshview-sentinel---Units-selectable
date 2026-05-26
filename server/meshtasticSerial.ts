@@ -1048,7 +1048,7 @@ export class MeshtasticSerialBridge extends EventEmitter {
   /** Persist a single message row (insert-or-replace on the same id). */
   private persistMessage(msg: MeshMessage) {
     try {
-      this.db.insertMessage(msg);
+      this.db.insertMessage(msg, this.radioId);
     } catch (err: any) {
       console.error('[MeshtasticSerial] insertMessage persist failed:', err.message);
     }
@@ -3176,7 +3176,7 @@ export class MeshtasticSerialBridge extends EventEmitter {
     if (this.messages.length > 500) {
       this.messages = this.messages.slice(-500);
     }
-    try { this.db.insertMessage(msg); } catch (e: any) {
+    try { this.db.insertMessage(msg, this.radioId); } catch (e: any) {
       console.error('[MeshtasticSerial] message persist failed:', e.message);
     }
 
@@ -5119,7 +5119,7 @@ export class MeshtasticSerialBridge extends EventEmitter {
     if (this.events.length > 100) {
       this.events = this.events.slice(0, 100);
     }
-    try { this.db.insertEvent(event); } catch (e: any) {
+    try { this.db.insertEvent(event, this.radioId); } catch (e: any) {
       console.error('[MeshtasticSerial] event persist failed:', e.message);
     }
     this.emit('event', event);

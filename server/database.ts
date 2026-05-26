@@ -912,6 +912,41 @@ export class MeshDatabase {
     const pos = node.position;
     const now = Date.now();
 
+    // v2.0 multi-radio: merge heardByRadios + lastHeardAtPerRadio with any
+    // already-persisted state. Without this, two bridges writing the same
+    // node clobber each other's attribution because raw_json is fully
+    // overwritten on conflict. We read the existing row, merge, and let the
+    // writer continue with the combined view.
+    try {
+      const existing = this.db.prepare(`SELECT raw_json FROM nodes WHERE id = ?`).get(node.id) as { raw_json: string } | undefined;
+      if (existing) {
+        const prev = safeParse<MeshNode>(existing.raw_json);
+        if (prev) {
+          const prevHeard = prev.heardByRadios ?? [];
+          const nextHeard = node.heardByRadios ?? [];
+          // Combine, deduplicate, newest-first (so the bridge that just wrote
+          // is at index 0).
+          const seen = new Set<string>();
+          const merged: string[] = [];
+          for (const r of [...nextHeard, ...prevHeard]) {
+            if (!seen.has(r)) { seen.add(r); merged.push(r); }
+          }
+          if (merged.length > 0) node.heardByRadios = merged;
+
+          const prevAt = prev.lastHeardAtPerRadio ?? {};
+          const nextAt = node.lastHeardAtPerRadio ?? {};
+          const mergedAt: Record<string, number> = { ...prevAt };
+          for (const [rid, t] of Object.entries(nextAt)) {
+            mergedAt[rid] = Math.max(mergedAt[rid] ?? 0, t);
+          }
+          if (Object.keys(mergedAt).length > 0) node.lastHeardAtPerRadio = mergedAt;
+        }
+      }
+    } catch (err: any) {
+      // Best-effort merge; don't fail the write.
+      console.warn('[MeshDB] heardByRadios merge skipped:', err.message);
+    }
+
     this.db.prepare(`
       INSERT INTO nodes (
         id, num, name, short_name, first_seen, last_seen, online, favorite, is_local,
@@ -1008,13 +1043,13 @@ export class MeshDatabase {
   // ---------------------------------------------------------------------
   // Messages
   // ---------------------------------------------------------------------
-  insertMessage(msg: MeshMessage) {
+  insertMessage(msg: MeshMessage, radioId: string | null = null) {
     this.db.prepare(`
       INSERT OR REPLACE INTO messages (
         id, from_id, to_id, channel, text, timestamp, hop_limit,
         rx_snr, rx_rssi, hops_json, status, error_code, is_own,
-        packet_id, reply_to, is_reaction, delivery_ms
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        packet_id, reply_to, is_reaction, delivery_ms, radio_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       msg.id,
       msg.from,
@@ -1033,6 +1068,7 @@ export class MeshDatabase {
       typeof msg.replyTo === 'number' ? msg.replyTo : null,
       msg.isReaction ? 1 : 0,
       typeof msg.deliveryMs === 'number' ? msg.deliveryMs : null,
+      radioId,
     );
     this.pruneMessages();
   }
@@ -1092,11 +1128,11 @@ export class MeshDatabase {
   // ---------------------------------------------------------------------
   // Events
   // ---------------------------------------------------------------------
-  insertEvent(ev: MeshEvent) {
+  insertEvent(ev: MeshEvent, radioId: string | null = null) {
     this.db.prepare(`
-      INSERT OR REPLACE INTO events (id, type, node_id, timestamp, details)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(ev.id, ev.type, ev.nodeId ?? null, ev.timestamp, ev.details);
+      INSERT OR REPLACE INTO events (id, type, node_id, timestamp, details, radio_id)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(ev.id, ev.type, ev.nodeId ?? null, ev.timestamp, ev.details, radioId);
     this.pruneEvents();
   }
 

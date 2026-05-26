@@ -487,6 +487,31 @@ app.post('/api/mesh/radios/:radioId/default', (req, res) => {
   return res.json({ ok: true, defaultRadioId: radioId });
 });
 
+// --- v2.0 Phase 3b: secondary-bridge connect / disconnect / status ---
+// The default radio is auto-managed; these endpoints only operate on
+// non-default radios stored in the radios table. Connecting spawns a
+// fresh MeshtasticSerialBridge instance that streams its packets into
+// the unified node/message/event view via the BridgeManager aggregator.
+
+app.post('/api/mesh/radios/:radioId/connect', async (req, res) => {
+  const result = await bridgeManager.spawnSecondary(req.params.radioId);
+  if (!result.ok) return res.status(409).json({ error: (result as { ok: false; error: string }).error });
+  return res.json({ ok: true });
+});
+
+app.post('/api/mesh/radios/:radioId/disconnect', async (req, res) => {
+  const result = await bridgeManager.disconnectRadio(req.params.radioId);
+  if (!result.ok) return res.status(409).json({ error: (result as { ok: false; error: string }).error });
+  return res.json({ ok: true });
+});
+
+app.get('/api/mesh/radios/connections', (_req, res) => {
+  return res.json({
+    states: bridgeManager.connectionStates(),
+    defaultRadioId: bridgeManager.getDefaultRadioId(),
+  });
+});
+
 // --- LoRa config read + write (firmware admin) ---
 // GET returns the most-recently-read LoRa config from the radio + the cached
 // radios.row values. POST writes new values via admin.set_config and triggers
@@ -658,9 +683,15 @@ app.post('/api/mesh/refresh', (req, res) => {
   }
 });
 
-// All mesh nodes seen by the radio
+// All mesh nodes — v2.0 aggregates across every connected radio so a single
+// list reflects the union of meshes the operator is bridging. heardByRadios
+// preserves attribution per node.
 app.get('/api/mesh/nodes', (_req, res) => {
-  return res.json(meshBridge.getNodes());
+  // Fall back to the singleton's view if BridgeManager has no contexts yet
+  // (very early boot before auto-registration completes).
+  const ctxs = bridgeManager.list();
+  if (ctxs.length === 0) return res.json(meshBridge.getNodes());
+  return res.json(bridgeManager.getAllNodes());
 });
 
 // Node groups (operator-defined organizational tags)
@@ -788,9 +819,11 @@ app.delete('/api/mesh/blocked/:nodeId', (req, res) => {
   }
 });
 
-// All messages received by the radio
+// All messages received by the radio — aggregates across all bridges.
 app.get('/api/mesh/messages', (_req, res) => {
-  return res.json(meshBridge.getMessages());
+  const ctxs = bridgeManager.list();
+  if (ctxs.length === 0) return res.json(meshBridge.getMessages());
+  return res.json(bridgeManager.getAllMessages());
 });
 
 // Full-text search across all persisted messages
@@ -805,19 +838,23 @@ app.get('/api/mesh/messages/search', (req, res) => {
   }
 });
 
-// Event log
+// Event log — aggregates across all bridges.
 app.get('/api/mesh/events', (_req, res) => {
-  return res.json(meshBridge.getEvents());
+  const ctxs = bridgeManager.list();
+  if (ctxs.length === 0) return res.json(meshBridge.getEvents());
+  return res.json(bridgeManager.getAllEvents());
 });
 
 // Full snapshot (nodes + messages + events in one call)
 app.get('/api/mesh/snapshot', (_req, res) => {
   let blocked: string[] = [];
   try { blocked = meshDb().loadBlockedNodes(); } catch { /* fall back to empty */ }
+  const ctxs = bridgeManager.list();
+  const useAgg = ctxs.length > 0;
   return res.json({
-    nodes: meshBridge.getNodes(),
-    messages: meshBridge.getMessages(),
-    events: meshBridge.getEvents(),
+    nodes:    useAgg ? bridgeManager.getAllNodes()    : meshBridge.getNodes(),
+    messages: useAgg ? bridgeManager.getAllMessages() : meshBridge.getMessages(),
+    events:   useAgg ? bridgeManager.getAllEvents()   : meshBridge.getEvents(),
     channels: meshBridge.getChannels(),
     waypoints: meshBridge.getWaypoints(),
     traces: meshBridge.getTraces(),
@@ -1971,18 +2008,26 @@ app.post('/api/mesh/send', async (req, res) => {
 // Server-Sent Events stream for real-time ACK/status updates
 const sseClients = new Set<(data: string) => void>();
 
-// v2.0: every SSE payload carries the source radio_id so Phase 3's
-// per-radio filter chips can drop events that don't belong to the
-// selected radio without needing a separate channel per radio.
-meshBridge.on('ackUpdate', (msgId: string, status: string, errorCode: number) => {
-  const payload = `event: ack\ndata: ${JSON.stringify({ msgId, status, errorCode: errorCode ?? 0, radioId: bridgeManager.getDefaultRadioId() })}\n\n`;
+// v2.0 Phase 3b: every SSE payload carries the source radio_id so the
+// client can filter by selected radio. BridgeManager re-broadcasts events
+// from every connected bridge (default + secondaries) and appends the
+// origin radio_id as the final argument — see [bridgeManager.ts](./bridgeManager.ts).
+function radioIdFromArgs(args: any[]): string | null {
+  const last = args[args.length - 1];
+  return typeof last === 'string' || last === null ? last : bridgeManager.getDefaultRadioId();
+}
+
+bridgeManager.on('ackUpdate', (...args: any[]) => {
+  const [msgId, status, errorCode] = args;
+  const payload = `event: ack\ndata: ${JSON.stringify({ msgId, status, errorCode: errorCode ?? 0, radioId: radioIdFromArgs(args) })}\n\n`;
   for (const send of sseClients) {
     try { send(payload); } catch { /* client gone */ }
   }
 });
 
-meshBridge.on('traceUpdate', (trace: any) => {
-  const payload = `event: trace\ndata: ${JSON.stringify({ ...trace, radioId: bridgeManager.getDefaultRadioId() })}\n\n`;
+bridgeManager.on('traceUpdate', (...args: any[]) => {
+  const [trace] = args;
+  const payload = `event: trace\ndata: ${JSON.stringify({ ...trace, radioId: radioIdFromArgs(args) })}\n\n`;
   for (const send of sseClients) {
     try { send(payload); } catch { /* client gone */ }
   }
@@ -1990,8 +2035,8 @@ meshBridge.on('traceUpdate', (trace: any) => {
 
 // Waypoint changes fan out to every connected client so a drop-pin on one
 // browser tab appears instantly on every other open tab.
-meshBridge.on('waypointsChanged', () => {
-  const payload = `event: waypoints\ndata: ${JSON.stringify({ ts: Date.now(), radioId: bridgeManager.getDefaultRadioId() })}\n\n`;
+bridgeManager.on('waypointsChanged', (...args: any[]) => {
+  const payload = `event: waypoints\ndata: ${JSON.stringify({ ts: Date.now(), radioId: radioIdFromArgs(args) })}\n\n`;
   for (const send of sseClients) {
     try { send(payload); } catch { /* client gone */ }
   }
@@ -2000,22 +2045,22 @@ meshBridge.on('waypointsChanged', () => {
 // Generic "something interesting changed" multiplexer. The bridge fires these
 // fairly frequently (nodeUpdate fires on every telemetry/position update, etc.)
 // — the client debounces them server-side could be added later if needed.
-const fanOut = (eventName: string) => () => {
-  const payload = `event: ${eventName}\ndata: ${JSON.stringify({ ts: Date.now(), radioId: bridgeManager.getDefaultRadioId() })}\n\n`;
+const fanOut = (eventName: string) => (...args: any[]) => {
+  const payload = `event: ${eventName}\ndata: ${JSON.stringify({ ts: Date.now(), radioId: radioIdFromArgs(args) })}\n\n`;
   for (const send of sseClients) {
     try { send(payload); } catch { /* client gone */ }
   }
 };
 
-meshBridge.on('nodeUpdate',              fanOut('node'));
-meshBridge.on('event',                   fanOut('eventLog'));
-meshBridge.on('storeForwardUpdate',      fanOut('storeForward'));
-meshBridge.on('neighborInfoUpdate',      fanOut('neighborInfo'));
-meshBridge.on('localModuleConfigUpdate', fanOut('moduleConfig'));
-meshBridge.on('bbsMail',                 fanOut('bbsMail'));
-meshBridge.on('bbsSubscriber',           fanOut('bbsSubscriber'));
+bridgeManager.on('nodeUpdate',              fanOut('node'));
+bridgeManager.on('event',                   fanOut('eventLog'));
+bridgeManager.on('storeForwardUpdate',      fanOut('storeForward'));
+bridgeManager.on('neighborInfoUpdate',      fanOut('neighborInfo'));
+bridgeManager.on('localModuleConfigUpdate', fanOut('moduleConfig'));
+bridgeManager.on('bbsMail',                 fanOut('bbsMail'));
+bridgeManager.on('bbsSubscriber',           fanOut('bbsSubscriber'));
 // v2.0: LoRa config readback completed — Settings → Radios re-fetches.
-meshBridge.on('loraConfigUpdate',        fanOut('loraConfig'));
+bridgeManager.on('loraConfigUpdate',        fanOut('loraConfig'));
 
 app.get('/api/mesh/stream', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');

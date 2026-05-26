@@ -4300,9 +4300,11 @@ const MODEM_PRESET_OPTIONS: Array<{ value: number; label: string }> = [
 function RadiosSection() {
   const [radios, setRadios] = React.useState<RadioRow[]>([]);
   const [defaultRadioId, setDefaultRadioId] = React.useState<string | null>(null);
+  const [connectionStates, setConnectionStates] = React.useState<Record<string, { connected: boolean; transport: string | null }>>({});
   const [loading, setLoading] = React.useState(true);
   const [showAdd, setShowAdd] = React.useState(false);
   const [editingId, setEditingId] = React.useState<string | null>(null);
+  const [busyRadioId, setBusyRadioId] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
 
   const reload = React.useCallback(async () => {
@@ -4312,17 +4314,26 @@ function RadiosSection() {
       setRadios(data.radios);
       setDefaultRadioId(data.defaultRadioId);
     }
+    const conns = await meshDataService.getRadioConnections();
+    if (conns) setConnectionStates(conns.states);
     setLoading(false);
   }, []);
 
   React.useEffect(() => { reload(); }, [reload]);
 
   // Re-fetch on LoRa-config SSE so the row's region/preset/slot/hops stays live.
+  // Also re-fetch on `connected`/`disconnected` events so the Connect/Disconnect
+  // pill flips in real time when secondary bridges come and go.
   React.useEffect(() => {
     const es = new EventSource(`${API_BASE}/api/mesh/stream`);
     const handler = () => { reload(); };
     es.addEventListener('loraConfig', handler);
-    return () => { es.removeEventListener('loraConfig', handler); es.close(); };
+    es.addEventListener('node', handler);
+    return () => {
+      es.removeEventListener('loraConfig', handler);
+      es.removeEventListener('node', handler);
+      es.close();
+    };
   }, [reload]);
 
   const handleDelete = async (id: string) => {
@@ -4338,12 +4349,30 @@ function RadiosSection() {
     reload();
   };
 
+  const handleConnect = async (id: string) => {
+    setError(null);
+    setBusyRadioId(id);
+    const r = await meshDataService.connectRadio(id);
+    setBusyRadioId(null);
+    if (!r.ok) { setError(r.error || 'connect failed'); return; }
+    reload();
+  };
+
+  const handleDisconnect = async (id: string) => {
+    setError(null);
+    setBusyRadioId(id);
+    const r = await meshDataService.disconnectRadio(id);
+    setBusyRadioId(null);
+    if (!r.ok) { setError(r.error || 'disconnect failed'); return; }
+    reload();
+  };
+
   return (
     <div className="space-y-4">
       <div className="flex items-start justify-between gap-3">
         <SectionHeader
           title="Radios"
-          subtitle="Each connected radio appears here with its 4-char short name. v2.0 ships read-only listing + LoRa config for the auto-registered default radio; full multi-radio connection support lands in Phase 3."
+          subtitle="Each configured radio appears here with its 4-char short name. The default radio connects automatically via the discovered hardware; secondary radios (TCP / serial) connect on demand."
         />
         <button
           onClick={() => { setError(null); setShowAdd(true); }}
@@ -4375,10 +4404,14 @@ function RadiosSection() {
               key={r.radio_id}
               row={r}
               isDefault={r.radio_id === defaultRadioId}
+              isConnected={!!connectionStates[r.radio_id]?.connected}
               isEditing={editingId === r.radio_id}
+              busy={busyRadioId === r.radio_id}
               onEdit={() => setEditingId(editingId === r.radio_id ? null : r.radio_id)}
               onDelete={() => handleDelete(r.radio_id)}
               onSetDefault={() => handleSetDefault(r.radio_id)}
+              onConnect={() => handleConnect(r.radio_id)}
+              onDisconnect={() => handleDisconnect(r.radio_id)}
               onChanged={reload}
             />
           ))}
@@ -4397,14 +4430,18 @@ function RadiosSection() {
 }
 
 function RadioRowCard({
-  row, isDefault, isEditing, onEdit, onDelete, onSetDefault, onChanged,
+  row, isDefault, isConnected, isEditing, busy, onEdit, onDelete, onSetDefault, onConnect, onDisconnect, onChanged,
 }: {
   row: RadioRow;
   isDefault: boolean;
+  isConnected: boolean;
   isEditing: boolean;
+  busy: boolean;
   onEdit: () => void;
   onDelete: () => void;
   onSetDefault: () => void;
+  onConnect: () => void;
+  onDisconnect: () => void;
   onChanged: () => void;
 }) {
   return (
@@ -4421,6 +4458,16 @@ function RadioRowCard({
               <span className="text-xs font-bold mono-text text-brand-ink">{row.radio_id}</span>
               {isDefault && <Star size={10} className="text-amber-400 fill-amber-400" />}
               <span className="text-[10px] uppercase tracking-widest text-brand-muted">{row.transport}</span>
+              <span
+                className={cn(
+                  "text-[9px] font-bold uppercase tracking-widest px-1.5 py-0.5 rounded border",
+                  isConnected
+                    ? "text-emerald-400 border-emerald-400/40 bg-emerald-400/10"
+                    : "text-brand-muted border-brand-line"
+                )}
+              >
+                {isConnected ? '● connected' : '○ disconnected'}
+              </span>
             </div>
             <p className="text-[11px] text-brand-muted truncate">
               {row.long_name}
@@ -4433,13 +4480,34 @@ function RadioRowCard({
         </div>
         <div className="flex items-center gap-1 flex-shrink-0">
           {!isDefault && (
-            <button
-              onClick={onSetDefault}
-              className="text-[10px] font-bold uppercase tracking-widest text-brand-muted hover:text-brand-accent px-2 py-1 rounded hover:bg-brand-line/40"
-              title="Make this the default radio"
-            >
-              Set Default
-            </button>
+            <>
+              {isConnected ? (
+                <button
+                  onClick={onDisconnect}
+                  disabled={busy}
+                  className="text-[10px] font-bold uppercase tracking-widest text-amber-300 hover:bg-amber-500/15 disabled:opacity-40 px-2 py-1 rounded"
+                  title="Disconnect this radio"
+                >
+                  {busy ? <Loader2 size={11} className="animate-spin" /> : 'Disconnect'}
+                </button>
+              ) : (
+                <button
+                  onClick={onConnect}
+                  disabled={busy}
+                  className="text-[10px] font-bold uppercase tracking-widest text-emerald-400 hover:bg-emerald-400/15 disabled:opacity-40 px-2 py-1 rounded"
+                  title="Open this radio's transport and start ingesting packets"
+                >
+                  {busy ? <Loader2 size={11} className="animate-spin" /> : 'Connect'}
+                </button>
+              )}
+              <button
+                onClick={onSetDefault}
+                className="text-[10px] font-bold uppercase tracking-widest text-brand-muted hover:text-brand-accent px-2 py-1 rounded hover:bg-brand-line/40"
+                title="Make this the default radio"
+              >
+                Set Default
+              </button>
+            </>
           )}
           <button
             onClick={onEdit}

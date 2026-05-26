@@ -24,7 +24,7 @@ interface RadioBarProps {
 }
 
 export function RadioBar({ defaultConnected, totalNodes }: RadioBarProps) {
-  const { radios, defaultRadioId, selectedRadioId, setSelectedRadioId } = useRadios();
+  const { radios, defaultRadioId, connectionStates, selectedRadioId, setSelectedRadioId } = useRadios();
 
   if (radios.length === 0) return null;
 
@@ -44,10 +44,13 @@ export function RadioBar({ defaultConnected, totalNodes }: RadioBarProps) {
       {radios.map(r => {
         const isSelected = selectedRadioId === r.radio_id;
         const isDefault = r.radio_id === defaultRadioId;
-        // Connection status only known for the default radio in Phase 3a;
-        // secondary radios fall back to the row's `enabled` flag until
-        // Phase 3b lights up per-radio bridge state.
-        const connected = isDefault ? defaultConnected : !!r.enabled;
+        // Phase 3b: BridgeManager owns the authoritative per-radio
+        // connection state for both the default radio (forwarded from
+        // meshBridge) and any secondary bridges. Fall back to the prop
+        // `defaultConnected` only while connectionStates is still empty
+        // (very early boot, before the first fetch).
+        const liveConn = connectionStates[r.radio_id];
+        const connected = liveConn ? liveConn.connected : (isDefault ? defaultConnected : false);
         return (
           <button
             key={r.radio_id}

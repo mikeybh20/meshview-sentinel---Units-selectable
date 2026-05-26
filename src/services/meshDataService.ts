@@ -507,6 +507,36 @@ export class MeshDataService {
     }
   }
 
+  async connectRadio(radioId: string): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/connect`, { method: 'POST' });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'request failed' };
+    }
+  }
+
+  async disconnectRadio(radioId: string): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/disconnect`, { method: 'POST' });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'request failed' };
+    }
+  }
+
+  async getRadioConnections(): Promise<{ states: Record<string, { connected: boolean; transport: string | null }>; defaultRadioId: string | null } | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/connections`);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  }
+
   async getRadioLora(radioId: string): Promise<{ radio: any; live: any | null } | null> {
     try {
       const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/lora`);
