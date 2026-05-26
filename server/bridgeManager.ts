@@ -40,6 +40,36 @@ class BridgeManager {
     // one (`bridge.getLocalNodeId()` matches the updated node's id).
     meshBridge.on('nodeUpdate', () => this.tryAutoRegisterDefault(meshBridge));
     meshBridge.on('connected', () => this.tryAutoRegisterDefault(meshBridge));
+
+    // After a LoRa config readback lands, update the cached radios row so
+    // Settings → Radios stays in lockstep with the firmware's authoritative
+    // state. Triggered the first time after auto-registration kicks off the
+    // readback, then again on every successful read.
+    meshBridge.on('loraConfigUpdate', (snap) => this.applyLoraReadback(snap));
+  }
+
+  private applyLoraReadback(snap: { region: number; modemPreset: number; frequencySlot: number; hopLimit: number }): void {
+    const id = this.defaultRadioId;
+    if (!id) return;
+    const ctx = this.contexts.get(id);
+    if (!ctx) return;
+
+    const region        = REGION_LABELS[snap.region]       ?? null;
+    const modem_preset  = MODEM_PRESET_LABELS[snap.modemPreset] ?? null;
+    const frequency_slot = snap.frequencySlot;
+    const num_hops      = snap.hopLimit;
+
+    // No-op if nothing changed (avoid pointless DB writes).
+    if (
+      ctx.meta.region === region &&
+      ctx.meta.modem_preset === modem_preset &&
+      ctx.meta.frequency_slot === frequency_slot &&
+      ctx.meta.num_hops === num_hops
+    ) return;
+
+    ctx.updateMeta({ region, modem_preset, frequency_slot, num_hops });
+    meshDb().upsertRadio(ctx.meta);
+    console.log(`[BridgeManager] radio ${id} meta updated from LoRa readback: region=${region} preset=${modem_preset} slot=${frequency_slot} hops=${num_hops}`);
   }
 
   /**
@@ -122,7 +152,17 @@ class BridgeManager {
     this.defaultRadioId = shortName;
     this.defaultRegistered = true;
 
+    // Tell the bridge its radio_id so every upserted node carries this
+    // bridge as a "heard by" entry. Backfills existing nodes too.
+    bridge.setRadioId(shortName);
+
     console.log(`[BridgeManager] default radio registered: ${shortName} (${row.long_name}) via ${row.transport}:${row.target}`);
+
+    // Kick off a LoRa config readback so the radios row gets stamped with
+    // the firmware's real region / preset / frequency slot / hops.
+    bridge.requestLoraConfig().catch(err => {
+      console.warn('[BridgeManager] initial LoRa readback failed:', err?.message ?? err);
+    });
   }
 
   private guessTarget(bridge: MeshtasticSerialBridge): string {
@@ -135,5 +175,54 @@ class BridgeManager {
     return 'auto';
   }
 }
+
+// Stringified labels for Meshtastic enums. Keep these in sync with the
+// canonical config.proto values; new firmware releases occasionally add
+// regions or presets so the unknown-value fallback in applyLoraReadback()
+// stores null rather than a stale string.
+const REGION_LABELS: Record<number, string> = {
+  0: 'UNSET',
+  1: 'US',
+  2: 'EU_433',
+  3: 'EU_868',
+  4: 'CN',
+  5: 'JP',
+  6: 'ANZ',
+  7: 'KR',
+  8: 'TW',
+  9: 'RU',
+  10: 'IN',
+  11: 'NZ_865',
+  12: 'TH',
+  13: 'LORA_24',
+  14: 'UA_433',
+  15: 'UA_868',
+  16: 'MY_433',
+  17: 'MY_919',
+  18: 'SG_923',
+  19: 'PH_433',
+  20: 'PH_868',
+  21: 'PH_915',
+  22: 'ANZ_433',
+  23: 'KZ_433',
+  24: 'KZ_863',
+  25: 'NP_865',
+  26: 'BR_902',
+};
+
+const MODEM_PRESET_LABELS: Record<number, string> = {
+  0: 'LONG_FAST',
+  1: 'LONG_SLOW',
+  2: 'VERY_LONG_SLOW', // deprecated in newer firmware
+  3: 'MEDIUM_SLOW',
+  4: 'MEDIUM_FAST',
+  5: 'SHORT_SLOW',
+  6: 'SHORT_FAST',
+  7: 'LONG_MODERATE',
+  8: 'SHORT_TURBO',
+};
+
+export const REGION_LABEL_BY_VALUE = REGION_LABELS;
+export const MODEM_PRESET_LABEL_BY_VALUE = MODEM_PRESET_LABELS;
 
 export const bridgeManager = new BridgeManager();

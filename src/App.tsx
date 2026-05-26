@@ -39,6 +39,9 @@ import { ChannelsModal } from './components/ChannelsModal';
 import { ExportModal } from './components/ExportModal';
 import { ImportModal } from './components/ImportModal';
 import { DashboardDesigner } from './components/DashboardDesigner';
+import { RadioBar } from './components/RadioBar';
+import { RefreshSplitButton } from './components/RefreshSplitButton';
+import { useRadios } from './hooks/useRadios';
 // RecipeView moved into SettingsModal as the "Install Guide" tab; the standalone
 // dashboard page was removed per operator request to keep the main nav focused
 // on operational views.
@@ -155,6 +158,9 @@ export default function App() {
   // ACK status overlay: messageId → status (overrides whatever the poll returns)
   const [ackStatuses, setAckStatuses] = React.useState<Record<string, { status: string; errorCode: number }>>({});
   
+  // v2.0 multi-radio: the active per-radio filter from the RadioBar (null = "all").
+  const { selectedRadioId } = useRadios();
+
   // Grouping State — groups are persisted server-side; we mirror them here.
   const [groups, setGroups] = React.useState<Group[]>([]);
   const [selectedGroupId, setSelectedGroupId] = React.useState<string | 'all' | 'favorites'>('all');
@@ -207,6 +213,14 @@ export default function App() {
     window.addEventListener('mesh:aiEnabledChanged', handler);
     return () => { cancelled = true; window.removeEventListener('mesh:aiEnabledChanged', handler); };
   }, []);
+
+  const handleRefreshNodeDbForRadio = React.useCallback(async (radioId: string | null) => {
+    if (refreshState === 'pending') return;
+    setRefreshState('pending');
+    const result = await meshDataService.refreshNodeDb(radioId ?? undefined);
+    setRefreshState(result.ok ? 'ok' : 'err');
+    setTimeout(() => setRefreshState('idle'), 2000);
+  }, [refreshState]);
 
   const handleRefreshNodeDb = React.useCallback(async () => {
     if (dataSource !== 'live' || !radioConnected) return;
@@ -432,17 +446,26 @@ export default function App() {
 
   const filteredNodes = React.useMemo(() => {
     let result = nodes;
+
+    // v2.0 multi-radio: per-radio filter. A node passes when its heardBy
+    // list contains the selected radio. Legacy 1.x rows without heardBy
+    // are conservatively included so a fresh "All radios" view still
+    // shows them — only the per-radio filter view excludes unstamped nodes.
+    if (selectedRadioId) {
+      result = result.filter(n => n.heardByRadios?.includes(selectedRadioId));
+    }
+
     if (selectedGroupId === 'favorites') {
       result = result.filter(n => n.favorite);
     } else if (selectedGroupId !== 'all') {
       result = result.filter(n => n.groupId === selectedGroupId);
     }
-    
-    return result.filter(n => 
+
+    return result.filter(n =>
       n.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
       n.id.toLowerCase().includes(searchQuery.toLowerCase())
     );
-  }, [nodes, searchQuery, selectedGroupId]);
+  }, [nodes, searchQuery, selectedGroupId, selectedRadioId]);
 
   const stats = React.useMemo(() => ({
     total: nodes.length,
@@ -722,32 +745,12 @@ export default function App() {
               />
             </div>
             {dataSource === 'live' && (
-              <button
-                onClick={handleRefreshNodeDb}
+              <RefreshSplitButton
+                state={refreshState}
                 disabled={!radioConnected || refreshState === 'pending'}
-                className={cn(
-                  "flex items-center gap-2 px-3 py-1.5 rounded-full border transition-colors",
-                  refreshState === 'ok' && "border-brand-accent text-brand-accent",
-                  refreshState === 'err' && "border-brand-danger text-brand-danger",
-                  refreshState !== 'ok' && refreshState !== 'err' && "border-brand-line text-brand-muted hover:text-brand-accent hover:border-brand-accent/40",
-                  (!radioConnected || refreshState === 'pending') && "opacity-50 cursor-not-allowed"
-                )}
-                title={
-                  !radioConnected
-                    ? 'Connect a radio first'
-                    : refreshState === 'err'
-                      ? 'Refresh failed — see server logs'
-                      : 'Re-pull NodeDB / channels / module configs from the radio'
-                }
-              >
-                <RefreshCw
-                  size={14}
-                  className={cn(refreshState === 'pending' && 'animate-spin')}
-                />
-                <span className="text-xs font-medium mono-text hidden md:inline">
-                  {refreshState === 'pending' ? 'REFRESHING' : refreshState === 'ok' ? 'REFRESHED' : refreshState === 'err' ? 'FAILED' : 'REFRESH'}
-                </span>
-              </button>
+                radioConnected={radioConnected}
+                onRefresh={handleRefreshNodeDbForRadio}
+              />
             )}
             {(() => {
               // Truthful MQTT status pill. Three states:
@@ -784,6 +787,9 @@ export default function App() {
             })()}
           </div>
         </header>
+
+        {/* v2.0 multi-radio: radio filter bar (hidden when no radios configured) */}
+        <RadioBar defaultConnected={radioConnected} totalNodes={nodes.length} />
 
         {/* View Layout */}
         <div className="flex-1 relative overflow-hidden">

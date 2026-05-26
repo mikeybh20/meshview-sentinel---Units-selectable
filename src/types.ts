@@ -81,6 +81,14 @@ export interface Node {
   hopsAway?: number;
   /** Last-observed inbound transport ('lora' = direct over RF, 'mqtt' = bridged). */
   lastVia?: 'lora' | 'mqtt';
+  /**
+   * v2.0 multi-radio: radio_ids (4-char short names) that have heard this
+   * node, ordered most-recent-first. Powers the "Heard by" badges + map pin
+   * border color.
+   */
+  heardByRadios?: string[];
+  /** v2.0 multi-radio: epoch ms of the most recent observation per radio. */
+  lastHeardAtPerRadio?: Record<string, number>;
   settings?: NodeSettings;
   position?: {
     lat: number;
@@ -366,4 +374,36 @@ export interface RouteRecord {
   timestamp: number;
   deliveryMs: number;    // simulated delivery latency
   success: boolean;
+}
+
+// v2.0 multi-radio — mirrors the `radios` table in [../server/database.ts](../server/database.ts).
+export type RadioTransport = 'serial' | 'tcp' | 'ble';
+
+export interface RadioRow {
+  radio_id: string;
+  long_name: string;
+  transport: RadioTransport;
+  target: string;
+  region: string | null;
+  modem_preset: string | null;
+  frequency_slot: number | null;
+  primary_channel: string | null;
+  num_hops: number | null;
+  enabled: number;
+  color_hex: string | null;
+  network_label: string | null;
+  is_default: number;
+  created_at: number;
+  updated_at: number;
+}
+
+// Live LoRa config readback from the firmware (raw enum values, not labels).
+export interface LoRaConfigLive {
+  usePreset: boolean;
+  modemPreset: number;
+  region: number;
+  hopLimit: number;
+  txEnabled: boolean;
+  frequencySlot: number;
+  lastReadAt: number;
 }

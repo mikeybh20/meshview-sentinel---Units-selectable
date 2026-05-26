@@ -360,15 +360,193 @@ app.get('/api/mesh/status', (_req, res) => {
   });
 });
 
-// --- v2.0 multi-radio: read-only listing of configured radios. ---
-// Phase 1 only exposes the default radio (auto-registered from the
-// connected hardware). Phase 2 will add CRUD for adding/editing radios.
+// --- v2.0 multi-radio: CRUD for the radios table. ---
+// Phase 2 ships full CRUD over the metadata table. Actually opening a
+// second transport (connecting a second radio) lands in Phase 3 when
+// BridgeManager spawns secondary bridge instances. For now, adding a
+// row here just persists the operator's intent.
+
+// --- v2.0 multi-radio palette (matches PHASE_2_COLOR_PALETTE in
+// [../src/lib/radioColors.ts](../src/lib/radioColors.ts)). Stays in
+// sync with the client so DB-stored colors round-trip identically.
+const RADIO_COLOR_PALETTE = [
+  '#3b82f6', // blue
+  '#10b981', // emerald
+  '#f59e0b', // amber
+  '#ef4444', // red
+  '#8b5cf6', // violet
+  '#06b6d4', // cyan
+  '#ec4899', // pink
+  '#84cc16', // lime
+];
+
+function nextAvailableColor(existing: string[]): string {
+  for (const c of RADIO_COLOR_PALETTE) {
+    if (!existing.includes(c)) return c;
+  }
+  // All used — recycle from the start so we don't blow up over 8 radios.
+  return RADIO_COLOR_PALETTE[existing.length % RADIO_COLOR_PALETTE.length];
+}
+
+const SHORT_NAME_RE = /^[A-Za-z0-9_!-]{1,4}$/;
+
 app.get('/api/mesh/radios', (_req, res) => {
   const rows = meshDb().listRadios();
   return res.json({
     radios: rows,
     defaultRadioId: bridgeManager.getDefaultRadioId(),
+    palette: RADIO_COLOR_PALETTE,
   });
+});
+
+app.post('/api/mesh/radios', (req, res) => {
+  const body = req.body ?? {};
+  const radio_id = String(body.radio_id ?? '').trim();
+  const long_name = String(body.long_name ?? '').trim();
+  const transport = String(body.transport ?? '').trim();
+  const target = String(body.target ?? '').trim();
+
+  if (!radio_id || !SHORT_NAME_RE.test(radio_id)) {
+    return res.status(400).json({ error: 'radio_id must be 1-4 chars (A-Z, 0-9, _, !, -)' });
+  }
+  if (!long_name) return res.status(400).json({ error: 'long_name is required' });
+  if (transport !== 'serial' && transport !== 'tcp' && transport !== 'ble') {
+    return res.status(400).json({ error: 'transport must be serial|tcp|ble' });
+  }
+  if (!target) return res.status(400).json({ error: 'target is required' });
+
+  const db = meshDb();
+  if (db.getRadio(radio_id)) {
+    return res.status(409).json({ error: `radio_id "${radio_id}" already exists` });
+  }
+
+  const existingColors = db.listRadios().map(r => r.color_hex).filter((c): c is string => !!c);
+  const now = Date.now();
+  db.upsertRadio({
+    radio_id,
+    long_name,
+    transport: transport as 'serial' | 'tcp' | 'ble',
+    target,
+    region:          body.region ?? null,
+    modem_preset:    body.modem_preset ?? null,
+    frequency_slot:  Number.isFinite(body.frequency_slot) ? body.frequency_slot : null,
+    primary_channel: body.primary_channel ?? null,
+    num_hops:        Number.isFinite(body.num_hops) ? body.num_hops : 3,
+    enabled:         body.enabled === false ? 0 : 1,
+    color_hex:       body.color_hex ?? nextAvailableColor(existingColors),
+    network_label:   body.network_label ?? null,
+    // First radio added becomes default if no default exists yet.
+    is_default:      db.getDefaultRadio() ? 0 : 1,
+    created_at:      now,
+    updated_at:      now,
+  });
+  return res.status(201).json(db.getRadio(radio_id));
+});
+
+app.put('/api/mesh/radios/:radioId', (req, res) => {
+  const { radioId } = req.params;
+  const db = meshDb();
+  const existing = db.getRadio(radioId);
+  if (!existing) return res.status(404).json({ error: 'radio not found' });
+
+  const body = req.body ?? {};
+  db.upsertRadio({
+    ...existing,
+    long_name:       body.long_name       ?? existing.long_name,
+    transport:       body.transport       ?? existing.transport,
+    target:          body.target          ?? existing.target,
+    region:          body.region          !== undefined ? body.region          : existing.region,
+    modem_preset:    body.modem_preset    !== undefined ? body.modem_preset    : existing.modem_preset,
+    frequency_slot:  body.frequency_slot  !== undefined ? body.frequency_slot  : existing.frequency_slot,
+    primary_channel: body.primary_channel !== undefined ? body.primary_channel : existing.primary_channel,
+    num_hops:        body.num_hops        !== undefined ? body.num_hops        : existing.num_hops,
+    enabled:         body.enabled !== undefined ? (body.enabled ? 1 : 0) : existing.enabled,
+    color_hex:       body.color_hex       !== undefined ? body.color_hex       : existing.color_hex,
+    network_label:   body.network_label   !== undefined ? body.network_label   : existing.network_label,
+  });
+  return res.json(db.getRadio(radioId));
+});
+
+app.delete('/api/mesh/radios/:radioId', (req, res) => {
+  const { radioId } = req.params;
+  const db = meshDb();
+  const existing = db.getRadio(radioId);
+  if (!existing) return res.status(404).json({ error: 'radio not found' });
+  if (existing.is_default) {
+    return res.status(409).json({ error: 'cannot delete the default radio — set another default first' });
+  }
+  const ok = db.deleteRadio(radioId);
+  if (!ok) return res.status(500).json({ error: 'delete failed' });
+  return res.json({ ok: true });
+});
+
+app.post('/api/mesh/radios/:radioId/default', (req, res) => {
+  const { radioId } = req.params;
+  const ok = meshDb().setDefaultRadio(radioId);
+  if (!ok) return res.status(404).json({ error: 'radio not found' });
+  return res.json({ ok: true, defaultRadioId: radioId });
+});
+
+// --- LoRa config read + write (firmware admin) ---
+// GET returns the most-recently-read LoRa config from the radio + the cached
+// radios.row values. POST writes new values via admin.set_config and triggers
+// a fresh readback. Only valid for the default radio in Phase 2 — Phase 3+
+// will scope this per radio_id when secondary bridges land.
+app.get('/api/mesh/radios/:radioId/lora', (req, res) => {
+  const { radioId } = req.params;
+  const row = meshDb().getRadio(radioId);
+  if (!row) return res.status(404).json({ error: 'radio not found' });
+
+  const ctx = bridgeManager.get(radioId);
+  const live = ctx ? meshBridge.getLocalLoraConfig() : null;
+  return res.json({
+    radio: row,
+    live, // null until first readback completes
+  });
+});
+
+app.post('/api/mesh/radios/:radioId/lora/refresh', async (req, res) => {
+  const { radioId } = req.params;
+  const ctx = bridgeManager.get(radioId);
+  if (!ctx) return res.status(404).json({ error: 'radio not found or not connected' });
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+
+  try {
+    await meshBridge.requestLoraConfig();
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/mesh/radios/:radioId/lora', async (req, res) => {
+  const { radioId } = req.params;
+  const ctx = bridgeManager.get(radioId);
+  if (!ctx) return res.status(404).json({ error: 'radio not found' });
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+
+  // Only the default radio is wired in Phase 2 — Phase 3+ will route
+  // per-radio admin via the corresponding RadioContext bridge.
+  if (radioId !== bridgeManager.getDefaultRadioId()) {
+    return res.status(501).json({
+      error: 'Writing LoRa config to non-default radios lands in Phase 3 (multi-bridge support)',
+    });
+  }
+
+  const body = req.body ?? {};
+  try {
+    await meshBridge.setLoraConfig({
+      region:        typeof body.region === 'number'        ? body.region        : undefined,
+      modemPreset:   typeof body.modemPreset === 'number'   ? body.modemPreset   : undefined,
+      usePreset:     typeof body.usePreset === 'boolean'    ? body.usePreset     : undefined,
+      frequencySlot: typeof body.frequencySlot === 'number' ? body.frequencySlot : undefined,
+      hopLimit:      typeof body.hopLimit === 'number'      ? body.hopLimit      : undefined,
+      txEnabled:     typeof body.txEnabled === 'boolean'    ? body.txEnabled     : undefined,
+    });
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 // --- v2.0 GPU sidecar health passthrough. ---
@@ -433,10 +611,22 @@ app.post('/api/mesh/disconnect', async (_req, res) => {
 // Re-issue want_config_id to pull a fresh NodeDB / channel set from the radio.
 // Useful when a phone (BLE) has changed config out-of-band and the UI is showing
 // stale liveness or channel-index drift.
-app.post('/api/mesh/refresh', (_req, res) => {
+app.post('/api/mesh/refresh', (req, res) => {
+  // v2.0: optional ?radio_id=NOVA scopes the refresh to a single radio. When
+  // omitted, refreshes the default radio (Phase 3a); Phase 3b will fan out
+  // to every connected secondary bridge when none is specified.
+  const radioId = typeof req.query.radio_id === 'string' ? req.query.radio_id : null;
+  const targetIds = radioId ? [radioId] : [];
   try {
+    if (radioId) {
+      if (radioId !== bridgeManager.getDefaultRadioId()) {
+        return res.status(501).json({
+          error: 'Per-radio refresh of non-default radios lands in Phase 3b (secondary-bridge support)',
+        });
+      }
+    }
     meshBridge.refreshNodeDb();
-    return res.json({ ok: true });
+    return res.json({ ok: true, refreshed: targetIds.length ? targetIds : ['<default>'] });
   } catch (err: any) {
     return res.status(409).json({ error: err.message || 'refresh failed' });
   }
@@ -1798,6 +1988,8 @@ meshBridge.on('neighborInfoUpdate',      fanOut('neighborInfo'));
 meshBridge.on('localModuleConfigUpdate', fanOut('moduleConfig'));
 meshBridge.on('bbsMail',                 fanOut('bbsMail'));
 meshBridge.on('bbsSubscriber',           fanOut('bbsSubscriber'));
+// v2.0: LoRa config readback completed — Settings → Radios re-fetches.
+meshBridge.on('loraConfigUpdate',        fanOut('loraConfig'));
 
 app.get('/api/mesh/stream', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');

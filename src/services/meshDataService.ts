@@ -405,13 +405,145 @@ export class MeshDataService {
    * The bridge already issues this on connect; this is a manual nudge for when
    * a phone (BLE) has changed config out-of-band and the UI looks stale.
    */
-  async refreshNodeDb(): Promise<{ ok: boolean; error?: string }> {
+  /**
+   * v2.0: optional `radioId` scopes the refresh to a single radio. When
+   * omitted, the server refreshes the default radio (Phase 3a) or all
+   * connected radios (Phase 3b once that lands).
+   */
+  async refreshNodeDb(radioId?: string): Promise<{ ok: boolean; error?: string }> {
     try {
-      const res = await fetch(`${API_BASE}/api/mesh/refresh`, { method: 'POST' });
+      const url = radioId
+        ? `${API_BASE}/api/mesh/refresh?radio_id=${encodeURIComponent(radioId)}`
+        : `${API_BASE}/api/mesh/refresh`;
+      const res = await fetch(url, { method: 'POST' });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         return { ok: false, error: body.error || `HTTP ${res.status}` };
       }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'request failed' };
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // v2.0 multi-radio
+  // -------------------------------------------------------------------
+
+  async listRadios(): Promise<{ radios: any[]; defaultRadioId: string | null; palette: string[] } | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios`);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  }
+
+  async addRadio(input: {
+    radio_id: string;
+    long_name: string;
+    transport: 'serial' | 'tcp' | 'ble';
+    target: string;
+    color_hex?: string;
+    network_label?: string;
+  }): Promise<{ ok: boolean; row?: any; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(input),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true, row: body };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'request failed' };
+    }
+  }
+
+  async updateRadio(radioId: string, patch: Partial<{
+    long_name: string;
+    target: string;
+    color_hex: string | null;
+    network_label: string | null;
+    enabled: boolean;
+  }>): Promise<{ ok: boolean; row?: any; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true, row: body };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'request failed' };
+    }
+  }
+
+  async deleteRadio(radioId: string): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}`, {
+        method: 'DELETE',
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'request failed' };
+    }
+  }
+
+  async setDefaultRadio(radioId: string): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/default`, {
+        method: 'POST',
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'request failed' };
+    }
+  }
+
+  async getRadioLora(radioId: string): Promise<{ radio: any; live: any | null } | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/lora`);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  }
+
+  async refreshRadioLora(radioId: string): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/lora/refresh`, {
+        method: 'POST',
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'request failed' };
+    }
+  }
+
+  async setRadioLora(radioId: string, patch: Partial<{
+    region: number;
+    modemPreset: number;
+    usePreset: boolean;
+    frequencySlot: number;
+    hopLimit: number;
+    txEnabled: boolean;
+  }>): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/lora`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
       return { ok: true };
     } catch (err: any) {
       return { ok: false, error: err?.message || 'request failed' };

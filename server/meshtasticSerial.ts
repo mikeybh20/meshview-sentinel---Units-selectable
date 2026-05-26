@@ -58,6 +58,16 @@ export interface MeshNode {
   hopsAway?: number;
   /** Last-observed inbound transport for this node ('lora' = direct over RF, 'mqtt' = bridged). */
   lastVia?: 'lora' | 'mqtt';
+  /**
+   * v2.0 multi-radio: list of radio_ids (4-char short names) that have heard
+   * this node, ordered most-recent-first. Surfaced as "Heard by" badges in
+   * the node list and as the map-pin border color. In Phase 3a there is only
+   * ever the default radio in this list; Phase 3b populates it from secondary
+   * bridges as they come online.
+   */
+  heardByRadios?: string[];
+  /** Epoch ms of the most recent observation per radio. Keyed by radio_id. */
+  lastHeardAtPerRadio?: Record<string, number>;
   /** Group id this node belongs to (operator-assigned). null/undefined = unassigned. */
   groupId?: string;
   position?: { lat: number; lng: number; alt: number };
@@ -365,6 +375,30 @@ export interface StoreForwardLocalConfig {
   lastReadAt: number;
 }
 
+/**
+ * v2.0: subset of Meshtastic's LoRaConfig that we surface in the Settings →
+ * Radios editor. Other LoRaConfig fields (bandwidth, spread_factor, etc.) are
+ * preserved opaquely on readback so save round-trips don't lose them.
+ *
+ * Field numbers (config.proto LoRaConfig):
+ *   1=use_preset, 2=modem_preset, 7=region, 8=hop_limit, 9=tx_enabled, 11=channel_num
+ */
+export interface LoRaConfigSnapshot {
+  usePreset: boolean;
+  /** ModemPreset enum value (0=LONG_FAST, 1=LONG_SLOW, ..., 8=SHORT_TURBO). */
+  modemPreset: number;
+  /** RegionCode enum value (1=US, 2=EU_433, 3=EU_868, ...). */
+  region: number;
+  hopLimit: number;
+  txEnabled: boolean;
+  /** config.lora.channel_num — the Frequency Slot. 0 = auto-derive from primary channel name. */
+  frequencySlot: number;
+  /** Epoch ms of last successful readback. */
+  lastReadAt: number;
+  /** Opaque copy of the inbound buffer so we can echo unmodified fields on save. */
+  rawBuf?: Buffer;
+}
+
 export interface LocalModuleConfigSnapshot {
   /** Authoritative NeighborInfo config read from the radio via admin readback. */
   neighborInfo?: NeighborInfoModuleConfig;
@@ -492,6 +526,14 @@ export class MeshtasticSerialBridge extends EventEmitter {
   private storeForwardRouters = new Map<string, MeshStoreForwardRouter>();
   /** Authoritative module config read from the local radio via admin readback. */
   private localModuleConfig: LocalModuleConfigSnapshot = {};
+  /** v2.0: authoritative LoRa config (region / preset / frequency slot / hops / tx). */
+  private localLoraConfig: LoRaConfigSnapshot | null = null;
+  /**
+   * v2.0 multi-radio: this bridge's radio_id (4-char short_name). Set by
+   * BridgeManager after auto-registration completes. Stamped onto every
+   * node this bridge hears via `applyHeardByRadio()`.
+   */
+  private radioId: string | null = null;
   /** Operator-defined node groups (for organizing the mesh into Field Team / Logistics / etc.). */
   private groups = new Map<string, MeshGroup>();
   // ---- Timed module surveys ----
@@ -674,6 +716,10 @@ export class MeshtasticSerialBridge extends EventEmitter {
   /** Upsert into the in-memory cache AND persist. Use this everywhere
    *  instead of `this.nodes.set(id, node)`. */
   private upsertNode(node: MeshNode) {
+    // v2.0 multi-radio: stamp this bridge's radio_id as a heard-by entry
+    // before persisting. No-op until BridgeManager sets the id (very early
+    // boot before auto-registration completes).
+    this.applyHeardByRadio(node, node.lastSeen ?? Date.now());
     this.nodes.set(node.id, node);
     try {
       this.db.upsertNode(node);
@@ -3753,6 +3799,166 @@ export class MeshtasticSerialBridge extends EventEmitter {
     console.log('[MeshtasticSerial] Requested NeighborInfo module config readback');
   }
 
+  // ---- v2.0 LoRa config (Region / Modem Preset / Frequency Slot / Hops / Tx)
+  // admin.proto ConfigType enum: LORA_CONFIG = 6
+  private static readonly CFG_LORA = 6;
+
+  /** Snapshot accessor for the most-recently-read LoRa config (or null if never read). */
+  getLocalLoraConfig(): LoRaConfigSnapshot | null {
+    return this.localLoraConfig;
+  }
+
+  /** v2.0: BridgeManager calls this once auto-registration completes. */
+  setRadioId(radioId: string): void {
+    if (this.radioId === radioId) return;
+    this.radioId = radioId;
+    // Backfill heardByRadios on every node we've already heard so the UI
+    // can render badges immediately on the next paint.
+    for (const node of this.nodes.values()) {
+      this.applyHeardByRadio(node, Date.now());
+    }
+  }
+
+  getRadioId(): string | null {
+    return this.radioId;
+  }
+
+  /**
+   * Stamp a node with this bridge's radio_id as a heard-by entry. Idempotent —
+   * if the radio is already in the list it gets moved to the front (most
+   * recent). The per-radio timestamp is updated regardless.
+   */
+  private applyHeardByRadio(node: MeshNode, when: number): void {
+    if (!this.radioId) return;
+    const existing = node.heardByRadios ?? [];
+    const filtered = existing.filter(r => r !== this.radioId);
+    node.heardByRadios = [this.radioId, ...filtered];
+    node.lastHeardAtPerRadio = { ...(node.lastHeardAtPerRadio ?? {}), [this.radioId]: when };
+  }
+
+  /**
+   * Ask the local radio for its current LoRaConfig. Reply arrives as a
+   * PORT_ADMIN_APP packet carrying `AdminMessage.get_config_response` (field 8)
+   * with a Config submessage whose `lora` variant (field 6) we parse.
+   */
+  async requestLoraConfig(): Promise<void> {
+    if (!this.isLinkOpen()) return;
+    if (!this.localNodeNum) return;
+    // AdminMessage { get_config_request: ConfigType (varint, field 7) }
+    const adminPayload = this.encodeTagVarint(7, MeshtasticSerialBridge.CFG_LORA);
+    this.sendAdminMessage(adminPayload);
+    console.log('[MeshtasticSerial] Requested LoRa config readback');
+  }
+
+  /**
+   * Write a new LoRa config to the local radio. Only the fields the Settings →
+   * Radios editor surfaces are settable here; everything else is echoed from
+   * the most-recent readback so untouched fields survive the round-trip.
+   *
+   * NOTE: changing region / modem_preset / frequency_slot reconfigures the
+   * radio's RF channel — peers on the old configuration disappear immediately.
+   * The UI guards this with a confirm dialog.
+   */
+  async setLoraConfig(opts: {
+    region?: number;
+    modemPreset?: number;
+    usePreset?: boolean;
+    frequencySlot?: number;
+    hopLimit?: number;
+    txEnabled?: boolean;
+  }): Promise<void> {
+    if (!this.isLinkOpen()) throw new Error('Radio not connected');
+    if (!this.localNodeNum) throw new Error('Local node not yet identified — try again in a moment');
+
+    const baseline = this.localLoraConfig;
+    const merged = {
+      usePreset:     opts.usePreset     ?? baseline?.usePreset     ?? true,
+      modemPreset:   opts.modemPreset   ?? baseline?.modemPreset   ?? 0,    // LONG_FAST
+      region:        opts.region        ?? baseline?.region        ?? 1,    // US
+      hopLimit:      opts.hopLimit      ?? baseline?.hopLimit      ?? 3,
+      txEnabled:     opts.txEnabled     ?? baseline?.txEnabled     ?? true,
+      frequencySlot: opts.frequencySlot ?? baseline?.frequencySlot ?? 0,
+    };
+
+    // LoRaConfig payload — only the fields we surface. Others retain their
+    // existing values because we don't transmit them; the firmware preserves
+    // unset fields in set_config.
+    const loraPayload = Buffer.concat([
+      this.encodeTagBool(1,    merged.usePreset),
+      this.encodeTagVarint(2,  merged.modemPreset),
+      this.encodeTagVarint(7,  merged.region),
+      this.encodeTagVarint(8,  Math.max(1, Math.min(7, Math.floor(merged.hopLimit)))),
+      this.encodeTagBool(9,    merged.txEnabled),
+      this.encodeTagVarint(11, Math.max(0, Math.floor(merged.frequencySlot))),
+    ]);
+    const configMsg = this.encodeTagLen(6, loraPayload); // Config.lora (field 6)
+    const adminPayload = this.encodeTagLen(33, configMsg); // AdminMessage.set_config (field 33)
+
+    this.sendAdminMessage(adminPayload);
+    await new Promise(r => setTimeout(r, 80));
+    this.sendAdminMessage(this.buildAdminCommit());
+
+    console.log(`[MeshtasticSerial] LoRa config write: region=${merged.region} preset=${merged.modemPreset} slot=${merged.frequencySlot} hops=${merged.hopLimit} tx=${merged.txEnabled}`);
+    this.addEvent('TELEMETRY', this.localNodeId || '!local',
+      `LoRa config updated (region=${merged.region}, slot=${merged.frequencySlot}, hops=${merged.hopLimit})`);
+
+    // Optimistically update local snapshot so the UI re-syncs immediately.
+    // The firmware will send a fresh readback if we request one.
+    this.localLoraConfig = {
+      ...merged,
+      lastReadAt: Date.now(),
+      rawBuf: this.localLoraConfig?.rawBuf,
+    };
+    this.emit('loraConfigUpdate', this.localLoraConfig);
+
+    // Issue a readback so the authoritative state catches up.
+    setTimeout(() => { this.requestLoraConfig().catch(() => {}); }, 200);
+  }
+
+  /** Parse a LoRaConfig submessage and capture the fields we care about. */
+  private parseLoraConfigSub(buf: Buffer): LoRaConfigSnapshot {
+    let offset = 0;
+    let usePreset = true;
+    let modemPreset = 0;
+    let region = 0;
+    let hopLimit = 3;
+    let txEnabled = true;
+    let frequencySlot = 0;
+
+    while (offset < buf.length) {
+      const tag = buf[offset++];
+      const fieldNumber = tag >> 3;
+      const wireType = tag & 0x07;
+
+      if (wireType === 0) {
+        const { value, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (fieldNumber === 1)        usePreset = value !== 0;
+        else if (fieldNumber === 2)   modemPreset = value;
+        else if (fieldNumber === 7)   region = value;
+        else if (fieldNumber === 8)   hopLimit = value;
+        else if (fieldNumber === 9)   txEnabled = value !== 0;
+        else if (fieldNumber === 11)  frequencySlot = value;
+      } else if (wireType === 2) {
+        const { value: len, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        offset += len; // skip strings/submessages we don't care about
+      } else if (wireType === 5) {
+        offset += 4;
+      } else if (wireType === 1) {
+        offset += 8;
+      } else {
+        break;
+      }
+    }
+
+    return {
+      usePreset, modemPreset, region, hopLimit, txEnabled, frequencySlot,
+      lastReadAt: Date.now(),
+      rawBuf: Buffer.from(buf),
+    };
+  }
+
   // ---- Range Test module --------------------------------------------------
 
   /**
@@ -4428,9 +4634,45 @@ export class MeshtasticSerialBridge extends EventEmitter {
         if (fieldNumber === 4) {
           // get_module_config_response — parse the ModuleConfig oneof
           this.parseModuleConfigResponse(sub);
+        } else if (fieldNumber === 8) {
+          // v2.0: get_config_response — parse the Config oneof for LoRa
+          this.parseConfigResponse(sub);
         }
       } else if (wireType === 5) {
         offset += 4;
+      } else {
+        break;
+      }
+    }
+  }
+
+  /** Parse a Config submessage (admin get_config_response) for the lora variant. */
+  private parseConfigResponse(buf: Buffer) {
+    let offset = 0;
+    while (offset < buf.length) {
+      const tag = buf[offset++];
+      const fieldNumber = tag >> 3;
+      const wireType = tag & 0x07;
+      if (wireType === 2) {
+        const { value: len, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (offset + len > buf.length) break;
+        const sub = buf.subarray(offset, offset + len);
+        offset += len;
+        if (fieldNumber === 6) {
+          // Config.lora
+          const snap = this.parseLoraConfigSub(sub);
+          this.localLoraConfig = snap;
+          console.log(`[MeshtasticSerial] LoRa config readback: region=${snap.region} preset=${snap.modemPreset} slot=${snap.frequencySlot} hops=${snap.hopLimit} tx=${snap.txEnabled} usePreset=${snap.usePreset}`);
+          this.emit('loraConfigUpdate', snap);
+        }
+      } else if (wireType === 0) {
+        const { bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+      } else if (wireType === 5) {
+        offset += 4;
+      } else if (wireType === 1) {
+        offset += 8;
       } else {
         break;
       }

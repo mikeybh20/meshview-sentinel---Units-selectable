@@ -4,8 +4,10 @@ import {
   X, Wifi, Bell, Globe, FileDown, FileUp, Bot, Plug, AlertCircle,
   Check, Loader2, Eye, EyeOff, Radio, Ban, Undo2, Network, RefreshCw,
   HelpCircle, ChevronDown, Activity, Mail, HardDrive, Database, BookOpen,
-  Copy, Download, Cpu,
+  Copy, Download, Cpu, Plus, Trash2, Star,
 } from 'lucide-react';
+import { RADIO_COLOR_PALETTE } from '../lib/radioColors';
+import type { RadioRow, LoRaConfigLive } from '../types';
 
 import { meshDataService, TransportInfo, DataSource } from '../services/meshDataService';
 import { LocalModuleConfigSnapshot, Node, UnitSystem } from '../types';
@@ -13,7 +15,7 @@ import { cn } from '../lib/utils';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
-type SectionKey = 'connection' | 'mode' | 'modules' | 'notifications' | 'display' | 'blocked' | 'data' | 'disk' | 'guide' | 'jetson' | 'ai' | 'bbs';
+type SectionKey = 'connection' | 'radios' | 'mode' | 'modules' | 'notifications' | 'display' | 'blocked' | 'data' | 'disk' | 'guide' | 'jetson' | 'ai' | 'bbs';
 
 interface SectionDef {
   key: SectionKey;
@@ -23,6 +25,7 @@ interface SectionDef {
 
 const SECTIONS: SectionDef[] = [
   { key: 'connection',    label: 'Connection',    icon: <Wifi size={14} /> },
+  { key: 'radios',        label: 'Radios',        icon: <Radio size={14} /> },
   { key: 'mode',          label: 'Mode',          icon: <Radio size={14} /> },
   { key: 'modules',       label: 'Modules',       icon: <Network size={14} /> },
   { key: 'notifications', label: 'Notifications', icon: <Bell size={14} /> },
@@ -128,6 +131,7 @@ export function SettingsModal(props: SettingsModalProps) {
           {/* Content */}
           <div className="flex-1 overflow-y-auto p-5">
             {active === 'connection'    && <ConnectionSection {...props} />}
+            {active === 'radios'        && <RadiosSection />}
             {active === 'modules'       && <ModulesSection {...props} />}
             {active === 'notifications' && <NotificationsSection {...props} />}
             {active === 'display'       && <DisplaySection {...props} />}
@@ -4252,6 +4256,550 @@ function SectionHeader({ title, subtitle }: { title: string; subtitle: string })
     <div>
       <h4 className="text-sm font-bold uppercase tracking-tight text-brand-ink">{title}</h4>
       <p className="text-[11px] text-brand-muted mt-0.5">{subtitle}</p>
+    </div>
+  );
+}
+
+// ============================================================================
+// v2.0 multi-radio — Settings → Radios tab.
+// ============================================================================
+
+const REGION_OPTIONS: Array<{ value: number; label: string }> = [
+  { value: 0,  label: 'UNSET' },
+  { value: 1,  label: 'US' },
+  { value: 2,  label: 'EU_433' },
+  { value: 3,  label: 'EU_868' },
+  { value: 4,  label: 'CN' },
+  { value: 5,  label: 'JP' },
+  { value: 6,  label: 'ANZ' },
+  { value: 7,  label: 'KR' },
+  { value: 8,  label: 'TW' },
+  { value: 9,  label: 'RU' },
+  { value: 10, label: 'IN' },
+  { value: 11, label: 'NZ_865' },
+  { value: 12, label: 'TH' },
+  { value: 13, label: 'LORA_24' },
+  { value: 14, label: 'UA_433' },
+  { value: 15, label: 'UA_868' },
+  { value: 16, label: 'MY_433' },
+  { value: 17, label: 'MY_919' },
+  { value: 18, label: 'SG_923' },
+];
+
+const MODEM_PRESET_OPTIONS: Array<{ value: number; label: string }> = [
+  { value: 0, label: 'LONG_FAST' },
+  { value: 1, label: 'LONG_SLOW' },
+  { value: 3, label: 'MEDIUM_SLOW' },
+  { value: 4, label: 'MEDIUM_FAST' },
+  { value: 5, label: 'SHORT_SLOW' },
+  { value: 6, label: 'SHORT_FAST' },
+  { value: 7, label: 'LONG_MODERATE' },
+  { value: 8, label: 'SHORT_TURBO' },
+];
+
+function RadiosSection() {
+  const [radios, setRadios] = React.useState<RadioRow[]>([]);
+  const [defaultRadioId, setDefaultRadioId] = React.useState<string | null>(null);
+  const [loading, setLoading] = React.useState(true);
+  const [showAdd, setShowAdd] = React.useState(false);
+  const [editingId, setEditingId] = React.useState<string | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+
+  const reload = React.useCallback(async () => {
+    setLoading(true);
+    const data = await meshDataService.listRadios();
+    if (data) {
+      setRadios(data.radios);
+      setDefaultRadioId(data.defaultRadioId);
+    }
+    setLoading(false);
+  }, []);
+
+  React.useEffect(() => { reload(); }, [reload]);
+
+  // Re-fetch on LoRa-config SSE so the row's region/preset/slot/hops stays live.
+  React.useEffect(() => {
+    const es = new EventSource(`${API_BASE}/api/mesh/stream`);
+    const handler = () => { reload(); };
+    es.addEventListener('loraConfig', handler);
+    return () => { es.removeEventListener('loraConfig', handler); es.close(); };
+  }, [reload]);
+
+  const handleDelete = async (id: string) => {
+    if (!confirm(`Delete radio "${id}"? This only removes the metadata row; the firmware on the radio itself is not touched.`)) return;
+    const r = await meshDataService.deleteRadio(id);
+    if (!r.ok) { setError(r.error || 'delete failed'); return; }
+    reload();
+  };
+
+  const handleSetDefault = async (id: string) => {
+    const r = await meshDataService.setDefaultRadio(id);
+    if (!r.ok) { setError(r.error || 'set-default failed'); return; }
+    reload();
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-start justify-between gap-3">
+        <SectionHeader
+          title="Radios"
+          subtitle="Each connected radio appears here with its 4-char short name. v2.0 ships read-only listing + LoRa config for the auto-registered default radio; full multi-radio connection support lands in Phase 3."
+        />
+        <button
+          onClick={() => { setError(null); setShowAdd(true); }}
+          className="flex items-center gap-1 bg-brand-accent/10 hover:bg-brand-accent/20 border border-brand-accent/40 text-brand-accent text-[10px] font-bold uppercase tracking-widest rounded px-3 py-1.5 transition-colors flex-shrink-0"
+        >
+          <Plus size={12} /> Add Radio
+        </button>
+      </div>
+
+      {error && (
+        <div className="flex items-center gap-2 bg-red-500/10 border border-red-500/40 rounded px-3 py-2 text-[11px] text-red-300">
+          <AlertCircle size={12} />
+          <span>{error}</span>
+        </div>
+      )}
+
+      {loading ? (
+        <div className="flex items-center gap-2 text-brand-muted text-xs">
+          <Loader2 size={12} className="animate-spin" /> Loading…
+        </div>
+      ) : radios.length === 0 ? (
+        <div className="border border-brand-line rounded p-4 text-center text-xs text-brand-muted">
+          No radios registered yet. The first radio that connects will be auto-registered as the default.
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {radios.map(r => (
+            <RadioRowCard
+              key={r.radio_id}
+              row={r}
+              isDefault={r.radio_id === defaultRadioId}
+              isEditing={editingId === r.radio_id}
+              onEdit={() => setEditingId(editingId === r.radio_id ? null : r.radio_id)}
+              onDelete={() => handleDelete(r.radio_id)}
+              onSetDefault={() => handleSetDefault(r.radio_id)}
+              onChanged={reload}
+            />
+          ))}
+        </div>
+      )}
+
+      {showAdd && (
+        <AddRadioForm
+          existing={radios}
+          onCancel={() => setShowAdd(false)}
+          onCreated={() => { setShowAdd(false); reload(); }}
+        />
+      )}
+    </div>
+  );
+}
+
+function RadioRowCard({
+  row, isDefault, isEditing, onEdit, onDelete, onSetDefault, onChanged,
+}: {
+  row: RadioRow;
+  isDefault: boolean;
+  isEditing: boolean;
+  onEdit: () => void;
+  onDelete: () => void;
+  onSetDefault: () => void;
+  onChanged: () => void;
+}) {
+  return (
+    <div className="border border-brand-line rounded">
+      <div className="flex items-center justify-between gap-3 px-3 py-2.5">
+        <div className="flex items-center gap-2.5 min-w-0">
+          <div
+            className="w-3 h-3 rounded-full flex-shrink-0"
+            style={{ background: row.color_hex ?? '#666' }}
+            title={row.color_hex ?? 'no color'}
+          />
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-bold mono-text text-brand-ink">{row.radio_id}</span>
+              {isDefault && <Star size={10} className="text-amber-400 fill-amber-400" />}
+              <span className="text-[10px] uppercase tracking-widest text-brand-muted">{row.transport}</span>
+            </div>
+            <p className="text-[11px] text-brand-muted truncate">
+              {row.long_name}
+              {row.network_label ? ` · ${row.network_label}` : ''}
+            </p>
+            <p className="text-[10px] text-brand-muted mono-text truncate">
+              {row.target} · {row.region ?? '?region'} · {row.modem_preset ?? '?preset'} · slot {row.frequency_slot ?? '?'} · {row.num_hops ?? '?'} hops
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center gap-1 flex-shrink-0">
+          {!isDefault && (
+            <button
+              onClick={onSetDefault}
+              className="text-[10px] font-bold uppercase tracking-widest text-brand-muted hover:text-brand-accent px-2 py-1 rounded hover:bg-brand-line/40"
+              title="Make this the default radio"
+            >
+              Set Default
+            </button>
+          )}
+          <button
+            onClick={onEdit}
+            className={cn(
+              "text-[10px] font-bold uppercase tracking-widest px-2 py-1 rounded transition-colors",
+              isEditing
+                ? "bg-brand-accent/15 text-brand-accent"
+                : "text-brand-muted hover:text-brand-ink hover:bg-brand-line/40"
+            )}
+          >
+            {isEditing ? 'Done' : 'Edit'}
+          </button>
+          {!isDefault && (
+            <button
+              onClick={onDelete}
+              className="p-1 text-red-400 hover:text-red-300 hover:bg-red-500/10 rounded"
+              title="Delete radio"
+            >
+              <Trash2 size={12} />
+            </button>
+          )}
+        </div>
+      </div>
+
+      {isEditing && (
+        <RadioEditor row={row} onChanged={onChanged} />
+      )}
+    </div>
+  );
+}
+
+function RadioEditor({ row, onChanged }: { row: RadioRow; onChanged: () => void }) {
+  const [longName, setLongName] = React.useState(row.long_name);
+  const [networkLabel, setNetworkLabel] = React.useState(row.network_label ?? '');
+  const [colorHex, setColorHex] = React.useState(row.color_hex ?? RADIO_COLOR_PALETTE[0]);
+  const [saving, setSaving] = React.useState(false);
+
+  // LoRa live state from the firmware
+  const [live, setLive] = React.useState<LoRaConfigLive | null>(null);
+  const [region, setRegion] = React.useState<number>(1);
+  const [preset, setPreset] = React.useState<number>(0);
+  const [slot, setSlot] = React.useState<number>(0);
+  const [hops, setHops] = React.useState<number>(3);
+  const [txEnabled, setTxEnabled] = React.useState(true);
+  const [loraSaving, setLoraSaving] = React.useState(false);
+  const [loraMsg, setLoraMsg] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    meshDataService.getRadioLora(row.radio_id).then(data => {
+      if (cancelled || !data) return;
+      if (data.live) {
+        setLive(data.live);
+        setRegion(data.live.region);
+        setPreset(data.live.modemPreset);
+        setSlot(data.live.frequencySlot);
+        setHops(data.live.hopLimit);
+        setTxEnabled(data.live.txEnabled);
+      }
+    });
+    return () => { cancelled = true; };
+  }, [row.radio_id]);
+
+  const saveMeta = async () => {
+    setSaving(true);
+    const r = await meshDataService.updateRadio(row.radio_id, {
+      long_name: longName,
+      network_label: networkLabel || null,
+      color_hex: colorHex,
+    });
+    setSaving(false);
+    if (r.ok) onChanged();
+  };
+
+  const refreshLora = async () => {
+    setLoraMsg('Requesting readback…');
+    const r = await meshDataService.refreshRadioLora(row.radio_id);
+    setLoraMsg(r.ok ? 'Readback requested — values update on arrival.' : `Refresh failed: ${r.error}`);
+    setTimeout(() => setLoraMsg(null), 3000);
+    // Re-fetch in 1s to pick up the readback.
+    setTimeout(async () => {
+      const data = await meshDataService.getRadioLora(row.radio_id);
+      if (data?.live) {
+        setLive(data.live);
+        setRegion(data.live.region);
+        setPreset(data.live.modemPreset);
+        setSlot(data.live.frequencySlot);
+        setHops(data.live.hopLimit);
+        setTxEnabled(data.live.txEnabled);
+      }
+    }, 1200);
+  };
+
+  const saveLora = async () => {
+    const confirmMsg = `Write LoRa config to ${row.radio_id}?\n\nRegion: ${REGION_OPTIONS.find(o => o.value === region)?.label}\nPreset: ${MODEM_PRESET_OPTIONS.find(o => o.value === preset)?.label}\nFrequency Slot: ${slot}\nHops: ${hops}\nTx Enabled: ${txEnabled}\n\nChanging region / preset / slot reconfigures the radio's RF channel — peers on the old configuration disappear immediately.`;
+    if (!confirm(confirmMsg)) return;
+    setLoraSaving(true);
+    setLoraMsg(null);
+    const r = await meshDataService.setRadioLora(row.radio_id, {
+      region, modemPreset: preset, frequencySlot: slot, hopLimit: hops, txEnabled,
+    });
+    setLoraSaving(false);
+    if (r.ok) {
+      setLoraMsg('Write sent. Awaiting firmware readback…');
+      setTimeout(() => setLoraMsg(null), 3000);
+      onChanged();
+    } else {
+      setLoraMsg(`Write failed: ${r.error}`);
+    }
+  };
+
+  return (
+    <div className="border-t border-brand-line bg-brand-bg/40 p-3 space-y-3">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <div>
+          <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Long Name</label>
+          <input
+            type="text"
+            value={longName}
+            onChange={e => setLongName(e.target.value)}
+            className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs text-brand-ink"
+          />
+        </div>
+        <div>
+          <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Network Label</label>
+          <input
+            type="text"
+            value={networkLabel}
+            onChange={e => setNetworkLabel(e.target.value)}
+            placeholder="DC Mesh, NOVA Mesh, …"
+            className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs text-brand-ink"
+          />
+        </div>
+        <div className="sm:col-span-2">
+          <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Color</label>
+          <div className="flex items-center gap-1.5">
+            {RADIO_COLOR_PALETTE.map(c => (
+              <button
+                key={c}
+                onClick={() => setColorHex(c)}
+                className={cn(
+                  "w-6 h-6 rounded-full border-2 transition-all",
+                  colorHex === c ? "border-brand-ink scale-110" : "border-transparent opacity-70 hover:opacity-100"
+                )}
+                style={{ background: c }}
+                title={c}
+              />
+            ))}
+          </div>
+        </div>
+      </div>
+      <div>
+        <button
+          onClick={saveMeta}
+          disabled={saving}
+          className="bg-brand-accent/10 hover:bg-brand-accent/20 disabled:opacity-40 border border-brand-accent/40 text-brand-accent text-[10px] font-bold uppercase tracking-widest rounded px-3 py-1.5"
+        >
+          {saving ? 'Saving…' : 'Save Metadata'}
+        </button>
+      </div>
+
+      {/* LoRa Config editor — only useful for the default radio in Phase 2 */}
+      <div className="pt-3 border-t border-brand-line">
+        <div className="flex items-center justify-between mb-2">
+          <h5 className="text-[11px] font-bold uppercase tracking-widest text-brand-ink">LoRa Config</h5>
+          <button
+            onClick={refreshLora}
+            className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest text-brand-muted hover:text-brand-ink hover:bg-brand-line/40 px-2 py-1 rounded"
+          >
+            <RefreshCw size={10} /> Refresh
+          </button>
+        </div>
+        {!live && (
+          <div className="text-[11px] text-brand-muted mb-2">
+            No LoRa config readback yet. Click Refresh once the radio is connected.
+          </div>
+        )}
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Region</label>
+            <select
+              value={region}
+              onChange={e => setRegion(Number(e.target.value))}
+              className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs text-brand-ink"
+            >
+              {REGION_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Modem Preset</label>
+            <select
+              value={preset}
+              onChange={e => setPreset(Number(e.target.value))}
+              className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs text-brand-ink"
+            >
+              {MODEM_PRESET_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">
+              Frequency Slot
+              <span className="ml-1 text-brand-muted normal-case font-normal">(0 = auto from primary channel name)</span>
+            </label>
+            <input
+              type="number"
+              min={0}
+              max={104}
+              value={slot}
+              onChange={e => setSlot(Number(e.target.value))}
+              className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs mono-text text-brand-ink"
+            />
+          </div>
+          <div>
+            <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Number of Hops (1–7)</label>
+            <input
+              type="number"
+              min={1}
+              max={7}
+              value={hops}
+              onChange={e => setHops(Number(e.target.value))}
+              className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs mono-text text-brand-ink"
+            />
+          </div>
+          <label className="col-span-2 flex items-center gap-2 text-xs text-brand-ink">
+            <input type="checkbox" checked={txEnabled} onChange={e => setTxEnabled(e.target.checked)} />
+            Transmit Enabled
+          </label>
+        </div>
+        <div className="flex items-center gap-3 mt-3">
+          <button
+            onClick={saveLora}
+            disabled={loraSaving || !live}
+            className="bg-amber-500/10 hover:bg-amber-500/20 disabled:opacity-40 border border-amber-500/40 text-amber-300 text-[10px] font-bold uppercase tracking-widest rounded px-3 py-1.5"
+          >
+            {loraSaving ? 'Writing…' : 'Write LoRa Config to Radio'}
+          </button>
+          {loraMsg && <span className="text-[11px] text-brand-muted">{loraMsg}</span>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AddRadioForm({ existing, onCancel, onCreated }: {
+  existing: RadioRow[];
+  onCancel: () => void;
+  onCreated: () => void;
+}) {
+  const [radioId, setRadioId] = React.useState('');
+  const [longName, setLongName] = React.useState('');
+  const [transport, setTransport] = React.useState<'serial' | 'tcp' | 'ble'>('tcp');
+  const [target, setTarget] = React.useState('');
+  const [networkLabel, setNetworkLabel] = React.useState('');
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState<string | null>(null);
+
+  const submit = async () => {
+    setBusy(true); setErr(null);
+    const r = await meshDataService.addRadio({
+      radio_id: radioId.trim(),
+      long_name: longName.trim(),
+      transport,
+      target: target.trim(),
+      network_label: networkLabel.trim() || undefined,
+    });
+    setBusy(false);
+    if (!r.ok) { setErr(r.error || 'add failed'); return; }
+    onCreated();
+  };
+
+  const used = existing.map(r => r.radio_id);
+  const collides = radioId.trim() && used.includes(radioId.trim());
+
+  return (
+    <div className="border border-brand-accent/30 rounded p-3 bg-brand-accent/5 space-y-3">
+      <h5 className="text-[11px] font-bold uppercase tracking-widest text-brand-ink">Add Radio</h5>
+      <p className="text-[11px] text-brand-muted">
+        Phase 2 stores the metadata only. In Phase 3, BridgeManager will open a second transport and connect to this radio in addition to the default.
+      </p>
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Short Name (1–4 chars)</label>
+          <input
+            type="text"
+            maxLength={4}
+            value={radioId}
+            onChange={e => setRadioId(e.target.value)}
+            placeholder="NOVA"
+            className={cn(
+              "w-full bg-brand-bg border rounded px-2 py-1 text-xs mono-text text-brand-ink",
+              collides ? "border-red-500/60" : "border-brand-line"
+            )}
+          />
+          {collides && <p className="text-[10px] text-red-400 mt-0.5">already in use</p>}
+        </div>
+        <div>
+          <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Long Name</label>
+          <input
+            type="text"
+            value={longName}
+            onChange={e => setLongName(e.target.value)}
+            placeholder="NOVA Mesh Gateway"
+            className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs text-brand-ink"
+          />
+        </div>
+        <div>
+          <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Transport</label>
+          <select
+            value={transport}
+            onChange={e => setTransport(e.target.value as any)}
+            className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs text-brand-ink"
+          >
+            <option value="tcp">tcp</option>
+            <option value="serial">serial</option>
+            <option value="ble" disabled>ble (Phase 5)</option>
+          </select>
+        </div>
+        <div>
+          <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">
+            Target
+          </label>
+          <input
+            type="text"
+            value={target}
+            onChange={e => setTarget(e.target.value)}
+            placeholder={transport === 'tcp' ? '192.168.1.50:4403' : '/dev/ttyUSB1'}
+            className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs mono-text text-brand-ink"
+          />
+        </div>
+        <div className="col-span-2">
+          <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Network Label (optional)</label>
+          <input
+            type="text"
+            value={networkLabel}
+            onChange={e => setNetworkLabel(e.target.value)}
+            placeholder="NOVA Mesh"
+            className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs text-brand-ink"
+          />
+        </div>
+      </div>
+      {err && (
+        <div className="flex items-center gap-2 bg-red-500/10 border border-red-500/40 rounded px-3 py-2 text-[11px] text-red-300">
+          <AlertCircle size={12} /> {err}
+        </div>
+      )}
+      <div className="flex items-center gap-2">
+        <button
+          onClick={submit}
+          disabled={busy || !radioId.trim() || !longName.trim() || !target.trim() || !!collides}
+          className="bg-brand-accent/10 hover:bg-brand-accent/20 disabled:opacity-40 border border-brand-accent/40 text-brand-accent text-[10px] font-bold uppercase tracking-widest rounded px-3 py-1.5"
+        >
+          {busy ? 'Adding…' : 'Add Radio'}
+        </button>
+        <button
+          onClick={onCancel}
+          className="text-[10px] font-bold uppercase tracking-widest text-brand-muted hover:text-brand-ink hover:bg-brand-line/40 px-3 py-1.5 rounded"
+        >
+          Cancel
+        </button>
+      </div>
     </div>
   );
 }

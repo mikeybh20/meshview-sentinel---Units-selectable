@@ -29,6 +29,7 @@ import { TelemetryItem } from '../ui/TelemetryItem';
 import { SensorWidget } from '../SensorWidget';
 import { simulator } from '../../services/meshtasticSimulator';
 import { meshDataService } from '../../services/meshDataService';
+import { useRadios } from '../../hooks/useRadios';
 import {
   hardwareLabel,
   roleLabel,
@@ -686,6 +687,13 @@ function TraceLog({ nodeId }: { nodeId: string }) {
 
 function DashboardMapWidget({ nodes }: { nodes: Node[] }) {
   const positioned = nodes.filter(n => n.position);
+  const { radios } = useRadios();
+  // v2.0: map a radio_id to its assigned color for pin tinting.
+  const radioColors = React.useMemo(() => {
+    const m: Record<string, string> = {};
+    for (const r of radios) if (r.color_hex) m[r.radio_id] = r.color_hex;
+    return m;
+  }, [radios]);
 
   const derivedCenter = React.useMemo<[number, number]>(() => {
     if (positioned.length === 0) return FALLBACK_CENTER;
@@ -737,14 +745,22 @@ function DashboardMapWidget({ nodes }: { nodes: Node[] }) {
             setZoom(z);
           }}
         >
-          {positioned.map(node => (
-            <Marker
-              key={node.id}
-              width={20}
-              anchor={[node.position!.lat, node.position!.lng]}
-              color="var(--color-brand-accent)"
-            />
-          ))}
+          {positioned.map(node => {
+            // v2.0: tint pin by the most-recent hearing radio's color when
+            // available; fall back to the brand accent for nodes without
+            // heard-by data (legacy 1.x rows or simulator).
+            const mruRadio = node.heardByRadios?.[0];
+            const pinColor = (mruRadio && radioColors[mruRadio])
+              || 'var(--color-brand-accent)';
+            return (
+              <Marker
+                key={node.id}
+                width={20}
+                anchor={[node.position!.lat, node.position!.lng]}
+                color={pinColor}
+              />
+            );
+          })}
         </Map>
       </div>
       <div className="absolute top-2 left-2 px-2 py-1 bg-brand-bg/80 backdrop-blur-md rounded text-[10px] font-bold uppercase tracking-widest border border-brand-line">
@@ -984,6 +1000,7 @@ export function DashboardView({
                           <th className="px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-brand-muted">Status</th>
                           <th className="px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-brand-muted">Node ID</th>
                           <th className="px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-brand-muted">Name</th>
+                          <th className="px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-brand-muted hidden md:table-cell">Heard By</th>
                           <th className="px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-brand-muted text-right">Actions</th>
                         </tr>
                       </thead>
@@ -1045,6 +1062,9 @@ export function DashboardView({
                                 </button>
                                 {node.sensors && <Activity size={12} className="text-brand-accent animate-pulse" />}
                               </div>
+                            </td>
+                            <td className="px-4 py-4 hidden md:table-cell">
+                              <HeardByBadges nodeId={node.id} heardBy={node.heardByRadios ?? []} />
                             </td>
                             <td className="px-4 py-4 text-right">
                               <ArrowRight size={16} className="ml-auto opacity-0 group-hover:opacity-100 transition-opacity" />
@@ -1229,5 +1249,33 @@ export function DashboardView({
         })}
       </div>
     </>
+  );
+}
+
+// v2.0 multi-radio: "Heard by" badge cluster shown in the node-list row.
+// Each badge is the radio's 4-char short_name in its assigned color. Most
+// recently heard is leftmost (matches the bridge's MRU ordering).
+function HeardByBadges({ nodeId: _nodeId, heardBy }: { nodeId: string; heardBy: string[] }) {
+  const { radios } = useRadios();
+  if (heardBy.length === 0) {
+    return <span className="text-[10px] text-brand-muted/50 mono-text">—</span>;
+  }
+  return (
+    <div className="flex items-center gap-1 flex-wrap">
+      {heardBy.map(rid => {
+        const row = radios.find(r => r.radio_id === rid);
+        const color = row?.color_hex ?? '#888';
+        return (
+          <span
+            key={rid}
+            title={row?.long_name ?? rid}
+            className="text-[9px] font-bold mono-text px-1.5 py-0.5 rounded border"
+            style={{ color, borderColor: `${color}66`, background: `${color}1a` }}
+          >
+            {rid}
+          </span>
+        );
+      })}
+    </div>
   );
 }
