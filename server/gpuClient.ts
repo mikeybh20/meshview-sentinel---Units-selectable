@@ -221,6 +221,120 @@ export function clusterDbscanCpu(req: ClusterRequest): ClusterResponse {
 }
 
 // ---------------------------------------------------------------------
+// Phase 4: mesh topology graph (undirected, edge-deduped, BFS components).
+// ---------------------------------------------------------------------
+
+export interface TopologyEdgeIn {
+  src: string;
+  dst: string;
+  snr?: number | null;
+  rssi?: number | null;
+  last_seen?: number | null;
+}
+
+export interface TopologyEdgeOut {
+  src: string;
+  dst: string;
+  snr: number | null;
+  rssi: number | null;
+  last_seen: number | null;
+}
+
+export interface TopologyResponse {
+  nodes: string[];
+  degrees: Record<string, number>;
+  edges: TopologyEdgeOut[];
+  components: string[][];
+  centrality: Record<string, number> | null;
+  backend: 'cugraph' | 'cpu' | 'cpu_ts';
+}
+
+export interface TopologyRequest {
+  edges: TopologyEdgeIn[];
+  compute_centrality?: boolean;
+  k_shortest?: number;
+}
+
+export async function buildTopology(req: TopologyRequest): Promise<TopologyResponse> {
+  if (req.edges.length === 0) {
+    return { nodes: [], degrees: {}, edges: [], components: [], centrality: null, backend: 'cpu_ts' };
+  }
+  const remote = await callSidecar<TopologyRequest, TopologyResponse>('/topology/build', req);
+  if (remote) return remote;
+  return buildTopologyCpu(req);
+}
+
+// ---- CPU fallback in TS (mirrors the Python implementation) ----
+
+export function buildTopologyCpu(req: TopologyRequest): TopologyResponse {
+  const adj = new Map<string, Set<string>>();
+  type EdgeMeta = { snr: number | null; rssi: number | null; last_seen: number | null };
+  const edgeMeta = new Map<string, EdgeMeta>();
+
+  const keyOf = (a: string, b: string) => `${a}|${b}`;
+  const mergeMax = (prev: number | null | undefined, next: number | null | undefined): number | null => {
+    if (prev == null && next == null) return null;
+    if (prev == null) return next ?? null;
+    if (next == null) return prev;
+    return Math.max(prev, next);
+  };
+
+  for (const e of req.edges) {
+    if (!e.src || !e.dst || e.src === e.dst) continue;
+    const [a, b] = e.src < e.dst ? [e.src, e.dst] : [e.dst, e.src];
+    if (!adj.has(a)) adj.set(a, new Set());
+    if (!adj.has(b)) adj.set(b, new Set());
+    adj.get(a)!.add(b);
+    adj.get(b)!.add(a);
+    const k = keyOf(a, b);
+    const prev = edgeMeta.get(k);
+    edgeMeta.set(k, {
+      snr:       mergeMax(prev?.snr,       e.snr),
+      rssi:      mergeMax(prev?.rssi,      e.rssi),
+      last_seen: mergeMax(prev?.last_seen, e.last_seen),
+    });
+  }
+
+  const nodes = Array.from(adj.keys()).sort();
+  const degrees: Record<string, number> = {};
+  for (const n of nodes) degrees[n] = adj.get(n)!.size;
+
+  const visited = new Set<string>();
+  const components: string[][] = [];
+  for (const n of nodes) {
+    if (visited.has(n)) continue;
+    const comp: string[] = [];
+    const stack = [n];
+    while (stack.length) {
+      const cur = stack.pop()!;
+      if (visited.has(cur)) continue;
+      visited.add(cur);
+      comp.push(cur);
+      for (const x of adj.get(cur) ?? []) {
+        if (!visited.has(x)) stack.push(x);
+      }
+    }
+    components.push(comp.sort());
+  }
+
+  let centrality: Record<string, number> | null = null;
+  if (req.compute_centrality && nodes.length > 1) {
+    const maxPossible = nodes.length - 1;
+    centrality = {};
+    for (const n of nodes) centrality[n] = degrees[n] / maxPossible;
+  }
+
+  const edgesOut: TopologyEdgeOut[] = Array.from(edgeMeta.entries())
+    .map(([k, meta]) => {
+      const [src, dst] = k.split('|');
+      return { src, dst, snr: meta.snr, rssi: meta.rssi, last_seen: meta.last_seen };
+    })
+    .sort((a, b) => (a.src + a.dst).localeCompare(b.src + b.dst));
+
+  return { nodes, degrees, edges: edgesOut, components, centrality, backend: 'cpu_ts' };
+}
+
+// ---------------------------------------------------------------------
 // Boot probe — logs the sidecar status at startup so the operator knows
 // what acceleration tier they have. Non-blocking; sidecar may not be up
 // yet when this runs.

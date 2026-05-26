@@ -27,8 +27,9 @@ Rough budget for a typical 2GB Jetson:
 | Linux base + L4T services | ~500 MB |
 | Docker daemon | ~80 MB |
 | Sentinel container (Node + SQLite + caches) | ~250-400 MB |
+| **+ each additional radio** (v2.0 multi-radio) | **+150-250 MB / radio** |
 | **\`meshview-gpu\` sidecar** (v2.0+: Python + FastAPI; +RAPIDS if installed) | **~400 MB** |
-| **Headroom for everything else** | **~600 MB** |
+| **Headroom for everything else** | **~400-600 MB** |
 
 That's tight but workable **for headless operation** — Jetson runs the server only; you browse from a laptop or phone over the LAN. It becomes a problem if you also run a desktop browser on the Jetson: Chromium will push into swap and eventually OOM-kill.
 
@@ -41,6 +42,20 @@ If you don't want the GPU sidecar running (the Nano's Maxwell GPU only meaningfu
 \`\`\`
 
 Reclaiming the ~400 MB the sidecar would have used is the easiest single win for headroom on a 2GB Nano.
+
+### Multi-radio on a 2GB Nano
+
+Sentinel v2.0 lets you bridge multiple radios at once (a primary serial radio plus one or more TCP secondaries; see Settings → Radios in the dashboard). Each additional connected radio adds **~150-250 MB** to the Sentinel container's resident memory — its own packet buffer, pending-ACK tracker, and in-memory node Map. On a 2GB Nano the practical ceiling is:
+
+- **1 radio + GPU sidecar**: comfortable
+- **2 radios + GPU sidecar**: very tight — disable the sidecar to free ~400 MB of headroom
+- **3+ radios**: not recommended on Nano hardware; consider Orin Nano (8GB) or AGX (16GB+) for serious multi-radio deployments
+
+If you're hitting OOM-kills, the order of operations is:
+
+1. Cap the Sentinel container at \`memory: 1200M\` (instead of 800M) when running 2 radios
+2. Disable the GPU sidecar if you don't need its workloads
+3. Move to Orin Nano if you need >2 radios reliably
 
 **Mitigations**:
 

@@ -310,6 +310,55 @@ All changes apply immediately — no radio restart needed.
 
 ---
 
+## Phase 6.5: Multi-Radio (v2.0+)
+
+Sentinel v2.0 can bridge two or more Meshtastic radios simultaneously, even when they're on different RF channels (different Frequency Slot in LoRa Config). This is the right setup for an operator running both a local mesh (e.g., DC Mesh on slot 0) and a regional mesh (NOVA on slot 9) from the same gateway.
+
+### Concepts
+
+- **Default radio**: the radio Sentinel auto-discovers on boot via USB serial. It's the singleton bridge — no manual configuration needed.
+- **Secondary radio(s)**: any additional radio you connect via TCP (or another serial port). Configured in **Settings → Radios** and connected on demand with the **Connect** button per row.
+- **radio_id**: the 4-character \`short_name\` from each radio's firmware. Used as the identity for that radio everywhere: pill in the RadioBar, "Heard By" badge on nodes it has heard, log prefix on its events. Must be unique across your configured radios.
+- **Frequency Slot ≠ Primary Channel**: the slot (\`config.lora.channel_num\`) is the physical RF channel. Two radios with the same primary-channel name (\`LongFast\`) but different slots will never hear each other.
+
+### Adding a secondary radio
+
+1. Make sure the second radio is reachable. For TCP: it must be running with \`Meshtastic IP\` enabled (typically on port 4403). For serial: it must be on a port that the Sentinel container's \`/dev\` mount can see (the existing \`device_cgroup_rules\` cover \`ttyUSB*\` and \`ttyACM*\`).
+2. Open **Settings → Radios** and click **Add Radio**.
+3. Pick \`tcp\` or \`serial\` transport and enter the target (\`192.168.1.50:4403\` for TCP, \`/dev/ttyUSB1\` for serial).
+4. Click **Detect Identity** — Sentinel opens a transient connection, reads the radio's \`User\` config (short_name + long_name) and \`LoRaConfig\` (region / preset / slot / hops), disconnects, and pre-fills the form.
+5. Optional: add a **Network Label** like "NOVA Mesh" so the RadioBar pill carries human context, and pick a different palette color than your default radio's.
+6. Click **Add Radio**. The row appears in the registry but is not yet connected.
+7. Click **Connect** on that row. The RadioBar's connection chip flips to green when the second bridge attaches and starts ingesting packets.
+
+### What changes once a second radio is connected
+
+- The **RadioBar** below the header shows a pill per radio. Clicking a pill scopes the node list, map, stats cards, and the message send target to that radio's mesh. Clicking **All Radios** returns to the unified view.
+- The **Refresh** button becomes a split-button — its dropdown lets you refresh a single radio's NodeDB instead of every connected radio at once.
+- Each node row in the node list gains a **Heard By** badge showing which of your radios has heard it (most-recent first). A node bridged by both meshes will carry both badges.
+- The **Map** colors each node's pin border by the most-recent hearing radio so you can see at a glance which mesh each peer belongs to. The **+N** cluster badges still collapse spatial overlap.
+- The **Compose** field sends through whichever radio the RadioBar filter is currently scoped to. With "All Radios" selected, sends go through the default radio.
+- The **Channels modal** grows a **Target Radio** picker when more than one radio is configured. The channel list shown and any save (including a channel-share URL import) is scoped to that picker's selection.
+- The dashboard **Stats cards** scope to the filtered radio's nodes when a pill is active, and aggregate across all radios when "All" is selected.
+
+### Memory implications
+
+Each connected radio adds ~150–250 MB of resident memory to the Sentinel container (its own packet buffer, pending-ACK tracker, and in-memory node Map). On a Jetson Nano 2GB that's the difference between "1 radio fits" and "2 radios push into swap." Mitigation:
+
+- Cap the container's memory in \`docker-compose.yml\` (see Phase 5 → Persistent storage)
+- Disable the GPU sidecar if you don't need its workloads (\`meshview-gpu\` service in \`docker-compose.yml\`) — that reclaims ~400 MB
+- Use an Orin Nano or AGX if you plan to run >2 radios
+
+### Disconnect / disable
+
+- **Disconnect**: click the **Disconnect** button on the secondary radio's row. The bridge shuts down cleanly; the row stays in the registry so you can reconnect with one click.
+- **Disable**: toggle the **Enabled** checkbox off in the per-radio editor. Disabled radios stay in the registry but are skipped by Refresh and won't auto-connect on next boot.
+- **Delete**: only allowed for non-default radios that aren't currently connected.
+
+The default radio cannot be disconnected from this panel — use the **Connection** panel (Phase 1's serial / TCP toggle) instead.
+
+---
+
 ## Phase 7: Troubleshooting
 
 ### Radio not detected

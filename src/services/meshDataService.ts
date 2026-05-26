@@ -249,21 +249,28 @@ export class MeshDataService {
     text: string,
     to = '!ffffffff',
     channel = 0,
-    opts: { replyTo?: number; isReaction?: boolean } = {},
-  ): Promise<{ ok: boolean; messageId?: string }> {
+    opts: { replyTo?: number; isReaction?: boolean; radioId?: string | null } = {},
+  ): Promise<{ ok: boolean; messageId?: string; radioId?: string | null; error?: string }> {
     try {
       const res = await fetch(`${API_BASE}/api/mesh/send`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, to, channel, replyTo: opts.replyTo, isReaction: opts.isReaction }),
+        body: JSON.stringify({
+          text, to, channel,
+          replyTo: opts.replyTo,
+          isReaction: opts.isReaction,
+          // v2.0 Phase 4: optional originating radio. Backend falls back to
+          // the default radio when omitted, so 1.x callers stay working.
+          radio_id: opts.radioId ?? undefined,
+        }),
       });
-      if (!res.ok) return { ok: false };
-      const body = await res.json();
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
       // Immediately refresh so the optimistic message shows up in state
       await this.poll();
-      return { ok: true, messageId: body.messageId };
-    } catch {
-      return { ok: false };
+      return { ok: true, messageId: body.messageId, radioId: body.radioId ?? null };
+    } catch (err: any) {
+      return { ok: false, error: err?.message };
     }
   }
 
@@ -624,6 +631,32 @@ export class MeshDataService {
   } | null> {
     try {
       const res = await fetch(`${API_BASE}/api/gpu/cluster`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(input),
+      });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  }
+
+  /**
+   * v2.0 Phase 4: build the unified mesh topology graph. When `edges` is
+   * omitted the server derives them from the bridge's neighbor-info state.
+   */
+  async buildTopology(input: {
+    edges?: Array<{ src: string; dst: string; snr?: number | null; rssi?: number | null; last_seen?: number | null }>;
+    compute_centrality?: boolean;
+  } = {}): Promise<{
+    nodes: string[];
+    degrees: Record<string, number>;
+    edges: Array<{ src: string; dst: string; snr: number | null; rssi: number | null; last_seen: number | null }>;
+    components: string[][];
+    centrality: Record<string, number> | null;
+    backend: 'cugraph' | 'cpu' | 'cpu_ts';
+  } | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/gpu/topology`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(input),
@@ -1418,18 +1451,35 @@ export class MeshDataService {
 
   /** Persist a full channel list to the radio. Server fills any missing slots
    *  as DISABLED, then commits and re-reads from the radio. */
-  async saveChannels(channels: Channel[]): Promise<{ ok: boolean; error?: string }> {
+  /**
+   * v2.0 Phase 4: fetch the channel list from a specific radio (skipping the
+   * snapshot's cached default-radio view). Returns null on network failure
+   * or 404 so callers can fall back to getChannels() cached state.
+   */
+  async fetchChannelsForRadio(radioId: string): Promise<Channel[] | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/channels?radio_id=${encodeURIComponent(radioId)}`);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  }
+
+  /**
+   * v2.0 Phase 4: optional `radioId` routes the channel write to a specific
+   * bridge. Omitting it targets the default radio (1.x behavior).
+   */
+  async saveChannels(channels: Channel[], radioId?: string | null): Promise<{ ok: boolean; error?: string; radioId?: string | null }> {
     try {
       const res = await fetch(`${API_BASE}/api/mesh/channels`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ channels }),
+        body: JSON.stringify({ channels, radio_id: radioId ?? undefined }),
       });
+      const body = await res.json().catch(() => ({}));
       if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
         return { ok: false, error: body.error || `HTTP ${res.status}` };
       }
-      return { ok: true };
+      return { ok: true, radioId: body.radioId ?? null };
     } catch (err: any) {
       return { ok: false, error: err.message || 'Network error' };
     }

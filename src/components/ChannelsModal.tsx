@@ -4,6 +4,7 @@ import { QRCodeSVG } from 'qrcode.react';
 import { Channel, ChannelRole } from '../types';
 import { meshDataService } from '../services/meshDataService';
 import { buildChannelShareUrl, parseChannelShareUrl } from '../lib/channelShare';
+import { useRadios } from '../hooks/useRadios';
 import { cn } from '../lib/utils';
 
 interface ChannelsModalProps {
@@ -92,23 +93,42 @@ function PositionPrecisionPicker({
 }
 
 export function ChannelsModal({ onClose }: ChannelsModalProps) {
+  const { radios, defaultRadioId, connectionStates } = useRadios();
+  // v2.0 Phase 4: which radio's channel set is being edited. Defaults to the
+  // default radio; operators with multiple radios can switch via the picker
+  // at the top. Re-fetches channels from that radio's bridge on change.
+  const [targetRadioId, setTargetRadioId] = useState<string | null>(defaultRadioId);
   const [channels, setChannels] = useState<Channel[]>(() => meshDataService.getChannels());
   const [saving, setSaving] = useState(false);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showShare, setShowShare] = useState(false);
   const [showImport, setShowImport] = useState(false);
 
   useEffect(() => {
-    // Refresh from latest snapshot when the modal opens
-    const unsub = meshDataService.onChannels((list) => {
-      // Only adopt server state if we haven't started editing
-      if (!saving) {
-        setChannels(prev => prev.length === 0 ? list : prev);
-      }
+    // Default-radio path: keep subscribing to the cached snapshot stream so
+    // saves elsewhere reflect here too.
+    if (!targetRadioId || targetRadioId === defaultRadioId) {
+      const unsub = meshDataService.onChannels((list) => {
+        if (!saving) {
+          setChannels(prev => prev.length === 0 ? list : prev);
+        }
+      });
+      return unsub;
+    }
+
+    // Non-default radio: explicit fetch from that radio's bridge.
+    let cancelled = false;
+    setLoading(true);
+    meshDataService.fetchChannelsForRadio(targetRadioId).then(list => {
+      if (cancelled) return;
+      setLoading(false);
+      if (list) setChannels(list);
+      else setError(`Couldn't read channels from "${targetRadioId}". Is it connected?`);
     });
-    return unsub;
+    return () => { cancelled = true; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [targetRadioId, defaultRadioId]);
 
   const sortedActive = channels
     .filter(c => c.role !== 'DISABLED')
@@ -154,7 +174,9 @@ export function ChannelsModal({ onClose }: ChannelsModalProps) {
 
     setSaving(true);
     try {
-      const result = await meshDataService.saveChannels(channels);
+      // v2.0 Phase 4: route the write to whichever radio is currently being
+      // edited. Falls back to the default when targetRadioId is null.
+      const result = await meshDataService.saveChannels(channels, targetRadioId);
       console.log('[ChannelsModal] saveChannels result', result);
       if (!result.ok) {
         setError(result.error || 'Save failed — see server logs.');
@@ -178,12 +200,40 @@ export function ChannelsModal({ onClose }: ChannelsModalProps) {
         <div className="p-4 border-b border-brand-line flex items-center justify-between bg-brand-line/10">
           <div>
             <h3 className="text-lg font-bold tracking-tight uppercase">Radio Channels</h3>
-            <p className="text-[10px] text-brand-muted mono-text uppercase">Up to {MAX_CHANNELS} slots; saving writes to the locally attached radio.</p>
+            <p className="text-[10px] text-brand-muted mono-text uppercase">Up to {MAX_CHANNELS} slots; saving writes to the selected radio.</p>
           </div>
           <button onClick={onClose} className="p-1 hover:bg-brand-line rounded-full transition-colors">
             <X size={20} />
           </button>
         </div>
+
+        {/* v2.0 Phase 4: per-radio target picker (visible when >1 radio is registered) */}
+        {radios.length > 1 && (
+          <div className="px-4 py-2 border-b border-brand-line bg-brand-bg/40 flex items-center gap-2">
+            <label className="text-[10px] font-bold uppercase tracking-widest text-brand-muted">Target Radio</label>
+            <select
+              value={targetRadioId ?? ''}
+              onChange={e => { setError(null); setTargetRadioId(e.target.value || null); }}
+              className="bg-brand-line/50 border border-brand-line rounded px-2 py-1 text-xs mono-text focus:outline-none focus:border-brand-accent"
+            >
+              {radios.map(r => {
+                const connected = !!connectionStates[r.radio_id]?.connected;
+                return (
+                  <option key={r.radio_id} value={r.radio_id} disabled={!connected && r.radio_id !== defaultRadioId}>
+                    {r.radio_id}
+                    {r.network_label ? ` · ${r.network_label}` : ''}
+                    {!connected ? ' (disconnected)' : ''}
+                    {r.radio_id === defaultRadioId ? ' · default' : ''}
+                  </option>
+                );
+              })}
+            </select>
+            {loading && <span className="text-[10px] mono-text text-brand-muted">loading…</span>}
+            <p className="ml-auto text-[10px] text-brand-muted">
+              Channel writes target this radio's firmware.
+            </p>
+          </div>
+        )}
 
         <div className="flex-1 overflow-y-auto p-4 space-y-3">
           {sortedActive.length === 0 && (

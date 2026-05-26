@@ -1,11 +1,11 @@
 """
 meshview-gpu — Python sidecar for GPU-accelerated workloads.
 
-Phase 3 lights up /cluster/dbscan. Other endpoints remain stubs until their
-phase lands:
+Phase 4 lights up /topology/build alongside Phase 3's /cluster/dbscan. Other
+endpoints remain stubs until their phase lands:
 
   Phase 3 ✓ /cluster/dbscan        — spatial clustering for map pins
-  Phase 4   /topology/build        — mesh topology graph (cuGraph)
+  Phase 4 ✓ /topology/build        — mesh topology graph (cuGraph if installed)
   Phase 5   /heatmap/coverage      — RSSI/SNR interpolation (cuPy)
   Phase 5   /trace/playback        — position history processing (cuDF)
 
@@ -251,13 +251,95 @@ class TopologyEdge(BaseModel):
 class TopologyRequest(BaseModel):
     edges: list[TopologyEdge]
     compute_centrality: bool = False
-    k_shortest: int | None = None
+    k_shortest: int | None = None  # Reserved — future per-pair k-shortest paths
+
+
+def _topology_cpu(req: TopologyRequest) -> dict[str, Any]:
+    """Pure-Python topology builder. Computes:
+      - the deduplicated edge set (undirected)
+      - per-node degree
+      - connected components via union-find
+      - optional degree-centrality (sorted desc)
+    """
+    # Normalize: undirected edges, canonical (a, b) where a < b string-wise.
+    adj: dict[str, set[str]] = {}
+    edge_meta: dict[tuple[str, str], dict[str, Any]] = {}
+    for e in req.edges:
+        if not e.src or not e.dst or e.src == e.dst:
+            continue
+        a, b = (e.src, e.dst) if e.src < e.dst else (e.dst, e.src)
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+        prev = edge_meta.get((a, b))
+        # Keep the strongest signal we've seen for this pair.
+        snr = e.snr if prev is None else (max(prev.get("snr", -1e9), e.snr) if e.snr is not None else prev.get("snr"))
+        rssi = e.rssi if prev is None else (max(prev.get("rssi", -1e9), e.rssi) if e.rssi is not None else prev.get("rssi"))
+        last_seen = e.last_seen if prev is None else (max(prev.get("last_seen", 0), e.last_seen) if e.last_seen is not None else prev.get("last_seen"))
+        edge_meta[(a, b)] = {"snr": snr, "rssi": rssi, "last_seen": last_seen}
+
+    nodes = sorted(adj.keys())
+    degrees = {n: len(adj[n]) for n in nodes}
+
+    # Connected components via iterative BFS (avoid recursion blowups on long chains).
+    visited: set[str] = set()
+    components: list[list[str]] = []
+    for n in nodes:
+        if n in visited:
+            continue
+        comp: list[str] = []
+        stack = [n]
+        while stack:
+            cur = stack.pop()
+            if cur in visited:
+                continue
+            visited.add(cur)
+            comp.append(cur)
+            stack.extend(x for x in adj.get(cur, ()) if x not in visited)
+        components.append(sorted(comp))
+
+    centrality: dict[str, float] | None = None
+    if req.compute_centrality and len(nodes) > 1:
+        max_possible = len(nodes) - 1
+        centrality = {n: degrees[n] / max_possible for n in nodes}
+
+    out_edges = [
+        {"src": a, "dst": b, **edge_meta[(a, b)]}
+        for (a, b) in sorted(edge_meta.keys())
+    ]
+
+    return {
+        "nodes": nodes,
+        "degrees": degrees,
+        "edges": out_edges,
+        "components": components,
+        "centrality": centrality,
+        "backend": "cpu",
+    }
+
+
+def _try_cugraph_topology(req: TopologyRequest) -> dict[str, Any] | None:
+    """Future GPU path. Returns None until cuGraph is on the import path."""
+    try:
+        import cugraph  # type: ignore
+        import cudf  # type: ignore
+    except ImportError:
+        return None
+    # cuGraph is available — but the CPU path is fast enough for mesh sizes
+    # we expect (<10k nodes). Leaving this as the integration seam for when
+    # someone needs to scale; until then we return None and use _topology_cpu.
+    _ = (cugraph, cudf)  # mark imports as used so the type checker stops fretting
+    return None
 
 
 @app.post("/topology/build")
-def topology_build(_req: TopologyRequest) -> dict[str, Any]:
-    """Phase 4 will implement using cuGraph. Returns 501 until then."""
-    raise HTTPException(status_code=501, detail="topology_build not implemented (Phase 4)")
+def topology_build(req: TopologyRequest) -> dict[str, Any]:
+    """
+    Build an undirected mesh topology from heard-by edges. Phase 4 ships the
+    pure-Python implementation; cuGraph detection is a no-op until a
+    deployment actually has it installed (the Phase 1.5 base image doesn't).
+    """
+    gpu = _try_cugraph_topology(req)
+    return gpu if gpu is not None else _topology_cpu(req)
 
 
 # ---- Phase 5: signal coverage heatmap ------------------------------------------

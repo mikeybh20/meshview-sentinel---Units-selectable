@@ -17,7 +17,7 @@ import { WeatherAlertPoller } from './weatherAlertPoller.js';
 import { bridgeManager, testTransportConnection } from './bridgeManager.js';
 // v2.0 GPU sidecar boot probe. Logs sidecar reachability + detected GPU
 // at startup so the operator immediately knows their acceleration tier.
-import { probeGpuOnBoot, health as gpuHealth, clusterDbscan } from './gpuClient.js';
+import { probeGpuOnBoot, health as gpuHealth, clusterDbscan, buildTopology } from './gpuClient.js';
 probeGpuOnBoot();
 
 // Wire BBS-Mail. The bridge type-imports BbsService so we attach it after
@@ -602,6 +602,52 @@ app.get('/api/gpu/health', async (_req, res) => {
   return res.json(h);
 });
 
+// --- v2.0 Phase 4 GPU topology passthrough. ---
+// Builds the unified mesh topology graph from heard-by edges. Used by the
+// Topology / Network view to render the connectivity graph + centrality
+// scores. Server can derive edges from neighbor_info + heardBy if the
+// caller doesn't pass them explicitly.
+app.post('/api/gpu/topology', async (req, res) => {
+  const body = req.body ?? {};
+  let edges: Array<{ src: string; dst: string; snr?: number | null; rssi?: number | null; last_seen?: number | null }> = [];
+
+  if (Array.isArray(body.edges)) {
+    edges = body.edges;
+  } else {
+    // Auto-derive edges from server-side neighbor_info — every NeighborInfoSnapshot
+    // contains a list of neighbors that node has directly heard.
+    const ctxs = bridgeManager.list();
+    const sources = ctxs.length === 0 ? [meshBridge] : ctxs.map(c => c.bridge);
+    const seen = new Set<string>();
+    for (const br of sources) {
+      for (const snap of br.getNeighborInfo()) {
+        for (const nbr of snap.neighbors ?? []) {
+          const key = `${snap.fromNodeId}|${nbr.nodeId}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          edges.push({
+            src: snap.fromNodeId,
+            dst: nbr.nodeId,
+            snr: typeof nbr.snr === 'number' ? nbr.snr : null,
+            last_seen: snap.lastSeen ?? null,
+          });
+        }
+      }
+    }
+  }
+
+  try {
+    const result = await buildTopology({
+      edges,
+      compute_centrality: !!body.compute_centrality,
+      k_shortest: typeof body.k_shortest === 'number' ? body.k_shortest : undefined,
+    });
+    return res.json(result);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'topology build failed' });
+  }
+});
+
 // --- v2.0 Phase 3 GPU clustering passthrough. ---
 // The dashboard map calls this when its viewport / zoom / node set changes
 // so overlapping pins collapse into a `+N` cluster badge instead of stacking
@@ -840,11 +886,25 @@ app.delete('/api/mesh/blocked/:nodeId', (req, res) => {
   }
 });
 
-// All messages received by the radio — aggregates across all bridges.
-app.get('/api/mesh/messages', (_req, res) => {
+// All messages — aggregates across all bridges, with optional ?radio_id filter.
+// v2.0 Phase 4: when a per-radio filter is active the client passes the id so
+// the response only contains messages stamped with that radio_id (the bridge
+// that sent or received them).
+app.get('/api/mesh/messages', (req, res) => {
+  const radioId = typeof req.query.radio_id === 'string' && req.query.radio_id ? req.query.radio_id : null;
   const ctxs = bridgeManager.list();
-  if (ctxs.length === 0) return res.json(meshBridge.getMessages());
-  return res.json(bridgeManager.getAllMessages());
+  let msgs = ctxs.length === 0 ? meshBridge.getMessages() : bridgeManager.getAllMessages();
+  if (radioId) {
+    // The aggregator already concatenates per-bridge in-memory caches, but
+    // each message object doesn't carry a radio_id (the column is DB-only).
+    // For correctness, query the DB for the radio_id of each message and
+    // filter. For now, fall back to per-context iteration to avoid the DB
+    // hit on the hot path — secondary bridges' messages came from the
+    // matching radio context already.
+    const fromCtx = ctxs.find(c => c.radioId === radioId)?.bridge.getMessages() ?? [];
+    msgs = fromCtx;
+  }
+  return res.json(msgs);
 });
 
 // Full-text search across all persisted messages
@@ -1796,18 +1856,38 @@ app.get('/api/mesh/nodes/:id/traces', (req, res) => {
   }
 });
 
-// Channel configuration
-app.get('/api/mesh/channels', (_req, res) => {
+// Channel configuration. v2.0 Phase 4: optional ?radio_id picks the source
+// radio so an operator with multiple radios can read each radio's channel
+// list independently. Omitting the param returns the default radio's.
+app.get('/api/mesh/channels', (req, res) => {
+  const radioId = typeof req.query.radio_id === 'string' && req.query.radio_id ? req.query.radio_id : null;
+  if (radioId) {
+    const ctx = bridgeManager.get(radioId);
+    if (!ctx) return res.status(404).json({ error: `radio "${radioId}" is not currently connected` });
+    return res.json(ctx.bridge.getChannels());
+  }
   return res.json(meshBridge.getChannels());
 });
 
+// v2.0 Phase 4: same optional `radio_id` in the body routes the channel
+// write to a specific bridge. Channel-share imports use this to apply a
+// pasted URL to whichever radio the operator picks in the import overlay.
 app.post('/api/mesh/channels', async (req, res) => {
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
   const channels = req.body?.channels;
+  const radioIdRaw = req.body?.radio_id;
   if (!Array.isArray(channels)) return res.status(400).json({ error: 'Body must be { channels: [...] }' });
+
+  const radioId = typeof radioIdRaw === 'string' && radioIdRaw ? radioIdRaw : null;
+  const ctx = radioId ? bridgeManager.get(radioId) : null;
+  const bridge = ctx?.bridge ?? meshBridge;
+  if (radioId && !ctx) {
+    return res.status(404).json({ error: `radio "${radioId}" is not currently connected` });
+  }
+  if (!bridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+
   try {
-    await meshBridge.setChannels(channels);
-    return res.json({ ok: true });
+    await bridge.setChannels(channels);
+    return res.json({ ok: true, radioId: bridge.getRadioId() });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
   }
@@ -2009,18 +2089,29 @@ app.delete('/api/mesh/bbs/weather/subscribers/:nodeId', (req, res) => {
   }
 });
 
-// Send a text message through the radio (also handles replies and reactions)
+// Send a text message through the radio (also handles replies and reactions).
+// v2.0 Phase 4: optional `radio_id` in the body picks the originating radio;
+// when omitted, falls back to the default radio so 1.x clients keep working.
 app.post('/api/mesh/send', async (req, res) => {
-  const { text, to, channel, replyTo, isReaction } = req.body;
+  const { text, to, channel, replyTo, isReaction, radio_id: radioIdRaw } = req.body;
   if (!text) return res.status(400).json({ error: 'Missing text' });
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+
+  const radioId = typeof radioIdRaw === 'string' && radioIdRaw ? radioIdRaw : null;
+  // Resolve the target bridge: explicit radio_id → that context's bridge;
+  // otherwise the singleton (= default radio).
+  const ctx = radioId ? bridgeManager.get(radioId) : null;
+  const bridge = ctx?.bridge ?? meshBridge;
+  if (radioId && !ctx) {
+    return res.status(404).json({ error: `radio "${radioId}" is not currently connected` });
+  }
+  if (!bridge.connected) return res.status(503).json({ error: 'Radio not connected' });
 
   try {
-    const messageId = await meshBridge.sendMessage(text, to || '!ffffffff', channel ?? 0, {
+    const messageId = await bridge.sendMessage(text, to || '!ffffffff', channel ?? 0, {
       replyTo: typeof replyTo === 'number' ? replyTo : undefined,
       isReaction: !!isReaction,
     });
-    return res.json({ ok: true, messageId });
+    return res.json({ ok: true, messageId, radioId: bridge.getRadioId() });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
   }

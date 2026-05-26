@@ -358,7 +358,12 @@ export default function App() {
       const channelIndex = activeChannel?.index ?? 0;
       const to = activeChannel ? '!ffffffff' : activeChatId;
       if (!overrideText) setDraftMessage('');
-      await meshDataService.sendMessage(text, to, channelIndex, opts);
+      // v2.0 Phase 4: route through the currently-selected radio if any.
+      // null = "All Radios" filter → send through the default radio.
+      await meshDataService.sendMessage(text, to, channelIndex, {
+        ...opts,
+        radioId: selectedRadioId,
+      });
     } else {
       setDraftMessage('');
     }
@@ -467,12 +472,21 @@ export default function App() {
     );
   }, [nodes, searchQuery, selectedGroupId, selectedRadioId]);
 
-  const stats = React.useMemo(() => ({
-    total: nodes.length,
-    online: nodes.filter(n => n.online).length,
-    offline: nodes.filter(n => !n.online).length,
-    favorites: nodes.filter(n => n.favorite).length
-  }), [nodes]);
+  // v2.0 Phase 4: when a per-radio filter is active, scope stats to nodes
+  // that this radio has actually heard so the cards reflect the meshes the
+  // operator is currently looking at. With no filter, totals span every
+  // connected mesh.
+  const stats = React.useMemo(() => {
+    const scope = selectedRadioId
+      ? nodes.filter(n => n.heardByRadios?.includes(selectedRadioId))
+      : nodes;
+    return {
+      total: scope.length,
+      online: scope.filter(n => n.online).length,
+      offline: scope.filter(n => !n.online).length,
+      favorites: scope.filter(n => n.favorite).length,
+    };
+  }, [nodes, selectedRadioId]);
 
   const handleCreateGroup = async () => {
     const name = newGroupName.trim();
