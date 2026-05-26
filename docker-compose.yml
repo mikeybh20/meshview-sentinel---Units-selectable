@@ -15,6 +15,11 @@ services:
     environment:
       - NODE_ENV=production
       - SERIAL_AUTO_DISCOVER=true
+      # v2.0: GPU sidecar URL. Default is the compose-network service name.
+      # Override (e.g., MESHVIEW_GPU_URL=http://192.168.1.50:7100) to point at
+      # a remote sidecar — useful when the Sentinel host has no GPU but a
+      # nearby NVIDIA box does.
+      - MESHVIEW_GPU_URL=http://meshview-gpu:7100
     # `host.docker.internal` works on Docker Desktop (mac/windows) out of the
     # box, but on Linux you have to alias it to the host gateway explicitly.
     # This lets the in-container API reach a host-side Ollama at
@@ -42,6 +47,42 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
+    depends_on:
+      - meshview-gpu
+
+  # ---------------------------------------------------------------------
+  # v2.0 GPU sidecar — Python service hosting GPU-accelerated workloads.
+  # Phase 1.5 ships endpoint stubs only (501); Sentinel uses CPU fallbacks
+  # transparently. Phases 3/4/5 implement actual GPU paths.
+  #
+  # To use a GPU here, ensure the host has the NVIDIA Container Toolkit
+  # installed, and uncomment the `deploy.resources.reservations.devices`
+  # block below. Without it, the sidecar runs in CPU-stub mode (still
+  # responds to /health, all compute endpoints return 501).
+  # ---------------------------------------------------------------------
+  meshview-gpu:
+    build:
+      context: ./gpu
+      dockerfile: Dockerfile
+    environment:
+      - MESHVIEW_GPU_PORT=7100
+      - MESHVIEW_GPU_LOG_LEVEL=INFO
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Uncomment for NVIDIA GPU passthrough (requires nvidia-container-toolkit
+    # on the host). On Jetson this is already implicit when the L4T runtime
+    # is the default Docker runtime.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
 
 volumes:
   meshview-data:

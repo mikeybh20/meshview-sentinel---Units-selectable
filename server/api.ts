@@ -11,6 +11,14 @@ import { meshDb } from './database.js';
 import { BbsService } from './bbs.js';
 import { loadBbsConfig, saveBbsConfig, normalizeBbsConfig, type BbsConfig } from './bbsConfig.js';
 import { WeatherAlertPoller } from './weatherAlertPoller.js';
+// v2.0 multi-radio. Importing for side effect: BridgeManager wires its
+// auto-registration listeners onto meshBridge at module load. The exported
+// singleton is also used by the /api/mesh/radios endpoint below.
+import { bridgeManager } from './bridgeManager.js';
+// v2.0 GPU sidecar boot probe. Logs sidecar reachability + detected GPU
+// at startup so the operator immediately knows their acceleration tier.
+import { probeGpuOnBoot, health as gpuHealth } from './gpuClient.js';
+probeGpuOnBoot();
 
 // Wire BBS-Mail. The bridge type-imports BbsService so we attach it after
 // both are constructed to avoid a runtime import cycle.
@@ -348,7 +356,26 @@ app.get('/api/mesh/status', (_req, res) => {
     localNodeId: meshBridge.getLocalNodeId(),
     firmwareVersion: meshBridge.getLocalFirmwareVersion(),
     rebootCount: meshBridge.getLocalRebootCount(),
+    defaultRadioId: bridgeManager.getDefaultRadioId(),
   });
+});
+
+// --- v2.0 multi-radio: read-only listing of configured radios. ---
+// Phase 1 only exposes the default radio (auto-registered from the
+// connected hardware). Phase 2 will add CRUD for adding/editing radios.
+app.get('/api/mesh/radios', (_req, res) => {
+  const rows = meshDb().listRadios();
+  return res.json({
+    radios: rows,
+    defaultRadioId: bridgeManager.getDefaultRadioId(),
+  });
+});
+
+// --- v2.0 GPU sidecar health passthrough. ---
+// Settings → GPU panel (Phase 5) will surface this.
+app.get('/api/gpu/health', async (_req, res) => {
+  const h = await gpuHealth();
+  return res.json(h);
 });
 
 // --- TCP transport: connect / disconnect ---
@@ -492,7 +519,7 @@ app.post('/api/mesh/nodes/:id/favorite', (req, res) => {
 // Group create/update/delete + node assignment all use the same fanOut
 // channel so other clients re-poll and see the change instantly.
 const broadcastGroupsChanged = () => {
-  const payload = `event: groups\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`;
+  const payload = `event: groups\ndata: ${JSON.stringify({ ts: Date.now(), radioId: bridgeManager.getDefaultRadioId() })}\n\n`;
   for (const send of sseClients) {
     try { send(payload); } catch { /* client gone */ }
   }
@@ -503,7 +530,7 @@ const broadcastGroupsChanged = () => {
 // from these nodes; we just persist the list centrally so multi-tab and
 // multi-machine operators stay in sync.
 const broadcastBlockedChanged = () => {
-  const payload = `event: blocked\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`;
+  const payload = `event: blocked\ndata: ${JSON.stringify({ ts: Date.now(), radioId: bridgeManager.getDefaultRadioId() })}\n\n`;
   for (const send of sseClients) {
     try { send(payload); } catch { /* client gone */ }
   }
@@ -1728,15 +1755,18 @@ app.post('/api/mesh/send', async (req, res) => {
 // Server-Sent Events stream for real-time ACK/status updates
 const sseClients = new Set<(data: string) => void>();
 
+// v2.0: every SSE payload carries the source radio_id so Phase 3's
+// per-radio filter chips can drop events that don't belong to the
+// selected radio without needing a separate channel per radio.
 meshBridge.on('ackUpdate', (msgId: string, status: string, errorCode: number) => {
-  const payload = `event: ack\ndata: ${JSON.stringify({ msgId, status, errorCode: errorCode ?? 0 })}\n\n`;
+  const payload = `event: ack\ndata: ${JSON.stringify({ msgId, status, errorCode: errorCode ?? 0, radioId: bridgeManager.getDefaultRadioId() })}\n\n`;
   for (const send of sseClients) {
     try { send(payload); } catch { /* client gone */ }
   }
 });
 
 meshBridge.on('traceUpdate', (trace: any) => {
-  const payload = `event: trace\ndata: ${JSON.stringify(trace)}\n\n`;
+  const payload = `event: trace\ndata: ${JSON.stringify({ ...trace, radioId: bridgeManager.getDefaultRadioId() })}\n\n`;
   for (const send of sseClients) {
     try { send(payload); } catch { /* client gone */ }
   }
@@ -1745,7 +1775,7 @@ meshBridge.on('traceUpdate', (trace: any) => {
 // Waypoint changes fan out to every connected client so a drop-pin on one
 // browser tab appears instantly on every other open tab.
 meshBridge.on('waypointsChanged', () => {
-  const payload = `event: waypoints\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`;
+  const payload = `event: waypoints\ndata: ${JSON.stringify({ ts: Date.now(), radioId: bridgeManager.getDefaultRadioId() })}\n\n`;
   for (const send of sseClients) {
     try { send(payload); } catch { /* client gone */ }
   }
@@ -1755,7 +1785,7 @@ meshBridge.on('waypointsChanged', () => {
 // fairly frequently (nodeUpdate fires on every telemetry/position update, etc.)
 // — the client debounces them server-side could be added later if needed.
 const fanOut = (eventName: string) => () => {
-  const payload = `event: ${eventName}\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`;
+  const payload = `event: ${eventName}\ndata: ${JSON.stringify({ ts: Date.now(), radioId: bridgeManager.getDefaultRadioId() })}\n\n`;
   for (const send of sseClients) {
     try { send(payload); } catch { /* client gone */ }
   }

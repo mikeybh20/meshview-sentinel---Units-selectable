@@ -1,0 +1,8 @@
+# Phase 1.5 — minimal scaffold. GPU libraries (cuML, cuGraph, cuPy, cuDF) are
+# added per-phase as the workloads they back ship:
+#   Phase 3 → cuml
+#   Phase 4 → cugraph
+#   Phase 5 → cupy + cudf
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+pydantic==2.10.3

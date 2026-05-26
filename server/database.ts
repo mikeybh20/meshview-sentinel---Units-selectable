@@ -283,6 +283,30 @@ export class MeshDatabase {
       );
 
       CREATE INDEX IF NOT EXISTS idx_pos_hist_node_ts ON position_history(node_id, timestamp DESC);
+
+      -- v2.0: multi-radio support. Each row is one configured radio. The
+      -- radio_id is the 4-char Meshtastic short_name (User.short_name), kept
+      -- unique across the deployment. Existing single-radio installs get
+      -- their current radio auto-registered on first 2.0 boot.
+      CREATE TABLE IF NOT EXISTS radios (
+        radio_id        TEXT PRIMARY KEY,
+        long_name       TEXT NOT NULL,
+        transport       TEXT NOT NULL,
+        target          TEXT NOT NULL,
+        region          TEXT,
+        modem_preset    TEXT,
+        frequency_slot  INTEGER,
+        primary_channel TEXT,
+        num_hops        INTEGER DEFAULT 3,
+        enabled         INTEGER NOT NULL DEFAULT 1,
+        color_hex       TEXT,
+        network_label   TEXT,
+        is_default      INTEGER NOT NULL DEFAULT 0,
+        created_at      INTEGER NOT NULL,
+        updated_at      INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_radios_enabled ON radios(enabled);
     `);
 
     // Additive migrations for older DBs. SQLite throws if the column already
@@ -303,6 +327,31 @@ export class MeshDatabase {
     addColumnIfMissing('messages', 'is_reaction INTEGER NOT NULL DEFAULT 0');
     addColumnIfMissing('messages', 'delivery_ms INTEGER');
     addColumnIfMissing('channels', 'position_precision INTEGER');
+
+    // v2.0 multi-radio additive migration. Every radio-scoped table gets a
+    // radio_id column. Stays nullable for the migration window so existing
+    // rows aren't rejected; BridgeManager backfills NULLs to the
+    // auto-registered default radio's short_name on first 2.0 boot.
+    const RADIO_SCOPED_TABLES = [
+      'nodes', 'messages', 'events', 'channels', 'telemetry', 'waypoints',
+      'neighbor_info', 'store_forward_routers', 'trace_results',
+      'range_test_observations', 'blocked_nodes', 'node_sessions',
+      'bbs_mail', 'bbs_weather_subscribers', 'position_history',
+    ];
+    for (const t of RADIO_SCOPED_TABLES) {
+      addColumnIfMissing(t, 'radio_id TEXT');
+    }
+    // Indexes on radio_id for the high-cardinality / high-query tables.
+    try {
+      this.db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_nodes_radio_id    ON nodes(radio_id);
+        CREATE INDEX IF NOT EXISTS idx_messages_radio_id ON messages(radio_id, timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_events_radio_id   ON events(radio_id, timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_pos_hist_radio    ON position_history(radio_id, node_id, timestamp DESC);
+      `);
+    } catch (err: any) {
+      console.warn('[MeshDB] v2 radio_id index creation warning:', err.message);
+    }
 
     // FTS5 full-text search index over messages.text. We use external content
     // (the `messages` table is the canonical source) and triggers to keep them
@@ -1582,6 +1631,147 @@ export class MeshDatabase {
     }>;
     return rows;
   }
+
+  // ---------------------------------------------------------------------
+  // v2.0 Multi-radio (radios table)
+  // ---------------------------------------------------------------------
+
+  listRadios(): RadioRow[] {
+    return this.db.prepare(`
+      SELECT radio_id, long_name, transport, target, region, modem_preset,
+             frequency_slot, primary_channel, num_hops, enabled, color_hex,
+             network_label, is_default, created_at, updated_at
+      FROM radios
+      ORDER BY is_default DESC, created_at ASC
+    `).all() as RadioRow[];
+  }
+
+  getRadio(radioId: string): RadioRow | null {
+    const row = this.db.prepare(`
+      SELECT radio_id, long_name, transport, target, region, modem_preset,
+             frequency_slot, primary_channel, num_hops, enabled, color_hex,
+             network_label, is_default, created_at, updated_at
+      FROM radios WHERE radio_id = ?
+    `).get(radioId) as RadioRow | undefined;
+    return row ?? null;
+  }
+
+  getDefaultRadio(): RadioRow | null {
+    const row = this.db.prepare(`
+      SELECT radio_id, long_name, transport, target, region, modem_preset,
+             frequency_slot, primary_channel, num_hops, enabled, color_hex,
+             network_label, is_default, created_at, updated_at
+      FROM radios WHERE is_default = 1
+      LIMIT 1
+    `).get() as RadioRow | undefined;
+    return row ?? null;
+  }
+
+  upsertRadio(r: RadioRow): void {
+    const now = Date.now();
+    this.db.prepare(`
+      INSERT INTO radios (
+        radio_id, long_name, transport, target, region, modem_preset,
+        frequency_slot, primary_channel, num_hops, enabled, color_hex,
+        network_label, is_default, created_at, updated_at
+      ) VALUES (
+        @radio_id, @long_name, @transport, @target, @region, @modem_preset,
+        @frequency_slot, @primary_channel, @num_hops, @enabled, @color_hex,
+        @network_label, @is_default, @created_at, @updated_at
+      )
+      ON CONFLICT(radio_id) DO UPDATE SET
+        long_name       = excluded.long_name,
+        transport       = excluded.transport,
+        target          = excluded.target,
+        region          = excluded.region,
+        modem_preset    = excluded.modem_preset,
+        frequency_slot  = excluded.frequency_slot,
+        primary_channel = excluded.primary_channel,
+        num_hops        = excluded.num_hops,
+        enabled         = excluded.enabled,
+        color_hex       = excluded.color_hex,
+        network_label   = excluded.network_label,
+        is_default      = excluded.is_default,
+        updated_at      = excluded.updated_at
+    `).run({
+      radio_id:        r.radio_id,
+      long_name:       r.long_name,
+      transport:       r.transport,
+      target:          r.target,
+      region:          r.region ?? null,
+      modem_preset:    r.modem_preset ?? null,
+      frequency_slot:  r.frequency_slot ?? null,
+      primary_channel: r.primary_channel ?? null,
+      num_hops:        r.num_hops ?? 3,
+      enabled:         r.enabled ? 1 : 0,
+      color_hex:       r.color_hex ?? null,
+      network_label:   r.network_label ?? null,
+      is_default:      r.is_default ? 1 : 0,
+      created_at:      r.created_at ?? now,
+      updated_at:      now,
+    });
+  }
+
+  deleteRadio(radioId: string): boolean {
+    const r = this.db.prepare(`DELETE FROM radios WHERE radio_id = ? AND is_default = 0`).run(radioId);
+    return r.changes > 0;
+  }
+
+  setDefaultRadio(radioId: string): boolean {
+    const found = this.db.prepare(`SELECT 1 FROM radios WHERE radio_id = ?`).get(radioId);
+    if (!found) return false;
+    const tx = this.db.transaction(() => {
+      this.db.prepare(`UPDATE radios SET is_default = 0 WHERE is_default = 1`).run();
+      this.db.prepare(`UPDATE radios SET is_default = 1, updated_at = ? WHERE radio_id = ?`).run(Date.now(), radioId);
+    });
+    tx();
+    return true;
+  }
+
+  /**
+   * One-time backfill: stamp NULL radio_id rows with the supplied radio_id.
+   * Called by BridgeManager exactly once when the default radio is first
+   * auto-registered (so legacy 1.x data is attributed to that radio).
+   * Returns counts per table.
+   */
+  backfillRadioId(radioId: string): Record<string, number> {
+    const tables = [
+      'nodes', 'messages', 'events', 'channels', 'telemetry', 'waypoints',
+      'neighbor_info', 'store_forward_routers', 'trace_results',
+      'range_test_observations', 'blocked_nodes', 'node_sessions',
+      'bbs_mail', 'bbs_weather_subscribers', 'position_history',
+    ];
+    const results: Record<string, number> = {};
+    const tx = this.db.transaction(() => {
+      for (const t of tables) {
+        const r = this.db.prepare(`UPDATE ${t} SET radio_id = ? WHERE radio_id IS NULL`).run(radioId);
+        if (r.changes > 0) results[t] = r.changes;
+      }
+    });
+    tx();
+    return results;
+  }
+}
+
+// ---------------------------------------------------------------------
+// Radio row shape (mirrors the radios table 1:1).
+// ---------------------------------------------------------------------
+export interface RadioRow {
+  radio_id: string;
+  long_name: string;
+  transport: 'serial' | 'tcp' | 'ble';
+  target: string;
+  region: string | null;
+  modem_preset: string | null;
+  frequency_slot: number | null;
+  primary_channel: string | null;
+  num_hops: number | null;
+  enabled: number;          // 0|1 (SQLite booleans)
+  color_hex: string | null;
+  network_label: string | null;
+  is_default: number;       // 0|1
+  created_at: number;
+  updated_at: number;
 }
 
 // ---------------------------------------------------------------------
