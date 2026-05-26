@@ -537,6 +537,35 @@ export class MeshDataService {
     } catch { return null; }
   }
 
+  /**
+   * v2.0 Phase 2 polish: dry-run transport test. Returns the radio's
+   * reported identity (short_name + long_name) and LoRa config when the
+   * handshake completes inside the timeout. Used by:
+   *   - Add Radio "Detect Identity" pre-submit auto-fill
+   *   - Edit Radio "Test Connection" button
+   */
+  async testRadioConnection(input: {
+    transport: 'serial' | 'tcp';
+    target: string;
+    timeout_ms?: number;
+  }): Promise<
+    | { ok: true; identity?: { shortName: string; longName: string; nodeId: string }; lora?: { region: number; modemPreset: number; frequencySlot: number; hopLimit: number } }
+    | { ok: false; error: string }
+  > {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/test`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(input),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return body;
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'request failed' };
+    }
+  }
+
   async getRadioLora(radioId: string): Promise<{ radio: any; live: any | null } | null> {
     try {
       const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/lora`);

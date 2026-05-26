@@ -387,6 +387,86 @@ function parseTcpTarget(target: string): { host: string; port: number } {
   return { host: t, port: 4403 };
 }
 
+/**
+ * v2.0 Phase 2 polish: dry-run connect that opens a transient bridge against
+ * the given transport+target, waits up to `timeoutMs` for the radio's identity
+ * (its User config carries short_name + long_name), then tears down. Used by:
+ *   - Add Radio "Detect Identity" auto-fill
+ *   - Edit Radio "Test Connection" button
+ *
+ * Never persists state; the temporary bridge is created outside BridgeManager
+ * so it doesn't pollute the contexts map.
+ */
+export async function testTransportConnection(opts: {
+  transport: 'serial' | 'tcp';
+  target: string;
+  timeoutMs?: number;
+}): Promise<{
+  ok: true;
+  identity?: { shortName: string; longName: string; nodeId: string };
+  lora?: { region: number; modemPreset: number; frequencySlot: number; hopLimit: number };
+} | { ok: false; error: string }> {
+  const timeoutMs = opts.timeoutMs ?? 5000;
+  const bridge = new MeshtasticSerialBridge();
+  let identity: { shortName: string; longName: string; nodeId: string } | undefined;
+  let lora: { region: number; modemPreset: number; frequencySlot: number; hopLimit: number } | undefined;
+
+  // Resolve as soon as we have identity (lora is best-effort within the window).
+  const identityResolved = new Promise<void>((resolve) => {
+    const handler = () => {
+      const localId = bridge.getLocalNodeId();
+      if (!localId) return;
+      const node = bridge.getNodes().find(n => n.id === localId);
+      if (!node?.shortName) return;
+      identity = { shortName: node.shortName, longName: node.name ?? '', nodeId: localId };
+      resolve();
+    };
+    bridge.on('nodeUpdate', handler);
+  });
+  const loraResolved = new Promise<void>((resolve) => {
+    bridge.on('loraConfigUpdate', (snap: any) => {
+      lora = {
+        region: snap.region, modemPreset: snap.modemPreset,
+        frequencySlot: snap.frequencySlot, hopLimit: snap.hopLimit,
+      };
+      resolve();
+    });
+  });
+
+  const tearDown = async () => { try { await bridge.disconnect(); } catch { /* ignore */ } };
+
+  try {
+    if (opts.transport === 'tcp') {
+      const { host, port } = parseTcpTarget(opts.target);
+      await bridge.connectTcp(host, port);
+    } else {
+      await bridge.connect(opts.target);
+    }
+  } catch (err: any) {
+    await tearDown();
+    return { ok: false, error: err?.message ?? 'connect failed' };
+  }
+
+  // Try to get a LoRa readback alongside identity (best-effort).
+  bridge.requestLoraConfig().catch(() => {});
+
+  // Wait for identity OR timeout.
+  const timer = new Promise<'timeout'>(r => setTimeout(() => r('timeout'), timeoutMs));
+  const winner = await Promise.race([identityResolved.then(() => 'identity' as const), timer]);
+  // Give LoRa readback a little extra time after identity if it hasn't arrived yet.
+  if (winner === 'identity' && !lora) {
+    const loraTimer = new Promise<'timeout'>(r => setTimeout(() => r('timeout'), Math.min(1500, timeoutMs / 2)));
+    await Promise.race([loraResolved, loraTimer]);
+  }
+
+  await tearDown();
+
+  if (winner === 'timeout' && !identity) {
+    return { ok: false, error: `connected but radio did not report its identity within ${timeoutMs}ms — wrong port or firmware unresponsive?` };
+  }
+  return { ok: true, identity, lora };
+}
+
 // Stringified labels for Meshtastic enums. Keep these in sync with the
 // canonical config.proto values; new firmware releases occasionally add
 // regions or presets so the unknown-value fallback in applyLoraReadback()

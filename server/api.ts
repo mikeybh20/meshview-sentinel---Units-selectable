@@ -14,7 +14,7 @@ import { WeatherAlertPoller } from './weatherAlertPoller.js';
 // v2.0 multi-radio. Importing for side effect: BridgeManager wires its
 // auto-registration listeners onto meshBridge at module load. The exported
 // singleton is also used by the /api/mesh/radios endpoint below.
-import { bridgeManager } from './bridgeManager.js';
+import { bridgeManager, testTransportConnection } from './bridgeManager.js';
 // v2.0 GPU sidecar boot probe. Logs sidecar reachability + detected GPU
 // at startup so the operator immediately knows their acceleration tier.
 import { probeGpuOnBoot, health as gpuHealth, clusterDbscan } from './gpuClient.js';
@@ -510,6 +510,27 @@ app.get('/api/mesh/radios/connections', (_req, res) => {
     states: bridgeManager.connectionStates(),
     defaultRadioId: bridgeManager.getDefaultRadioId(),
   });
+});
+
+// --- v2.0 Phase 2 polish: dry-run connection test. ---
+// Two use cases:
+//   1. Add Radio form pre-submit — auto-fill short_name + long_name from the
+//      radio's firmware before the operator commits the row.
+//   2. Edit Radio "Test Connection" button — verify the configured target
+//      still reaches a live radio without leaving the bridge connected.
+app.post('/api/mesh/radios/test', async (req, res) => {
+  const body = req.body ?? {};
+  const transport = String(body.transport ?? '').trim();
+  const target = String(body.target ?? '').trim();
+  if (transport !== 'serial' && transport !== 'tcp') {
+    return res.status(400).json({ error: 'transport must be serial or tcp' });
+  }
+  if (!target) return res.status(400).json({ error: 'target is required' });
+  const timeoutMs = Number.isFinite(body.timeout_ms) ? Math.max(500, Math.min(15000, Math.floor(body.timeout_ms))) : 5000;
+
+  const r = await testTransportConnection({ transport: transport as 'serial' | 'tcp', target, timeoutMs });
+  if (!r.ok) return res.status(502).json({ error: (r as { ok: false; error: string }).error });
+  return res.json(r);
 });
 
 // --- LoRa config read + write (firmware admin) ---

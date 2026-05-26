@@ -2,7 +2,7 @@ export const JETSON_NANO_GUIDE = `# Deploying Meshview Sentinel on a Jetson Nano
 
 The Jetson Nano 2GB is a reasonable host for an always-on Sentinel gateway: low power (~5 W), quiet, ARM64-native, with built-in USB serial support. This guide covers what you'll want to know before standing one up, what's safe to ignore, and what to monitor once it's running.
 
-> **TL;DR**: yes it works. Run headless, cap container memory at ~800 MB, and put the data volume on a USB SSD or endurance microSD — not the kit's bargain card. Expect ~4-5 W idle, ~600-800 MB RAM total.
+> **TL;DR**: yes it works. Run headless, cap container memory at ~800 MB, and put the data volume on a USB SSD or endurance microSD — not the kit's bargain card. Expect ~4-5 W idle, ~1.0-1.2 GB RAM total once the v2.0 GPU sidecar is also running (~400 MB extra for Python + RAPIDS); 1.x deployments without the sidecar stay closer to 600-800 MB.
 
 ---
 
@@ -27,9 +27,20 @@ Rough budget for a typical 2GB Jetson:
 | Linux base + L4T services | ~500 MB |
 | Docker daemon | ~80 MB |
 | Sentinel container (Node + SQLite + caches) | ~250-400 MB |
-| **Headroom for everything else** | **~1 GB** |
+| **\`meshview-gpu\` sidecar** (v2.0+: Python + FastAPI; +RAPIDS if installed) | **~400 MB** |
+| **Headroom for everything else** | **~600 MB** |
 
 That's tight but workable **for headless operation** — Jetson runs the server only; you browse from a laptop or phone over the LAN. It becomes a problem if you also run a desktop browser on the Jetson: Chromium will push into swap and eventually OOM-kill.
+
+### Don't need GPU workloads on a Nano?
+
+If you don't want the GPU sidecar running (the Nano's Maxwell GPU only meaningfully accelerates the smaller workloads — clustering, topology — and we run those on the CPU on Nano anyway), comment out the \`meshview-gpu\` service in \`docker-compose.yml\`. Sentinel detects the sidecar's absence at boot and transparently falls back to its TypeScript CPU implementations:
+
+\`\`\`
+[GpuClient] sidecar unreachable — using CPU fallback (dev mode)
+\`\`\`
+
+Reclaiming the ~400 MB the sidecar would have used is the easiest single win for headroom on a 2GB Nano.
 
 **Mitigations**:
 

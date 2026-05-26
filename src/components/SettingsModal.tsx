@@ -4543,7 +4543,10 @@ function RadioEditor({ row, onChanged }: { row: RadioRow; onChanged: () => void 
   const [longName, setLongName] = React.useState(row.long_name);
   const [networkLabel, setNetworkLabel] = React.useState(row.network_label ?? '');
   const [colorHex, setColorHex] = React.useState(row.color_hex ?? RADIO_COLOR_PALETTE[0]);
+  const [enabled, setEnabled] = React.useState(!!row.enabled);
   const [saving, setSaving] = React.useState(false);
+  const [testing, setTesting] = React.useState(false);
+  const [testMsg, setTestMsg] = React.useState<string | null>(null);
 
   // LoRa live state from the firmware
   const [live, setLive] = React.useState<LoRaConfigLive | null>(null);
@@ -4577,9 +4580,33 @@ function RadioEditor({ row, onChanged }: { row: RadioRow; onChanged: () => void 
       long_name: longName,
       network_label: networkLabel || null,
       color_hex: colorHex,
+      enabled,
     });
     setSaving(false);
     if (r.ok) onChanged();
+  };
+
+  const testConnection = async () => {
+    if (row.transport === 'ble') { setTestMsg('BLE not supported yet'); return; }
+    setTesting(true);
+    setTestMsg('Connecting…');
+    const r = await meshDataService.testRadioConnection({
+      transport: row.transport,
+      target: row.target,
+      timeout_ms: 5000,
+    });
+    setTesting(false);
+    if (r.ok) {
+      const id = r.identity;
+      const lora = r.lora;
+      const parts: string[] = ['✓ reached radio'];
+      if (id) parts.push(`${id.shortName} (${id.longName || id.nodeId})`);
+      if (lora) parts.push(`slot ${lora.frequencySlot}, ${lora.hopLimit} hops`);
+      setTestMsg(parts.join(' · '));
+    } else {
+      setTestMsg(`✗ ${(r as { ok: false; error: string }).error}`);
+    }
+    setTimeout(() => setTestMsg(null), 6000);
   };
 
   const refreshLora = async () => {
@@ -4658,8 +4685,19 @@ function RadioEditor({ row, onChanged }: { row: RadioRow; onChanged: () => void 
             ))}
           </div>
         </div>
+        <label className="sm:col-span-2 flex items-center gap-2 text-xs text-brand-ink select-none cursor-pointer">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={e => setEnabled(e.target.checked)}
+          />
+          <span>Enabled</span>
+          <span className="text-[10px] text-brand-muted normal-case font-normal">
+            — disabled radios stay in the registry but are skipped by Refresh and won't auto-connect
+          </span>
+        </label>
       </div>
-      <div>
+      <div className="flex items-center gap-2 flex-wrap">
         <button
           onClick={saveMeta}
           disabled={saving}
@@ -4667,6 +4705,15 @@ function RadioEditor({ row, onChanged }: { row: RadioRow; onChanged: () => void 
         >
           {saving ? 'Saving…' : 'Save Metadata'}
         </button>
+        <button
+          onClick={testConnection}
+          disabled={testing}
+          className="bg-brand-line hover:bg-brand-line/70 disabled:opacity-40 border border-brand-line text-brand-ink text-[10px] font-bold uppercase tracking-widest rounded px-3 py-1.5"
+          title="Open a temporary connection, read the radio's identity, then disconnect"
+        >
+          {testing ? <Loader2 size={11} className="animate-spin inline" /> : 'Test Connection'}
+        </button>
+        {testMsg && <span className="text-[11px] text-brand-muted">{testMsg}</span>}
       </div>
 
       {/* LoRa Config editor — only useful for the default radio in Phase 2 */}
@@ -4762,6 +4809,8 @@ function AddRadioForm({ existing, onCancel, onCreated }: {
   const [target, setTarget] = React.useState('');
   const [networkLabel, setNetworkLabel] = React.useState('');
   const [busy, setBusy] = React.useState(false);
+  const [detecting, setDetecting] = React.useState(false);
+  const [detectMsg, setDetectMsg] = React.useState<string | null>(null);
   const [err, setErr] = React.useState<string | null>(null);
 
   const submit = async () => {
@@ -4778,6 +4827,26 @@ function AddRadioForm({ existing, onCancel, onCreated }: {
     onCreated();
   };
 
+  const detectIdentity = async () => {
+    setDetectMsg(null); setErr(null);
+    if (!target.trim()) { setDetectMsg('Enter a target first.'); return; }
+    if (transport === 'ble') { setDetectMsg('BLE detection not implemented yet.'); return; }
+    setDetecting(true);
+    const r = await meshDataService.testRadioConnection({
+      transport: transport as 'serial' | 'tcp',
+      target: target.trim(),
+      timeout_ms: 5000,
+    });
+    setDetecting(false);
+    if (!r.ok) { setDetectMsg(`✗ ${(r as { ok: false; error: string }).error}`); return; }
+    if (!r.identity) { setDetectMsg('Connected but radio did not report identity in time.'); return; }
+    // Only overwrite empty fields so the operator doesn't lose typed values.
+    if (!radioId.trim()) setRadioId(r.identity.shortName);
+    if (!longName.trim()) setLongName(r.identity.longName || r.identity.shortName);
+    const loraStr = r.lora ? ` · slot ${r.lora.frequencySlot}, ${r.lora.hopLimit} hops` : '';
+    setDetectMsg(`✓ ${r.identity.shortName} (${r.identity.longName || r.identity.nodeId})${loraStr}`);
+  };
+
   const used = existing.map(r => r.radio_id);
   const collides = radioId.trim() && used.includes(radioId.trim());
 
@@ -4785,7 +4854,7 @@ function AddRadioForm({ existing, onCancel, onCreated }: {
     <div className="border border-brand-accent/30 rounded p-3 bg-brand-accent/5 space-y-3">
       <h5 className="text-[11px] font-bold uppercase tracking-widest text-brand-ink">Add Radio</h5>
       <p className="text-[11px] text-brand-muted">
-        Phase 2 stores the metadata only. In Phase 3, BridgeManager will open a second transport and connect to this radio in addition to the default.
+        Enter the transport + target, then click <b>Detect Identity</b> to auto-fill the radio's short name + long name from its firmware. You can also fill the fields by hand.
       </p>
       <div className="grid grid-cols-2 gap-3">
         <div>
@@ -4853,7 +4922,15 @@ function AddRadioForm({ existing, onCancel, onCreated }: {
           <AlertCircle size={12} /> {err}
         </div>
       )}
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-2 flex-wrap">
+        <button
+          onClick={detectIdentity}
+          disabled={detecting || !target.trim()}
+          className="bg-brand-line hover:bg-brand-line/70 disabled:opacity-40 border border-brand-line text-brand-ink text-[10px] font-bold uppercase tracking-widest rounded px-3 py-1.5"
+          title="Open a temporary connection and read the radio's short name + long name + LoRa config"
+        >
+          {detecting ? <Loader2 size={11} className="animate-spin inline" /> : 'Detect Identity'}
+        </button>
         <button
           onClick={submit}
           disabled={busy || !radioId.trim() || !longName.trim() || !target.trim() || !!collides}
@@ -4867,6 +4944,7 @@ function AddRadioForm({ existing, onCancel, onCreated }: {
         >
           Cancel
         </button>
+        {detectMsg && <span className="text-[11px] text-brand-muted">{detectMsg}</span>}
       </div>
     </div>
   );
