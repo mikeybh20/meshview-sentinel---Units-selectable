@@ -50,6 +50,12 @@ export class BbsService {
   private lastSendAt = new Map<string, number>();
   private bridge: MeshtasticSerialBridge;
   private config: BbsConfig = defaultBbsConfig();
+  /** v2.0 multi-radio: the receiving radio's 4-char short_name. Stamped onto
+   *  every mail row + weather-subscriber row so per-radio MailView and
+   *  WeatherAlertPoller route correctly. Null until BridgeManager calls
+   *  setRadioId — most commonly during the brief window between bridge boot
+   *  and identity reveal. */
+  private radioId: string | null = null;
   /** Per-sender weather-flow state: when set, the next message they send is
    *  treated as a ZIP code lookup. Lives in a separate map so it doesn't
    *  collide with the mail state machine. */
@@ -58,6 +64,15 @@ export class BbsService {
   constructor(bridge: MeshtasticSerialBridge) {
     this.bridge = bridge;
     setInterval(() => this.reapStaleSessions(), 15_000).unref?.();
+  }
+
+  /** v2.0: BridgeManager calls this after the bridge's identity is known. */
+  setRadioId(radioId: string): void {
+    this.radioId = radioId;
+  }
+
+  getRadioId(): string | null {
+    return this.radioId;
   }
 
   /** Replace the active config. Called by the API layer after a settings
@@ -190,7 +205,7 @@ export class BbsService {
   // ---- State entry points ----
 
   private async openMenu(fromId: string, channelIndex: number): Promise<boolean> {
-    const unread = meshDb.countUnread(fromId);
+    const unread = meshDb.countUnread(fromId, this.radioId);
     if (unread > 0) {
       await this.reply(
         fromId,
@@ -214,7 +229,7 @@ export class BbsService {
   }
 
   private async startRead(fromId: string, channelIndex: number): Promise<boolean> {
-    const next = meshDb.nextUnreadFor(fromId);
+    const next = meshDb.nextUnreadFor(fromId, this.radioId);
     if (!next) {
       this.sessions.delete(fromId);
       await this.reply(fromId, 'No unread mail.', channelIndex);
@@ -373,6 +388,7 @@ export class BbsService {
         recipient_node_id: recipientNodeId,
         posted_at: Date.now(),
         body: clean,
+        radio_id: this.radioId,
       });
     } catch (err: any) {
       console.error('[BBS] insertMail failed:', err.message);
@@ -444,7 +460,7 @@ export class BbsService {
     }
 
     // Anything else → treat as reply body (compose mail back to the sender).
-    const mail = meshDb.loadInbox(fromId, 200).find(m => m.id === session.currentMailId);
+    const mail = meshDb.loadInbox(fromId, 200, this.radioId).find(m => m.id === session.currentMailId);
     if (!mail) {
       this.sessions.delete(fromId);
       await this.reply(fromId, 'Mail vanished. Try :mail.', channelIndex);
@@ -478,7 +494,7 @@ export class BbsService {
   /** Subscribe a node to alerts on the operator's home ZIP. Idempotent —
    *  re-subscribing just updates the reply channel. */
   private async handleWeatherSubscribe(fromId: string, channelIndex: number): Promise<boolean> {
-    const isNew = meshDb.addWeatherSubscriber(fromId, channelIndex);
+    const isNew = meshDb.addWeatherSubscriber(fromId, channelIndex, this.radioId);
     const home = this.config.homeZipCode;
     if (!home) {
       await this.reply(

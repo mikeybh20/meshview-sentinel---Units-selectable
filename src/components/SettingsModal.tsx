@@ -1311,6 +1311,9 @@ interface WeatherSubscriber {
   subscribedAt: number;
   channelIndex: number;
   lastAlertAt: number | null;
+  /** v2.0 multi-radio: which radio received this subscription. NULL for
+   *  legacy 1.x rows that pre-date the multi-radio split. */
+  radioId: string | null;
 }
 
 /**

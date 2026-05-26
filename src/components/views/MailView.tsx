@@ -15,6 +15,7 @@ import { Mail, Send, Inbox as InboxIcon, Forward as OutboxIcon, Users, Trash2, C
 import { Node } from '../../types';
 import { cn } from '../../lib/utils';
 import { meshDataService } from '../../services/meshDataService';
+import { useRadios } from '../../hooks/useRadios';
 
 interface MailViewProps {
   nodes: Node[];
@@ -78,13 +79,17 @@ export function MailView({ nodes, localNodeId }: MailViewProps) {
   const [sendOk, setSendOk] = React.useState(false);
   const [nodeFilter, setNodeFilter] = React.useState('');
 
+  // v2.0 multi-radio: scope mail to the radio currently selected in the
+  // RadioBar. null = "All Radios" returns mail across every radio_id stamp.
+  const { selectedRadioId } = useRadios();
+
   const refresh = React.useCallback(async () => {
     if (!localNodeId) return;
     setLoading(true);
     try {
       const [i, o, u] = await Promise.all([
-        meshDataService.getBbsInbox(localNodeId),
-        meshDataService.getBbsOutbox(localNodeId),
+        meshDataService.getBbsInbox(localNodeId, selectedRadioId),
+        meshDataService.getBbsOutbox(localNodeId, selectedRadioId),
         meshDataService.getBbsUsers(),
       ]);
       if (i) setInbox(i.mail);
@@ -93,7 +98,7 @@ export function MailView({ nodes, localNodeId }: MailViewProps) {
     } finally {
       setLoading(false);
     }
-  }, [localNodeId]);
+  }, [localNodeId, selectedRadioId]);
 
   // Initial load + live updates via SSE
   React.useEffect(() => {
@@ -125,7 +130,8 @@ export function MailView({ nodes, localNodeId }: MailViewProps) {
     if (!body.trim()) { setSendError('Body is empty.'); return; }
     setSending(true);
     try {
-      const r = await meshDataService.composeBbsMail(recipientId, body);
+      // v2.0: route the compose through the selected radio if any.
+      const r = await meshDataService.composeBbsMail(recipientId, body, selectedRadioId);
       if (!r.ok) {
         setSendError(r.error || 'Send failed.');
         return;

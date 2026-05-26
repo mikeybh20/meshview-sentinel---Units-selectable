@@ -22,6 +22,8 @@ import { EventEmitter } from 'events';
 import { meshBridge, MeshtasticSerialBridge, type MeshNode, type MeshMessage, type MeshEvent } from './meshtasticSerial.js';
 import { meshDb, type RadioRow } from './database.js';
 import { RadioContext } from './radioContext.js';
+import { BbsService } from './bbs.js';
+import type { BbsConfig } from './bbsConfig.js';
 
 // Bridge events the API SSE layer cares about. BridgeManager re-broadcasts
 // these from every connected bridge so api.ts only has to subscribe once.
@@ -40,6 +42,9 @@ class BridgeManager extends EventEmitter {
   private defaultRegistered = false;
   /** Track per-bridge forwarder cleanup so disconnect tears them down. */
   private forwarders: Map<string, Array<() => void>> = new Map();
+  /** Shared BBS config applied to every BbsService instance. api.ts pushes
+   *  updates here whenever the operator saves new BBS settings. */
+  private bbsConfig: BbsConfig | null = null;
 
   constructor() {
     super();
@@ -90,6 +95,31 @@ class BridgeManager extends EventEmitter {
     if (!tears) return;
     for (const t of tears) t();
     this.forwarders.delete(label);
+  }
+
+  /** v2.0: create + wire a BbsService for the given context's bridge. The
+   *  service is stamped with the context's radio_id so every mail insert /
+   *  weather subscription routes to the right radio's row.
+   */
+  private attachBbs(ctx: RadioContext): void {
+    const svc = new BbsService(ctx.bridge);
+    svc.setRadioId(ctx.radioId);
+    if (this.bbsConfig) svc.setConfig(this.bbsConfig);
+    ctx.bridge.setBbs(svc);
+    ctx.bbs = svc;
+  }
+
+  /** api.ts calls this once on boot + on every BBS settings save. */
+  setBbsConfig(cfg: BbsConfig): void {
+    this.bbsConfig = cfg;
+    for (const ctx of this.contexts.values()) {
+      ctx.bbs?.setConfig(cfg);
+    }
+  }
+
+  /** Get the BBS service for a specific radio (null if not connected). */
+  getBbs(radioId: string): BbsService | null {
+    return this.contexts.get(radioId)?.bbs ?? null;
   }
 
   private applyLoraReadback(snap: { region: number; modemPreset: number; frequencySlot: number; hopLimit: number }): void {
@@ -200,6 +230,9 @@ class BridgeManager extends EventEmitter {
     // bridge as a "heard by" entry. Backfills existing nodes too.
     bridge.setRadioId(shortName);
 
+    // v2.0: spin up a per-radio BbsService and wire it to the bridge.
+    this.attachBbs(ctx);
+
     console.log(`[BridgeManager] default radio registered: ${shortName} (${row.long_name}) via ${row.transport}:${row.target}`);
 
     // Kick off a LoRa config readback so the radios row gets stamped with
@@ -258,6 +291,7 @@ class BridgeManager extends EventEmitter {
     const ctx = new RadioContext(radioId, row, bridge);
     this.contexts.set(radioId, ctx);
     this.attachForwarders(radioId, bridge);
+    this.attachBbs(ctx);
 
     // Wire LoRa-readback so the secondary's row gets stamped with its
     // firmware's authoritative state when it arrives.

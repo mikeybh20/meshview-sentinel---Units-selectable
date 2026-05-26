@@ -288,16 +288,25 @@ export class MeshDataService {
     return () => { this.bbsMailListeners = this.bbsMailListeners.filter(l => l !== cb); };
   }
 
-  async getBbsInbox(nodeId?: string): Promise<{
+  /**
+   * v2.0 multi-radio: optional `radioId` scopes the inbox to mail received
+   * on a specific radio. Omitting it returns mail across all radios.
+   */
+  async getBbsInbox(nodeId?: string, radioId?: string | null): Promise<{
     nodeId: string;
+    radioId: string | null;
     unread: number;
     mail: Array<{
       id: number; senderNodeId: string; senderShortName: string;
       postedAt: number; body: string; readAt: number | null; deliveredAt: number | null;
+      radioId: string | null;
     }>;
   } | null> {
     try {
-      const q = nodeId ? `?nodeId=${encodeURIComponent(nodeId)}` : '';
+      const qs = new URLSearchParams();
+      if (nodeId) qs.set('nodeId', nodeId);
+      if (radioId) qs.set('radio_id', radioId);
+      const q = qs.toString() ? `?${qs.toString()}` : '';
       const res = await fetch(`${API_BASE}/api/mesh/bbs/inbox${q}`);
       if (!res.ok) return null;
       return await res.json();
@@ -306,15 +315,20 @@ export class MeshDataService {
     }
   }
 
-  async getBbsOutbox(nodeId?: string): Promise<{
+  async getBbsOutbox(nodeId?: string, radioId?: string | null): Promise<{
     nodeId: string;
+    radioId: string | null;
     mail: Array<{
       id: number; recipientNodeId: string; senderShortName: string;
       postedAt: number; body: string; readAt: number | null;
+      radioId: string | null;
     }>;
   } | null> {
     try {
-      const q = nodeId ? `?nodeId=${encodeURIComponent(nodeId)}` : '';
+      const qs = new URLSearchParams();
+      if (nodeId) qs.set('nodeId', nodeId);
+      if (radioId) qs.set('radio_id', radioId);
+      const q = qs.toString() ? `?${qs.toString()}` : '';
       const res = await fetch(`${API_BASE}/api/mesh/bbs/outbox${q}`);
       if (!res.ok) return null;
       return await res.json();
@@ -323,19 +337,23 @@ export class MeshDataService {
     }
   }
 
-  async composeBbsMail(recipientNodeId: string, body: string): Promise<{ ok: boolean; mailId?: number; error?: string }> {
+  /**
+   * v2.0 multi-radio: optional `radioId` routes the compose through a specific
+   * radio's bridge. Omitting it uses the default radio.
+   */
+  async composeBbsMail(recipientNodeId: string, body: string, radioId?: string | null): Promise<{ ok: boolean; mailId?: number; radioId?: string | null; error?: string }> {
     try {
       const res = await fetch(`${API_BASE}/api/mesh/bbs/compose`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ recipientNodeId, body }),
+        body: JSON.stringify({ recipientNodeId, body, radio_id: radioId ?? undefined }),
       });
       if (!res.ok) {
         const b = await res.json().catch(() => ({}));
         return { ok: false, error: b.error || `HTTP ${res.status}` };
       }
       const b = await res.json();
-      return { ok: true, mailId: b.mailId };
+      return { ok: true, mailId: b.mailId, radioId: b.radioId ?? null };
     } catch (err: any) {
       return { ok: false, error: err?.message || 'request failed' };
     }

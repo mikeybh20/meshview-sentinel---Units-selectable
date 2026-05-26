@@ -9,7 +9,8 @@ import dotenv from 'dotenv';
 import { serialDiscovery } from './serialDiscovery.js';
 import { meshBridge } from './meshtasticSerial.js';
 import { meshDb } from './database.js';
-import { BbsService } from './bbs.js';
+// BbsService is no longer instantiated here in v2.0 — see [bridgeManager.ts](./bridgeManager.ts)
+// which owns one BbsService per RadioContext. api.ts just plumbs config + endpoints.
 import { loadBbsConfig, saveBbsConfig, normalizeBbsConfig, type BbsConfig } from './bbsConfig.js';
 import { WeatherAlertPoller } from './weatherAlertPoller.js';
 // v2.0 multi-radio. Importing for side effect: BridgeManager wires its
@@ -21,20 +22,19 @@ import { bridgeManager, testTransportConnection } from './bridgeManager.js';
 import { probeGpuOnBoot, health as gpuHealth, clusterDbscan, buildTopology, buildHeatmap, simplifyTrace } from './gpuClient.js';
 probeGpuOnBoot();
 
-// Wire BBS-Mail. The bridge type-imports BbsService so we attach it after
-// both are constructed to avoid a runtime import cycle.
-const bbs = new BbsService(meshBridge);
-meshBridge.setBbs(bbs);
-
-// Load persisted BBS config and apply it to the live service. Subsequent
-// updates via POST /api/mesh/bbs/config flow through the same path.
+// v2.0 multi-radio: BbsService is instantiated per RadioContext inside
+// BridgeManager.attachBbs() (default radio on auto-register, secondaries
+// on spawn). api.ts only owns the shared BBS config + the weather poller.
+//
+// Load persisted BBS config and hand it to BridgeManager — it fans out to
+// every BbsService now and on every subsequent save.
 let bbsConfig: BbsConfig = loadBbsConfig();
-bbs.setConfig(bbsConfig);
+bridgeManager.setBbsConfig(bbsConfig);
 
 // Weather alert poller — starts immediately. The first poll fires ~10s after
 // boot so the radio has time to settle; the ticker reads from bbsConfig each
 // cycle so it picks up zip / enabled changes without restarting.
-const weatherPoller = new WeatherAlertPoller(meshBridge, () => bbsConfig);
+const weatherPoller = new WeatherAlertPoller(bridgeManager, () => bbsConfig);
 weatherPoller.start();
 
 dotenv.config();
@@ -2021,7 +2021,8 @@ app.post('/api/mesh/bbs/config', (req, res) => {
     const oldZip = bbsConfig.homeZipCode;
     bbsConfig = normalizeBbsConfig(req.body ?? {});
     saveBbsConfig(bbsConfig);
-    bbs.setConfig(bbsConfig);
+    // v2.0: fan the config out to every per-radio BbsService.
+    bridgeManager.setBbsConfig(bbsConfig);
     // If the home ZIP changed (or just got set), trigger a poll right away
     // so the operator sees alerts within seconds instead of waiting 20 min.
     if (bbsConfig.homeZipCode && bbsConfig.homeZipCode !== oldZip) {
@@ -2040,33 +2041,38 @@ app.post('/api/mesh/bbs/config', (req, res) => {
   }
 });
 
-/** GET /api/mesh/bbs/inbox?nodeId=<hex>  — defaults to local node */
+/** GET /api/mesh/bbs/inbox?nodeId=<hex>&radio_id=<short>  — defaults to local node + all radios */
 app.get('/api/mesh/bbs/inbox', (req, res) => {
   const localNodeId = (meshBridge as any).localNodeId as string | null;
   const nodeId = (req.query.nodeId as string) || localNodeId;
   if (!nodeId) return res.status(400).json({ error: 'nodeId required (local node unknown)' });
   const limit = parseInt(String(req.query.limit ?? '200'), 10) || 200;
+  // v2.0: optional radio_id filter scopes the inbox to one radio's mail.
+  const radioId = typeof req.query.radio_id === 'string' && req.query.radio_id ? req.query.radio_id : null;
   try {
     return res.json({
       nodeId,
-      unread: meshDb().countUnread(nodeId),
-      mail: meshDb().loadInbox(nodeId, Math.min(500, Math.max(1, limit))),
+      radioId,
+      unread: meshDb().countUnread(nodeId, radioId),
+      mail: meshDb().loadInbox(nodeId, Math.min(500, Math.max(1, limit)), radioId),
     });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
   }
 });
 
-/** GET /api/mesh/bbs/outbox?nodeId=<hex>  — defaults to local node */
+/** GET /api/mesh/bbs/outbox?nodeId=<hex>&radio_id=<short>  — defaults to local node + all radios */
 app.get('/api/mesh/bbs/outbox', (req, res) => {
   const localNodeId = (meshBridge as any).localNodeId as string | null;
   const nodeId = (req.query.nodeId as string) || localNodeId;
   if (!nodeId) return res.status(400).json({ error: 'nodeId required (local node unknown)' });
   const limit = parseInt(String(req.query.limit ?? '200'), 10) || 200;
+  const radioId = typeof req.query.radio_id === 'string' && req.query.radio_id ? req.query.radio_id : null;
   try {
     return res.json({
       nodeId,
-      mail: meshDb().loadOutbox(nodeId, Math.min(500, Math.max(1, limit))),
+      radioId,
+      mail: meshDb().loadOutbox(nodeId, Math.min(500, Math.max(1, limit)), radioId),
     });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
@@ -2082,11 +2088,7 @@ app.get('/api/mesh/bbs/outbox', (req, res) => {
  * Push notification fires the same as a remote-sourced send.
  */
 app.post('/api/mesh/bbs/compose', async (req, res) => {
-  const localNodeId = (meshBridge as any).localNodeId as string | null;
-  if (!localNodeId) return res.status(503).json({ error: 'Local node not identified — radio still booting' });
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
-
-  const { recipientNodeId, body } = req.body ?? {};
+  const { recipientNodeId, body, radio_id: radioIdRaw } = req.body ?? {};
   if (typeof recipientNodeId !== 'string' || !/^![0-9a-f]{8}$/i.test(recipientNodeId)) {
     return res.status(400).json({ error: 'recipientNodeId must be a hex node id like !02eb3bec' });
   }
@@ -2094,9 +2096,21 @@ app.post('/api/mesh/bbs/compose', async (req, res) => {
   const clean = body.trim().slice(0, 200);
   if (!clean) return res.status(400).json({ error: 'body must be non-empty' });
 
-  const localNode = meshBridge.getNodes().find(n => n.id === localNodeId);
-  const recipientNode = meshBridge.getNodes().find(n => n.id === recipientNodeId.toLowerCase());
-  if (!recipientNode) return res.status(404).json({ error: `Unknown recipient ${recipientNodeId}` });
+  // v2.0: optional radio_id routes the compose through a specific radio's
+  // bridge. Omit to use the default radio (1.x behavior).
+  const radioId = typeof radioIdRaw === 'string' && radioIdRaw ? radioIdRaw : null;
+  const ctx = radioId ? bridgeManager.get(radioId) : null;
+  const bridge = ctx?.bridge ?? meshBridge;
+  if (radioId && !ctx) {
+    return res.status(404).json({ error: `radio "${radioId}" is not currently connected` });
+  }
+  const localNodeId = (bridge as any).localNodeId as string | null;
+  if (!localNodeId) return res.status(503).json({ error: 'Local node not identified — radio still booting' });
+  if (!bridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+
+  const localNode = bridge.getNodes().find(n => n.id === localNodeId);
+  const recipientNode = bridge.getNodes().find(n => n.id === recipientNodeId.toLowerCase());
+  if (!recipientNode) return res.status(404).json({ error: `Unknown recipient ${recipientNodeId} on radio ${bridge.getRadioId() ?? '<default>'}` });
 
   try {
     const mailId = meshDb().insertMail({
@@ -2105,16 +2119,17 @@ app.post('/api/mesh/bbs/compose', async (req, res) => {
       recipient_node_id: recipientNodeId.toLowerCase(),
       posted_at: Date.now(),
       body: clean,
+      radio_id: bridge.getRadioId(),
     });
-    meshBridge.emit('bbsMail', { recipientNodeId: recipientNodeId.toLowerCase(), mailId, source: 'dashboard' });
+    bridge.emit('bbsMail', { recipientNodeId: recipientNodeId.toLowerCase(), mailId, source: 'dashboard' });
     // Push notify the recipient via DM. Fire-and-forget; the mail is stored
     // regardless of notification success.
     const sender = localNode?.shortName || localNodeId.slice(-4);
     const notice = `✉ Mail from ${sender}. DM :mail R to read.`;
-    meshBridge.sendMessage(notice, recipientNodeId.toLowerCase(), 0)
+    bridge.sendMessage(notice, recipientNodeId.toLowerCase(), 0)
       .then(() => meshDb().markMailDelivered(mailId))
       .catch(err => console.warn(`[BBS API] push notify failed: ${err?.message}`));
-    return res.json({ ok: true, mailId });
+    return res.json({ ok: true, mailId, radioId: bridge.getRadioId() });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
   }
@@ -2166,12 +2181,14 @@ app.get('/api/mesh/bbs/users', (_req, res) => {
   }
 });
 
-/** GET /api/mesh/bbs/weather/subscribers — list of nodes opted into alerts. */
-app.get('/api/mesh/bbs/weather/subscribers', (_req, res) => {
+/** GET /api/mesh/bbs/weather/subscribers?radio_id=<short>  — list of nodes opted into alerts. */
+app.get('/api/mesh/bbs/weather/subscribers', (req, res) => {
+  const radioId = typeof req.query.radio_id === 'string' && req.query.radio_id ? req.query.radio_id : null;
   try {
     return res.json({
-      subscribers: meshDb().listWeatherSubscribers(),
-      total: meshDb().countWeatherSubscribers(),
+      subscribers: meshDb().listWeatherSubscribers(radioId),
+      total: meshDb().countWeatherSubscribers(radioId),
+      radioId,
     });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });

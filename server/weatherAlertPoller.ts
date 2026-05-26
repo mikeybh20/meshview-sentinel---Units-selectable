@@ -16,9 +16,17 @@
  */
 
 import { weatherService, type NwsAlert } from './weather.js';
-import type { MeshtasticSerialBridge } from './meshtasticSerial.js';
 import type { BbsConfig } from './bbsConfig.js';
 import { meshDb as meshDbFactory } from './database.js';
+
+// Forward-declared type to avoid a runtime circular import with BridgeManager.
+// We only use it nominally — the methods we touch are listed inline below.
+interface BridgeManagerLike {
+  getDefault(): { bridge: any } | null;
+  get(radioId: string): { bridge: any } | null;
+  list(): Array<{ radioId: string; bridge: any }>;
+  getDefaultRadioId(): string | null;
+}
 
 const meshDb = meshDbFactory();
 
@@ -30,7 +38,7 @@ const POLL_INTERVAL_MS = parseInt(process.env.MESHVIEW_WEATHER_POLL_MS || '', 10
 const FIRST_POLL_DELAY_MS = 10_000; // wait for radio to settle before first poll
 
 export class WeatherAlertPoller {
-  private bridge: MeshtasticSerialBridge;
+  private bm: BridgeManagerLike;
   private getConfig: () => BbsConfig;
   /** Alert IDs we've already surfaced this run. Cleared when an alert is no
    *  longer in NWS's active list (so a repeat after expiry shows again). */
@@ -38,8 +46,8 @@ export class WeatherAlertPoller {
   private timer: ReturnType<typeof setInterval> | null = null;
   private firstRun = true;
 
-  constructor(bridge: MeshtasticSerialBridge, getConfig: () => BbsConfig) {
-    this.bridge = bridge;
+  constructor(bm: BridgeManagerLike, getConfig: () => BbsConfig) {
+    this.bm = bm;
     this.getConfig = getConfig;
   }
 
@@ -106,15 +114,21 @@ export class WeatherAlertPoller {
 
       newCount++;
       const compact = weatherService.formatAlertCompact(alert, locationLabel);
-      this.bridge.recordEvent({
-        // Prefix with `wx-` so the alert id doesn't collide with the normal
-        // randomId() format used for radio events.
-        id: `wx-${alert.id}`,
-        type: 'WEATHER_ALERT',
-        nodeId: 'local',
-        timestamp: Date.now(),
-        details: compact,
-      });
+      // v2.0 multi-radio: surface the WEATHER_ALERT event on every connected
+      // bridge so each radio's event log records it locally. Falls back to
+      // logging just the default bridge if BridgeManager hasn't registered
+      // any context yet (very early boot).
+      for (const ctx of this.bm.list()) {
+        ctx.bridge.recordEvent({
+          // Prefix with `wx-` so the alert id doesn't collide with the normal
+          // randomId() format used for radio events.
+          id: `wx-${alert.id}-${ctx.radioId}`,
+          type: 'WEATHER_ALERT',
+          nodeId: 'local',
+          timestamp: Date.now(),
+          details: compact,
+        });
+      }
       console.log(`[WeatherPoller] NEW alert: ${compact}`);
 
       // Fan out to subscribers. DM goes out over the radio (best-effort — may
@@ -144,48 +158,66 @@ export class WeatherAlertPoller {
    * global TX queue limit when many are subscribed.
    */
   private async deliverToSubscribers(compact: string): Promise<void> {
+    // v2.0 multi-radio: each subscriber row knows which radio they
+    // subscribed via. Route the DM back through that radio's bridge so
+    // multi-mesh operators reach the right peers. Subscribers with a NULL
+    // radio_id (1.x legacy rows) fall back to the default radio.
     const subscribers = meshDb.listWeatherSubscribers();
     if (subscribers.length === 0) return;
 
-    const localNodeId = (this.bridge as any).localNodeId as string | null;
-    if (!localNodeId) {
-      console.warn('[WeatherPoller] Skipping subscriber fanout — local node not yet identified');
+    const defaultBridge = this.bm.getDefault()?.bridge ?? null;
+    if (!defaultBridge && !this.bm.list().length) {
+      console.warn('[WeatherPoller] Skipping subscriber fanout — no bridge connected');
       return;
     }
 
     console.log(`[WeatherPoller] Fanning out alert to ${subscribers.length} subscriber(s)`);
     let delivered = 0;
+    let skipped = 0;
     for (const sub of subscribers) {
+      const ctx = sub.radioId ? this.bm.get(sub.radioId) : this.bm.getDefault();
+      if (!ctx?.bridge) {
+        skipped++;
+        console.warn(`[WeatherPoller] subscriber ${sub.nodeId} routed via radio "${sub.radioId ?? '<default>'}" but that bridge isn't connected — skipping DM, mail row still persisted`);
+      }
+      const bridge = ctx?.bridge ?? null;
+      const localNodeId = bridge ? (bridge as any).localNodeId as string | null : null;
+
       // Persist mail row first — even if the DM fails, the subscriber can pull
       // the alert via :mail R later.
       let mailId: number | undefined;
       try {
-        mailId = meshDb.insertMail({
-          sender_node_id: localNodeId,
-          sender_short_name: ALERT_SENDER_SHORT,
-          recipient_node_id: sub.nodeId,
-          posted_at: Date.now(),
-          body: compact,
-        });
-        this.bridge.emit('bbsMail', { recipientNodeId: sub.nodeId, mailId, source: 'weather' });
+        if (localNodeId) {
+          mailId = meshDb.insertMail({
+            sender_node_id: localNodeId,
+            sender_short_name: ALERT_SENDER_SHORT,
+            recipient_node_id: sub.nodeId,
+            posted_at: Date.now(),
+            body: compact,
+            radio_id: sub.radioId ?? this.bm.getDefaultRadioId(),
+          });
+          bridge?.emit('bbsMail', { recipientNodeId: sub.nodeId, mailId, source: 'weather' });
+        }
       } catch (err: any) {
         console.warn(`[WeatherPoller] insertMail failed for ${sub.nodeId}: ${err?.message}`);
       }
 
+      if (!bridge) continue;
+
       // Best-effort DM. sendMessage handles auto-retry on rate limit + transient
       // routing errors internally.
       try {
-        await this.bridge.sendMessage(compact, sub.nodeId, sub.channelIndex);
+        await bridge.sendMessage(compact, sub.nodeId, sub.channelIndex);
         meshDb.touchWeatherSubscriberAlert(sub.nodeId);
         if (mailId !== undefined) meshDb.markMailDelivered(mailId);
         delivered++;
       } catch (err: any) {
-        console.warn(`[WeatherPoller] DM to ${sub.nodeId} failed: ${err?.message}`);
+        console.warn(`[WeatherPoller] DM to ${sub.nodeId} via radio ${sub.radioId ?? '<default>'} failed: ${err?.message}`);
       }
 
       // Small inter-subscriber pause so we don't slam the firmware queue.
       await new Promise(r => setTimeout(r, 500));
     }
-    console.log(`[WeatherPoller] Subscriber fanout complete: ${delivered}/${subscribers.length} DM delivered`);
+    console.log(`[WeatherPoller] Subscriber fanout complete: ${delivered}/${subscribers.length} DM delivered (${skipped} skipped — radio disconnected)`);
   }
 }

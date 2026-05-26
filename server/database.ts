@@ -1363,36 +1363,59 @@ export class MeshDatabase {
 
   /** Insert a new piece of mail. Caller is responsible for trimming/validating
    *  body length. Returns the rowid so the caller can echo it back. */
+  /**
+   * Insert a BBS mail row. v2.0 multi-radio: when `radio_id` is supplied the
+   * row is stamped with the receiving radio so loadInbox/loadOutbox can
+   * scope per radio. Omitting it keeps 1.x behavior (radio_id stays NULL =
+   * "any radio").
+   */
   insertMail(row: {
     sender_node_id: string;
     sender_short_name: string;
     recipient_node_id: string;
     posted_at: number;
     body: string;
+    radio_id?: string | null;
   }): number {
     const result = this.db.prepare(`
-      INSERT INTO bbs_mail (sender_node_id, sender_short_name, recipient_node_id, posted_at, body)
-      VALUES (@sender_node_id, @sender_short_name, @recipient_node_id, @posted_at, @body)
-    `).run(row);
+      INSERT INTO bbs_mail (sender_node_id, sender_short_name, recipient_node_id, posted_at, body, radio_id)
+      VALUES (@sender_node_id, @sender_short_name, @recipient_node_id, @posted_at, @body, @radio_id)
+    `).run({
+      sender_node_id: row.sender_node_id,
+      sender_short_name: row.sender_short_name,
+      recipient_node_id: row.recipient_node_id,
+      posted_at: row.posted_at,
+      body: row.body,
+      radio_id: row.radio_id ?? null,
+    });
     return Number(result.lastInsertRowid);
   }
 
-  /** Load mail rows for a specific recipient, newest first. */
-  loadInbox(recipientNodeId: string, limit = 200): Array<{
+  /**
+   * Load mail rows for a specific recipient, newest first. v2.0 multi-radio:
+   * pass `radioId` to scope to mail received on a specific radio (matches
+   * either rows stamped with that radio_id OR legacy NULL rows, so 1.x data
+   * remains visible).
+   */
+  loadInbox(recipientNodeId: string, limit = 200, radioId?: string | null): Array<{
     id: number; senderNodeId: string; senderShortName: string;
     postedAt: number; body: string; readAt: number | null;
-    deliveredAt: number | null;
+    deliveredAt: number | null; radioId: string | null;
   }> {
-    const rows = this.db.prepare(`
-      SELECT id, sender_node_id, sender_short_name, posted_at, body, read_at, delivered_at
-      FROM bbs_mail
-      WHERE recipient_node_id = ?
-      ORDER BY posted_at DESC
-      LIMIT ?
-    `).all(recipientNodeId, limit) as Array<{
+    const sql = radioId
+      ? `SELECT id, sender_node_id, sender_short_name, posted_at, body, read_at, delivered_at, radio_id
+         FROM bbs_mail
+         WHERE recipient_node_id = ? AND (radio_id = ? OR radio_id IS NULL)
+         ORDER BY posted_at DESC LIMIT ?`
+      : `SELECT id, sender_node_id, sender_short_name, posted_at, body, read_at, delivered_at, radio_id
+         FROM bbs_mail
+         WHERE recipient_node_id = ?
+         ORDER BY posted_at DESC LIMIT ?`;
+    const params = radioId ? [recipientNodeId, radioId, limit] : [recipientNodeId, limit];
+    const rows = this.db.prepare(sql).all(...params) as Array<{
       id: number; sender_node_id: string; sender_short_name: string;
       posted_at: number; body: string; read_at: number | null;
-      delivered_at: number | null;
+      delivered_at: number | null; radio_id: string | null;
     }>;
     return rows.map(r => ({
       id: r.id,
@@ -1402,23 +1425,30 @@ export class MeshDatabase {
       body: r.body,
       readAt: r.read_at,
       deliveredAt: r.delivered_at,
+      radioId: r.radio_id,
     }));
   }
 
   /** Load mail rows sent by a specific node, newest first. */
-  loadOutbox(senderNodeId: string, limit = 200): Array<{
+  loadOutbox(senderNodeId: string, limit = 200, radioId?: string | null): Array<{
     id: number; recipientNodeId: string; senderShortName: string;
     postedAt: number; body: string; readAt: number | null;
+    radioId: string | null;
   }> {
-    const rows = this.db.prepare(`
-      SELECT id, recipient_node_id, sender_short_name, posted_at, body, read_at
-      FROM bbs_mail
-      WHERE sender_node_id = ?
-      ORDER BY posted_at DESC
-      LIMIT ?
-    `).all(senderNodeId, limit) as Array<{
+    const sql = radioId
+      ? `SELECT id, recipient_node_id, sender_short_name, posted_at, body, read_at, radio_id
+         FROM bbs_mail
+         WHERE sender_node_id = ? AND (radio_id = ? OR radio_id IS NULL)
+         ORDER BY posted_at DESC LIMIT ?`
+      : `SELECT id, recipient_node_id, sender_short_name, posted_at, body, read_at, radio_id
+         FROM bbs_mail
+         WHERE sender_node_id = ?
+         ORDER BY posted_at DESC LIMIT ?`;
+    const params = radioId ? [senderNodeId, radioId, limit] : [senderNodeId, limit];
+    const rows = this.db.prepare(sql).all(...params) as Array<{
       id: number; recipient_node_id: string; sender_short_name: string;
       posted_at: number; body: string; read_at: number | null;
+      radio_id: string | null;
     }>;
     return rows.map(r => ({
       id: r.id,
@@ -1427,29 +1457,36 @@ export class MeshDatabase {
       postedAt: r.posted_at,
       body: r.body,
       readAt: r.read_at,
+      radioId: r.radio_id,
     }));
   }
 
-  /** Count of unread messages for a recipient. */
-  countUnread(recipientNodeId: string): number {
-    const row = this.db.prepare(
-      `SELECT COUNT(*) AS c FROM bbs_mail WHERE recipient_node_id = ? AND read_at IS NULL`
-    ).get(recipientNodeId) as { c: number } | undefined;
+  /** Count of unread messages for a recipient. Optional radio_id scope. */
+  countUnread(recipientNodeId: string, radioId?: string | null): number {
+    const sql = radioId
+      ? `SELECT COUNT(*) AS c FROM bbs_mail
+         WHERE recipient_node_id = ? AND read_at IS NULL AND (radio_id = ? OR radio_id IS NULL)`
+      : `SELECT COUNT(*) AS c FROM bbs_mail
+         WHERE recipient_node_id = ? AND read_at IS NULL`;
+    const row = this.db.prepare(sql).get(...(radioId ? [recipientNodeId, radioId] : [recipientNodeId])) as { c: number } | undefined;
     return row?.c ?? 0;
   }
 
   /** Fetch a single unread mail item by recipient, oldest first (for sequential reading). */
-  nextUnreadFor(recipientNodeId: string): {
+  nextUnreadFor(recipientNodeId: string, radioId?: string | null): {
     id: number; senderNodeId: string; senderShortName: string;
     postedAt: number; body: string;
   } | null {
-    const row = this.db.prepare(`
-      SELECT id, sender_node_id, sender_short_name, posted_at, body
-      FROM bbs_mail
-      WHERE recipient_node_id = ? AND read_at IS NULL
-      ORDER BY posted_at ASC
-      LIMIT 1
-    `).get(recipientNodeId) as {
+    const sql = radioId
+      ? `SELECT id, sender_node_id, sender_short_name, posted_at, body
+         FROM bbs_mail
+         WHERE recipient_node_id = ? AND read_at IS NULL AND (radio_id = ? OR radio_id IS NULL)
+         ORDER BY posted_at ASC LIMIT 1`
+      : `SELECT id, sender_node_id, sender_short_name, posted_at, body
+         FROM bbs_mail
+         WHERE recipient_node_id = ? AND read_at IS NULL
+         ORDER BY posted_at ASC LIMIT 1`;
+    const row = this.db.prepare(sql).get(...(radioId ? [recipientNodeId, radioId] : [recipientNodeId])) as {
       id: number; sender_node_id: string; sender_short_name: string;
       posted_at: number; body: string;
     } | undefined;
@@ -1489,19 +1526,24 @@ export class MeshDatabase {
   // BBS Weather Subscribers
   // ---------------------------------------------------------------------
 
-  /** Add or refresh a subscription. If the node already subscribed, we update
-   *  the channel_index in case they're subscribing from a different channel
-   *  than before. Returns true if this is a NEW subscription, false if
-   *  refreshing an existing one. */
-  addWeatherSubscriber(nodeId: string, channelIndex: number, now: number = Date.now()): boolean {
+  /**
+   * Add or refresh a subscription. If the node already subscribed, we update
+   * the channel_index in case they're subscribing from a different channel
+   * than before. v2.0: also stamps the receiving radio so alerts route back
+   * through the same bridge the node first contacted us on. Returns true if
+   * this is a NEW subscription, false if refreshing an existing one.
+   */
+  addWeatherSubscriber(nodeId: string, channelIndex: number, radioId?: string | null, now: number = Date.now()): boolean {
     const existing = this.db.prepare(
       `SELECT 1 FROM bbs_weather_subscribers WHERE node_id = ?`
     ).get(nodeId);
     this.db.prepare(`
-      INSERT INTO bbs_weather_subscribers (node_id, subscribed_at, channel_index)
-      VALUES (?, ?, ?)
-      ON CONFLICT(node_id) DO UPDATE SET channel_index = excluded.channel_index
-    `).run(nodeId, now, channelIndex);
+      INSERT INTO bbs_weather_subscribers (node_id, subscribed_at, channel_index, radio_id)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(node_id) DO UPDATE SET
+        channel_index = excluded.channel_index,
+        radio_id      = excluded.radio_id
+    `).run(nodeId, now, channelIndex, radioId ?? null);
     return !existing;
   }
 
@@ -1519,24 +1561,41 @@ export class MeshDatabase {
     return !!row;
   }
 
-  listWeatherSubscribers(): Array<{ nodeId: string; subscribedAt: number; channelIndex: number; lastAlertAt: number | null }> {
-    const rows = this.db.prepare(`
-      SELECT node_id, subscribed_at, channel_index, last_alert_at
-      FROM bbs_weather_subscribers
-      ORDER BY subscribed_at DESC
-    `).all() as Array<{ node_id: string; subscribed_at: number; channel_index: number; last_alert_at: number | null }>;
+  /**
+   * v2.0 multi-radio: when `radioId` is supplied, returns only subscribers
+   * routed through that radio (so per-radio BBS UIs show only their own
+   * audience). Omit to list every subscriber across all radios.
+   */
+  listWeatherSubscribers(radioId?: string | null): Array<{
+    nodeId: string; subscribedAt: number; channelIndex: number;
+    lastAlertAt: number | null; radioId: string | null;
+  }> {
+    const sql = radioId
+      ? `SELECT node_id, subscribed_at, channel_index, last_alert_at, radio_id
+         FROM bbs_weather_subscribers
+         WHERE radio_id = ? OR radio_id IS NULL
+         ORDER BY subscribed_at DESC`
+      : `SELECT node_id, subscribed_at, channel_index, last_alert_at, radio_id
+         FROM bbs_weather_subscribers
+         ORDER BY subscribed_at DESC`;
+    const rows = this.db.prepare(sql).all(...(radioId ? [radioId] : [])) as Array<{
+      node_id: string; subscribed_at: number; channel_index: number;
+      last_alert_at: number | null; radio_id: string | null;
+    }>;
     return rows.map(r => ({
       nodeId: r.node_id,
       subscribedAt: r.subscribed_at,
       channelIndex: r.channel_index,
       lastAlertAt: r.last_alert_at,
+      radioId: r.radio_id,
     }));
   }
 
-  countWeatherSubscribers(): number {
-    const row = this.db.prepare(
-      `SELECT COUNT(*) AS c FROM bbs_weather_subscribers`
-    ).get() as { c: number } | undefined;
+  countWeatherSubscribers(radioId?: string | null): number {
+    const sql = radioId
+      ? `SELECT COUNT(*) AS c FROM bbs_weather_subscribers WHERE radio_id = ? OR radio_id IS NULL`
+      : `SELECT COUNT(*) AS c FROM bbs_weather_subscribers`;
+    const row = this.db.prepare(sql).get(...(radioId ? [radioId] : [])) as { c: number } | undefined;
     return row?.c ?? 0;
   }
 

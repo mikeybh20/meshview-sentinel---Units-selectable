@@ -405,7 +405,7 @@ export default function App() {
     }
     let cancelled = false;
     const fetchUnread = async () => {
-      const r = await meshDataService.getBbsInbox(localNodeId);
+      const r = await meshDataService.getBbsInbox(localNodeId, selectedRadioId);
       if (!cancelled && r) setBbsUnread(r.unread);
     };
     fetchUnread();

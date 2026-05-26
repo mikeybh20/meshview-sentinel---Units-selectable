@@ -20,6 +20,7 @@
  */
 import type { MeshtasticSerialBridge } from './meshtasticSerial.js';
 import type { RadioRow } from './database.js';
+import type { BbsService } from './bbs.js';
 
 export const MAX_BUFFERED_MESSAGES_PER_RADIO = 500;
 export const MAX_PENDING_ACKS_PER_RADIO      = 200;
@@ -28,6 +29,10 @@ export class RadioContext {
   readonly radioId: string;
   meta: RadioRow;
   bridge: MeshtasticSerialBridge;
+  /** v2.0: per-radio BBS service. Each context owns its own so mail and
+   *  weather subscribers route correctly when the operator runs multiple
+   *  radios at once. */
+  bbs?: BbsService;
 
   constructor(radioId: string, meta: RadioRow, bridge: MeshtasticSerialBridge) {
     this.radioId = radioId;
