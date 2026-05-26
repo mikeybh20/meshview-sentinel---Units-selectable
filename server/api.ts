@@ -4,6 +4,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import os from 'os';
 import dotenv from 'dotenv';
 import { serialDiscovery } from './serialDiscovery.js';
 import { meshBridge } from './meshtasticSerial.js';
@@ -17,7 +18,7 @@ import { WeatherAlertPoller } from './weatherAlertPoller.js';
 import { bridgeManager, testTransportConnection } from './bridgeManager.js';
 // v2.0 GPU sidecar boot probe. Logs sidecar reachability + detected GPU
 // at startup so the operator immediately knows their acceleration tier.
-import { probeGpuOnBoot, health as gpuHealth, clusterDbscan, buildTopology } from './gpuClient.js';
+import { probeGpuOnBoot, health as gpuHealth, clusterDbscan, buildTopology, buildHeatmap, simplifyTrace } from './gpuClient.js';
 probeGpuOnBoot();
 
 // Wire BBS-Mail. The bridge type-imports BbsService so we attach it after
@@ -600,6 +601,111 @@ app.put('/api/mesh/radios/:radioId/lora', async (req, res) => {
 app.get('/api/gpu/health', async (_req, res) => {
   const h = await gpuHealth();
   return res.json(h);
+});
+
+// --- v2.0 Phase 5: host system info ---
+// Powers the boot-time RAM advisory in Settings → Radios. Reports total RAM,
+// free RAM, CPU count, and detected platform hints (Jetson via device-tree)
+// so the client can show a "tight memory" banner when adding/connecting
+// secondary radios would push past comfortable headroom.
+app.get('/api/system/info', (_req, res) => {
+  let isJetson = false;
+  try {
+    if (existsSync('/proc/device-tree/compatible')) {
+      const compat = readFileSync('/proc/device-tree/compatible', 'utf-8');
+      isJetson = /tegra|jetson/i.test(compat);
+    }
+  } catch { /* not a Linux host or no perms — fine */ }
+  const totalBytes = os.totalmem();
+  const freeBytes = os.freemem();
+  return res.json({
+    platform:  process.platform,
+    arch:      process.arch,
+    cpuCount:  os.cpus().length,
+    memTotal:  totalBytes,
+    memFree:   freeBytes,
+    memTotalGB: +(totalBytes / 1024 / 1024 / 1024).toFixed(2),
+    memFreeGB:  +(freeBytes  / 1024 / 1024 / 1024).toFixed(2),
+    isJetson,
+    uptimeSecs: Math.floor(os.uptime()),
+    nodeVersion: process.version,
+  });
+});
+
+// --- v2.0 Phase 5 GPU position trace simplification passthrough. ---
+// Takes a node_id, pulls its position_history from the DB, runs RDP at the
+// requested tolerance, returns the kept indexes + simplified series. Used by
+// the Node Detail panel's Position Log → "Show simplified trace" affordance.
+app.post('/api/gpu/trace-simplify', async (req, res) => {
+  const body = req.body ?? {};
+  const nodeId = typeof body.node_id === 'string' ? body.node_id : null;
+  if (!nodeId && !Array.isArray(body.points)) {
+    return res.status(400).json({ error: 'either node_id or points[] is required' });
+  }
+  const tolerance = typeof body.simplify_tolerance_m === 'number' ? body.simplify_tolerance_m : 5;
+
+  // Resolve points: explicit array wins; otherwise pull from DB.
+  let points: Array<{ node_id: string; timestamp: number; lat: number; lng: number }>;
+  if (Array.isArray(body.points)) {
+    points = body.points;
+  } else {
+    const rows = meshDb().loadPositionHistory(nodeId!, typeof body.limit === 'number' ? body.limit : 1000);
+    // DB returns newest-first; flip so RDP sees chronological order.
+    rows.reverse();
+    points = rows.map(r => ({ node_id: nodeId!, timestamp: r.timestamp, lat: r.lat, lng: r.lng }));
+  }
+
+  try {
+    const result = await simplifyTrace({ points, simplify_tolerance_m: tolerance });
+    // Echo back the kept points so the client doesn't have to re-fetch.
+    const kept = result.keep.map(i => points[i]);
+    return res.json({ ...result, points: kept });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'trace simplify failed' });
+  }
+});
+
+// --- v2.0 Phase 5 GPU signal coverage heatmap passthrough. ---
+// The Map widget's "Coverage" toggle calls this with the current map bbox +
+// all positioned nodes (using their last RSSI as the sample value). Result
+// is rasterized into a colored overlay. Falls back to a pure-TS IDW when
+// the sidecar is unreachable.
+app.post('/api/gpu/heatmap', async (req, res) => {
+  const body = req.body ?? {};
+  if (!Array.isArray(body.bbox) || body.bbox.length !== 4) {
+    return res.status(400).json({ error: 'bbox must be [south, west, north, east]' });
+  }
+  let observations: Array<{ lat: number; lng: number; rssi: number; snr?: number | null }> = [];
+  if (Array.isArray(body.observations)) {
+    observations = body.observations;
+  } else {
+    // Auto-derive from positioned nodes' last RSSI.
+    const ctxs = bridgeManager.list();
+    const nodes = ctxs.length === 0 ? meshBridge.getNodes() : bridgeManager.getAllNodes();
+    for (const n of nodes) {
+      if (!n.position || n.telemetry?.rssi == null) continue;
+      observations.push({
+        lat: n.position.lat,
+        lng: n.position.lng,
+        rssi: n.telemetry.rssi,
+        snr:  n.telemetry.snr ?? null,
+      });
+    }
+  }
+  try {
+    const result = await buildHeatmap({
+      observations,
+      bbox: body.bbox as [number, number, number, number],
+      grid_width:  typeof body.grid_width  === 'number' ? body.grid_width  : 64,
+      grid_height: typeof body.grid_height === 'number' ? body.grid_height : 64,
+      method: 'idw',
+      power: typeof body.power === 'number' ? body.power : 2,
+      max_radius_m: typeof body.max_radius_m === 'number' ? body.max_radius_m : 5000,
+    });
+    return res.json(result);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'heatmap build failed' });
+  }
 });
 
 // --- v2.0 Phase 4 GPU topology passthrough. ---

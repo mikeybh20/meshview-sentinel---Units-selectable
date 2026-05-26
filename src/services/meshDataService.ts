@@ -545,6 +545,28 @@ export class MeshDataService {
   }
 
   /**
+   * v2.0 Phase 5: host system info for the RAM advisory in Settings → Radios.
+   */
+  async getSystemInfo(): Promise<{
+    platform: string;
+    arch: string;
+    cpuCount: number;
+    memTotal: number;
+    memFree: number;
+    memTotalGB: number;
+    memFreeGB: number;
+    isJetson: boolean;
+    uptimeSecs: number;
+    nodeVersion: string;
+  } | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/system/info`);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  }
+
+  /**
    * v2.0 Phase 2 polish: dry-run transport test. Returns the radio's
    * reported identity (short_name + long_name) and LoRa config when the
    * handshake completes inside the timeout. Used by:
@@ -631,6 +653,65 @@ export class MeshDataService {
   } | null> {
     try {
       const res = await fetch(`${API_BASE}/api/gpu/cluster`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(input),
+      });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  }
+
+  /**
+   * v2.0 Phase 5: simplify a node's position history via Ramer-Douglas-Peucker.
+   * When `points` is omitted, the server pulls position_history from the DB
+   * for the given `node_id`. Returns the kept indexes + the kept points.
+   */
+  async simplifyPositionTrace(input: {
+    node_id?: string;
+    points?: Array<{ node_id: string; timestamp: number; lat: number; lng: number }>;
+    simplify_tolerance_m?: number;
+    limit?: number;
+  }): Promise<{
+    keep: number[];
+    count: number;
+    input_count: number;
+    bbox: [number, number, number, number] | null;
+    backend: string;
+    points: Array<{ node_id: string; timestamp: number; lat: number; lng: number }>;
+  } | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/gpu/trace-simplify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(input),
+      });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  }
+
+  /**
+   * v2.0 Phase 5: signal coverage heatmap (IDW). When `observations` is
+   * omitted, the server derives them from currently-positioned nodes' last
+   * reported RSSI. Returns a 2D grid of dBm values (or null per cell when
+   * no sample falls inside max_radius_m).
+   */
+  async buildHeatmap(input: {
+    bbox: [number, number, number, number];
+    grid_width?: number;
+    grid_height?: number;
+    max_radius_m?: number;
+    observations?: Array<{ lat: number; lng: number; rssi: number; snr?: number | null }>;
+  }): Promise<{
+    grid: (number | null)[][];
+    bbox: [number, number, number, number];
+    stats: { min: number; max: number; samples: number } | null;
+    backend: 'cupy' | 'cpu' | 'cpu_ts' | 'noop';
+    method: string;
+  } | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/gpu/heatmap`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(input),

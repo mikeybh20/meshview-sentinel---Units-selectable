@@ -354,15 +354,115 @@ class HeatmapObservation(BaseModel):
 class HeatmapRequest(BaseModel):
     observations: list[HeatmapObservation]
     bbox: tuple[float, float, float, float]  # (south, west, north, east)
-    grid_width: int = 256
-    grid_height: int = 256
-    method: str = "idw"  # "idw" | "kriging"
+    grid_width: int = 64
+    grid_height: int = 64
+    method: str = "idw"          # only "idw" today; kriging is a future option
+    power: float = 2.0           # IDW exponent — 2 = inverse-square (default)
+    max_radius_m: float = 5000   # cells with no sample within this radius become null
+
+
+def _idw_cpu(req: HeatmapRequest) -> dict[str, Any]:
+    """Pure-Python IDW with a max-radius cutoff so distant cells are null
+    instead of getting smeared values from the nearest sample. Output is a
+    `grid_width × grid_height` 2D array of either floats (RSSI dBm) or None.
+    """
+    s, w, n, e = req.bbox
+    if n <= s or e <= w:
+        return {"grid": [], "bbox": req.bbox, "stats": None, "backend": "cpu", "method": req.method}
+
+    obs = req.observations
+    if not obs:
+        return {
+            "grid": [[None] * req.grid_width for _ in range(req.grid_height)],
+            "bbox": req.bbox,
+            "stats": None,
+            "backend": "cpu",
+            "method": req.method,
+        }
+
+    # Pre-compute observation positions in radians for haversine.
+    obs_pts = [(math.radians(o.lat), math.radians(o.lng), float(o.rssi)) for o in obs]
+    R = 6371000.0
+    max_r = req.max_radius_m
+    p = req.power
+
+    grid: list[list[float | None]] = []
+    rssi_min = math.inf
+    rssi_max = -math.inf
+    for row in range(req.grid_height):
+        # Cell-center latitude
+        frac_y = (req.grid_height - 1 - row + 0.5) / req.grid_height  # north → south rows top → bottom
+        lat = s + (n - s) * frac_y
+        lat_rad = math.radians(lat)
+        row_out: list[float | None] = []
+        for col in range(req.grid_width):
+            frac_x = (col + 0.5) / req.grid_width
+            lng = w + (e - w) * frac_x
+            lng_rad = math.radians(lng)
+
+            # IDW with cutoff
+            total_w = 0.0
+            total_v = 0.0
+            min_d = math.inf
+            for plat, plng, prssi in obs_pts:
+                dp = lat_rad - plat
+                dl = lng_rad - plng
+                a = math.sin(dp / 2) ** 2 + math.cos(lat_rad) * math.cos(plat) * math.sin(dl / 2) ** 2
+                d = 2 * R * math.asin(math.sqrt(a))
+                if d < min_d: min_d = d
+                if d > max_r: continue
+                # Avoid singularity when grid cell sits on top of an observation
+                if d < 1.0:
+                    total_w = float("inf")
+                    total_v = prssi
+                    break
+                weight = 1.0 / (d ** p)
+                total_w += weight
+                total_v += weight * prssi
+            if min_d > max_r:
+                row_out.append(None)
+            elif total_w == float("inf"):
+                row_out.append(total_v)
+                rssi_min = min(rssi_min, total_v)
+                rssi_max = max(rssi_max, total_v)
+            elif total_w > 0:
+                v = total_v / total_w
+                row_out.append(v)
+                rssi_min = min(rssi_min, v)
+                rssi_max = max(rssi_max, v)
+            else:
+                row_out.append(None)
+        grid.append(row_out)
+
+    stats = (
+        {"min": rssi_min, "max": rssi_max, "samples": len(obs)}
+        if rssi_min != math.inf else None
+    )
+    return {"grid": grid, "bbox": req.bbox, "stats": stats, "backend": "cpu", "method": req.method}
+
+
+def _try_cupy_heatmap(req: HeatmapRequest) -> dict[str, Any] | None:
+    """GPU path stub. cuPy + a vectorized IDW kernel would land here when
+    we're on a host that has CuPy in the image. Phase 1.5 base image doesn't,
+    so we return None and the CPU path runs."""
+    try:
+        import cupy  # type: ignore
+    except ImportError:
+        return None
+    _ = cupy
+    return None
 
 
 @app.post("/heatmap/coverage")
-def heatmap_coverage(_req: HeatmapRequest) -> dict[str, Any]:
-    """Phase 5 will implement using cuPy. Returns 501 until then."""
-    raise HTTPException(status_code=501, detail="heatmap_coverage not implemented (Phase 5)")
+def heatmap_coverage(req: HeatmapRequest) -> dict[str, Any]:
+    """
+    Inverse-distance-weighted signal coverage heatmap. Each cell of the
+    output grid is either the IDW-interpolated RSSI (dBm) or null when no
+    sample falls within `max_radius_m`. Used by the Dashboard map's coverage
+    overlay toggle.
+    """
+    gpu = _try_cupy_heatmap(req)
+    return gpu if gpu is not None else _idw_cpu(req)
 
 
 # ---- Phase 5: trace playback & analysis ----------------------------------------
@@ -379,10 +479,83 @@ class TracePlaybackRequest(BaseModel):
     simplify_tolerance_m: float = 5.0
 
 
+def _perpendicular_distance_m(
+    px_lat: float, px_lng: float,
+    a_lat: float, a_lng: float,
+    b_lat: float, b_lng: float,
+) -> float:
+    """Distance in meters from point P to the line segment AB. Treats lat/lng
+    as a local planar projection — fine for the short distances RDP cares
+    about (≤ a few hundred km of trace data per node)."""
+    # Local equirectangular projection at the segment midpoint
+    mid_lat = (a_lat + b_lat) / 2
+    cos_mid = math.cos(math.radians(mid_lat))
+    M_PER_DEG_LAT = 111320.0
+    def to_xy(lat: float, lng: float) -> tuple[float, float]:
+        return (lng * M_PER_DEG_LAT * cos_mid, lat * M_PER_DEG_LAT)
+    px, py = to_xy(px_lat, px_lng)
+    ax, ay = to_xy(a_lat, a_lng)
+    bx, by = to_xy(b_lat, b_lng)
+    dx, dy = bx - ax, by - ay
+    seg2 = dx * dx + dy * dy
+    if seg2 == 0:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / seg2))
+    qx, qy = ax + t * dx, ay + t * dy
+    return math.hypot(px - qx, py - qy)
+
+
+def _rdp(points: list[TracePoint], tolerance_m: float) -> list[int]:
+    """Iterative Ramer-Douglas-Peucker. Returns the indexes of the points
+    that survive simplification. Iterative to avoid recursion depth on long
+    traces. Tolerance is in meters."""
+    n = len(points)
+    if n <= 2:
+        return list(range(n))
+    keep = [False] * n
+    keep[0] = True
+    keep[n - 1] = True
+    stack: list[tuple[int, int]] = [(0, n - 1)]
+    while stack:
+        start, end = stack.pop()
+        if end - start < 2:
+            continue
+        max_d = -1.0
+        max_i = -1
+        a = points[start]
+        b = points[end]
+        for i in range(start + 1, end):
+            p = points[i]
+            d = _perpendicular_distance_m(p.lat, p.lng, a.lat, a.lng, b.lat, b.lng)
+            if d > max_d:
+                max_d = d
+                max_i = i
+        if max_d > tolerance_m and max_i > 0:
+            keep[max_i] = True
+            stack.append((start, max_i))
+            stack.append((max_i, end))
+    return [i for i, k in enumerate(keep) if k]
+
+
 @app.post("/trace/playback")
-def trace_playback(_req: TracePlaybackRequest) -> dict[str, Any]:
-    """Phase 5 will implement using cuDF + Ramer-Douglas-Peucker. Returns 501 until then."""
-    raise HTTPException(status_code=501, detail="trace_playback not implemented (Phase 5)")
+def trace_playback(req: TracePlaybackRequest) -> dict[str, Any]:
+    """
+    Ramer-Douglas-Peucker simplification of a position trace. Returns the
+    indexes of surviving points (so the client can keep its timestamps + alt
+    around without resampling) plus a count, and the bounding box.
+    """
+    if not req.points:
+        return {"keep": [], "count": 0, "bbox": None, "backend": "cpu"}
+    keep = _rdp(req.points, req.simplify_tolerance_m)
+    lats = [p.lat for p in req.points]
+    lngs = [p.lng for p in req.points]
+    return {
+        "keep": keep,
+        "count": len(keep),
+        "input_count": len(req.points),
+        "bbox": [min(lats), min(lngs), max(lats), max(lngs)],
+        "backend": "cpu",
+    }
 
 
 # ---------------------------------------------------------------------

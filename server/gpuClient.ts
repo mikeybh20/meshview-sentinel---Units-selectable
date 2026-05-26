@@ -221,6 +221,237 @@ export function clusterDbscanCpu(req: ClusterRequest): ClusterResponse {
 }
 
 // ---------------------------------------------------------------------
+// Phase 5: position trace simplification (Ramer-Douglas-Peucker).
+// ---------------------------------------------------------------------
+
+export interface TracePoint {
+  node_id: string;
+  timestamp: number;
+  lat: number;
+  lng: number;
+}
+
+export interface TraceSimplifyRequest {
+  points: TracePoint[];
+  simplify_tolerance_m?: number;
+}
+
+export interface TraceSimplifyResponse {
+  /** Indexes of points kept after RDP. Pair with the original timestamps to render. */
+  keep: number[];
+  count: number;
+  input_count: number;
+  bbox: [number, number, number, number] | null;
+  backend: 'cpu' | 'cpu_ts';
+}
+
+export async function simplifyTrace(req: TraceSimplifyRequest): Promise<TraceSimplifyResponse> {
+  if (req.points.length === 0) {
+    return { keep: [], count: 0, input_count: 0, bbox: null, backend: 'cpu_ts' };
+  }
+  const remote = await callSidecar<TraceSimplifyRequest, TraceSimplifyResponse>('/trace/playback', {
+    ...req,
+    simplify_tolerance_m: req.simplify_tolerance_m ?? 5,
+  });
+  if (remote) return remote;
+  return simplifyTraceCpu(req);
+}
+
+// Local equirectangular projection — fine for the short distances RDP cares about.
+function _perpDistanceM(
+  pLat: number, pLng: number,
+  aLat: number, aLng: number,
+  bLat: number, bLng: number,
+): number {
+  const midLat = (aLat + bLat) / 2;
+  const cosMid = Math.cos((midLat * Math.PI) / 180);
+  const MPDL = 111320;
+  const toXY = (lat: number, lng: number): [number, number] => [lng * MPDL * cosMid, lat * MPDL];
+  const [px, py] = toXY(pLat, pLng);
+  const [ax, ay] = toXY(aLat, aLng);
+  const [bx, by] = toXY(bLat, bLng);
+  const dx = bx - ax, dy = by - ay;
+  const seg2 = dx * dx + dy * dy;
+  if (seg2 === 0) return Math.hypot(px - ax, py - ay);
+  const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / seg2));
+  const qx = ax + t * dx, qy = ay + t * dy;
+  return Math.hypot(px - qx, py - qy);
+}
+
+export function simplifyTraceCpu(req: TraceSimplifyRequest): TraceSimplifyResponse {
+  const points = req.points;
+  const tol = req.simplify_tolerance_m ?? 5;
+  const n = points.length;
+  if (n === 0) return { keep: [], count: 0, input_count: 0, bbox: null, backend: 'cpu_ts' };
+  if (n <= 2) {
+    const lats = points.map(p => p.lat);
+    const lngs = points.map(p => p.lng);
+    return {
+      keep: points.map((_, i) => i),
+      count: n,
+      input_count: n,
+      bbox: [Math.min(...lats), Math.min(...lngs), Math.max(...lats), Math.max(...lngs)],
+      backend: 'cpu_ts',
+    };
+  }
+  const keep = new Array<boolean>(n).fill(false);
+  keep[0] = true;
+  keep[n - 1] = true;
+  const stack: Array<[number, number]> = [[0, n - 1]];
+  while (stack.length) {
+    const [start, end] = stack.pop()!;
+    if (end - start < 2) continue;
+    let maxD = -1;
+    let maxI = -1;
+    const a = points[start];
+    const b = points[end];
+    for (let i = start + 1; i < end; i++) {
+      const p = points[i];
+      const d = _perpDistanceM(p.lat, p.lng, a.lat, a.lng, b.lat, b.lng);
+      if (d > maxD) { maxD = d; maxI = i; }
+    }
+    if (maxD > tol && maxI > 0) {
+      keep[maxI] = true;
+      stack.push([start, maxI]);
+      stack.push([maxI, end]);
+    }
+  }
+  const idx: number[] = [];
+  for (let i = 0; i < n; i++) if (keep[i]) idx.push(i);
+  const lats = points.map(p => p.lat);
+  const lngs = points.map(p => p.lng);
+  return {
+    keep: idx,
+    count: idx.length,
+    input_count: n,
+    bbox: [Math.min(...lats), Math.min(...lngs), Math.max(...lats), Math.max(...lngs)],
+    backend: 'cpu_ts',
+  };
+}
+
+// ---------------------------------------------------------------------
+// Phase 5: signal coverage heatmap (IDW interpolation over a 2D grid).
+// ---------------------------------------------------------------------
+
+export interface HeatmapObservation {
+  lat: number;
+  lng: number;
+  rssi: number;
+  snr?: number | null;
+}
+
+export interface HeatmapRequest {
+  observations: HeatmapObservation[];
+  /** (south, west, north, east) */
+  bbox: [number, number, number, number];
+  grid_width?: number;
+  grid_height?: number;
+  method?: 'idw';
+  power?: number;
+  max_radius_m?: number;
+}
+
+export interface HeatmapResponse {
+  /** `grid_height` rows × `grid_width` cols, north → south top to bottom. null = no sample within max_radius_m. */
+  grid: (number | null)[][];
+  bbox: [number, number, number, number];
+  stats: { min: number; max: number; samples: number } | null;
+  backend: 'cupy' | 'cpu' | 'cpu_ts' | 'noop';
+  method: string;
+}
+
+export async function buildHeatmap(req: HeatmapRequest): Promise<HeatmapResponse> {
+  if (req.observations.length === 0) {
+    const h = req.grid_height ?? 64;
+    const w = req.grid_width ?? 64;
+    return {
+      grid: Array.from({ length: h }, () => Array(w).fill(null) as (number | null)[]),
+      bbox: req.bbox, stats: null, backend: 'noop', method: req.method ?? 'idw',
+    };
+  }
+  const remote = await callSidecar<HeatmapRequest, HeatmapResponse>('/heatmap/coverage', {
+    ...req,
+    grid_width:  req.grid_width  ?? 64,
+    grid_height: req.grid_height ?? 64,
+    method:      req.method      ?? 'idw',
+    power:       req.power       ?? 2,
+    max_radius_m: req.max_radius_m ?? 5000,
+  });
+  if (remote) return remote;
+  return buildHeatmapCpu(req);
+}
+
+export function buildHeatmapCpu(req: HeatmapRequest): HeatmapResponse {
+  const [s, w, n, e] = req.bbox;
+  const gw = req.grid_width  ?? 64;
+  const gh = req.grid_height ?? 64;
+  const p  = req.power ?? 2;
+  const maxR = req.max_radius_m ?? 5000;
+  const method = req.method ?? 'idw';
+
+  if (n <= s || e <= w) {
+    return { grid: [], bbox: req.bbox, stats: null, backend: 'cpu_ts', method };
+  }
+
+  const obs = req.observations.map(o => ({
+    latRad: (o.lat * Math.PI) / 180,
+    lngRad: (o.lng * Math.PI) / 180,
+    rssi: o.rssi,
+  }));
+  const R = 6371000;
+
+  const grid: (number | null)[][] = [];
+  let rssiMin = Infinity;
+  let rssiMax = -Infinity;
+
+  for (let row = 0; row < gh; row++) {
+    const fracY = (gh - 1 - row + 0.5) / gh;
+    const lat = s + (n - s) * fracY;
+    const latRad = (lat * Math.PI) / 180;
+    const rowOut: (number | null)[] = [];
+    for (let col = 0; col < gw; col++) {
+      const fracX = (col + 0.5) / gw;
+      const lng = w + (e - w) * fracX;
+      const lngRad = (lng * Math.PI) / 180;
+      let totalW = 0;
+      let totalV = 0;
+      let minD = Infinity;
+      let cellValue: number | null = null;
+      for (const ob of obs) {
+        const dp = latRad - ob.latRad;
+        const dl = lngRad - ob.lngRad;
+        const a = Math.sin(dp / 2) ** 2 + Math.cos(latRad) * Math.cos(ob.latRad) * Math.sin(dl / 2) ** 2;
+        const d = 2 * R * Math.asin(Math.sqrt(a));
+        if (d < minD) minD = d;
+        if (d > maxR) continue;
+        if (d < 1) { cellValue = ob.rssi; break; }
+        const weight = 1 / Math.pow(d, p);
+        totalW += weight;
+        totalV += weight * ob.rssi;
+      }
+      if (cellValue != null) {
+        rowOut.push(cellValue);
+        rssiMin = Math.min(rssiMin, cellValue); rssiMax = Math.max(rssiMax, cellValue);
+      } else if (minD > maxR) {
+        rowOut.push(null);
+      } else if (totalW > 0) {
+        const v = totalV / totalW;
+        rowOut.push(v);
+        rssiMin = Math.min(rssiMin, v); rssiMax = Math.max(rssiMax, v);
+      } else {
+        rowOut.push(null);
+      }
+    }
+    grid.push(rowOut);
+  }
+
+  const stats = rssiMin !== Infinity
+    ? { min: rssiMin, max: rssiMax, samples: obs.length }
+    : null;
+  return { grid, bbox: req.bbox, stats, backend: 'cpu_ts', method };
+}
+
+// ---------------------------------------------------------------------
 // Phase 4: mesh topology graph (undirected, edge-deduped, BFS components).
 // ---------------------------------------------------------------------
 

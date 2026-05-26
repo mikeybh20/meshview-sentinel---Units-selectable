@@ -4297,10 +4297,80 @@ const MODEM_PRESET_OPTIONS: Array<{ value: number; label: string }> = [
   { value: 8, label: 'SHORT_TURBO' },
 ];
 
+interface SystemInfo {
+  memTotalGB: number;
+  memFreeGB: number;
+  cpuCount: number;
+  isJetson: boolean;
+  platform: string;
+  arch: string;
+}
+
+function RamAdvisory({ info, radios, connected }: {
+  info: SystemInfo;
+  radios: RadioRow[];
+  connected: Record<string, { connected: boolean; transport: string | null }>;
+}) {
+  const connectedCount = Object.values(connected).filter(s => s.connected).length;
+  // Rough budget: Sentinel ~350 MB + (connected radios × 200 MB) + sidecar ~400 MB.
+  // Comfort threshold: total RAM should leave ≥600 MB headroom on top of that.
+  const baselineMB = 350 + connectedCount * 200 + 400;
+  const headroomMB = info.memTotalGB * 1024 - baselineMB;
+  const tight  = headroomMB < 600;
+  const veryTight = headroomMB < 200;
+
+  // Only render when there's something interesting to say. Don't yell at
+  // people with 16 GB hosts running one radio.
+  if (!tight && !info.isJetson && info.memTotalGB > 4) return null;
+
+  const tone = veryTight ? 'red' : (tight ? 'amber' : 'muted');
+  const borderClass =
+    tone === 'red'   ? 'border-red-500/40 bg-red-500/10 text-red-300' :
+    tone === 'amber' ? 'border-amber-500/40 bg-amber-500/10 text-amber-300' :
+                       'border-brand-line bg-brand-line/20 text-brand-muted';
+
+  return (
+    <div className={cn(
+      'flex items-start gap-2 rounded px-3 py-2 text-[11px] border',
+      borderClass
+    )}>
+      <AlertCircle size={12} className="flex-shrink-0 mt-0.5" />
+      <div className="space-y-1">
+        <p className="font-bold uppercase tracking-widest text-[10px]">
+          Memory advisory
+          {info.isJetson && ' · Jetson host detected'}
+        </p>
+        <p>
+          Total RAM: <span className="mono-text font-bold">{info.memTotalGB.toFixed(1)} GB</span>
+          {' · '}
+          Free: <span className="mono-text">{info.memFreeGB.toFixed(1)} GB</span>
+          {' · '}
+          Estimated baseline (Sentinel + {connectedCount} connected radio{connectedCount === 1 ? '' : 's'} + GPU sidecar):
+          {' '}<span className="mono-text font-bold">{(baselineMB / 1024).toFixed(1)} GB</span>
+          {' · '}
+          Headroom: <span className="mono-text font-bold">{(headroomMB / 1024).toFixed(1)} GB</span>
+        </p>
+        {veryTight && (
+          <p>
+            <span className="font-bold">Very tight.</span> Adding more radios or connecting the GPU sidecar will likely OOM-kill the container. Consider commenting out <span className="mono-text">meshview-gpu</span> in <span className="mono-text">docker-compose.yml</span> to free ~400 MB.
+          </p>
+        )}
+        {!veryTight && tight && (
+          <p>
+            Headroom is tight for adding additional radios. {radios.length > 1 && 'Disconnecting unused secondary radios via the panel below recovers ~200 MB each.'}
+            {info.isJetson && ' On a Jetson Nano 2GB, the GPU sidecar can usually be disabled (its workloads fall back to CPU automatically).'}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function RadiosSection() {
   const [radios, setRadios] = React.useState<RadioRow[]>([]);
   const [defaultRadioId, setDefaultRadioId] = React.useState<string | null>(null);
   const [connectionStates, setConnectionStates] = React.useState<Record<string, { connected: boolean; transport: string | null }>>({});
+  const [sysInfo, setSysInfo] = React.useState<SystemInfo | null>(null);
   const [loading, setLoading] = React.useState(true);
   const [showAdd, setShowAdd] = React.useState(false);
   const [editingId, setEditingId] = React.useState<string | null>(null);
@@ -4316,8 +4386,19 @@ function RadiosSection() {
     }
     const conns = await meshDataService.getRadioConnections();
     if (conns) setConnectionStates(conns.states);
+    if (!sysInfo) {
+      const info = await meshDataService.getSystemInfo();
+      if (info) setSysInfo({
+        memTotalGB: info.memTotalGB,
+        memFreeGB:  info.memFreeGB,
+        cpuCount:   info.cpuCount,
+        isJetson:   info.isJetson,
+        platform:   info.platform,
+        arch:       info.arch,
+      });
+    }
     setLoading(false);
-  }, []);
+  }, [sysInfo]);
 
   React.useEffect(() => { reload(); }, [reload]);
 
@@ -4388,6 +4469,12 @@ function RadiosSection() {
           <span>{error}</span>
         </div>
       )}
+
+      {/* v2.0 Phase 5: boot-time memory advisory. The Sentinel container takes
+          ~250-400 MB on its own; every additional connected radio adds ~150-250
+          MB; the GPU sidecar adds ~400 MB. We flag tight hosts (<= 2 GB total
+          RAM with multi-radio plans) so operators don't OOM mid-shift. */}
+      {sysInfo && <RamAdvisory info={sysInfo} radios={radios} connected={connectionStates} />}
 
       {loading ? (
         <div className="flex items-center gap-2 text-brand-muted text-xs">

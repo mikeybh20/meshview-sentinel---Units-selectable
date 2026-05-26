@@ -756,6 +756,26 @@ function DashboardMapWidget({ nodes }: { nodes: Node[] }) {
   const [clusters, setClusters] = React.useState<ClusterMarker[]>([]);
   const [backend, setBackend] = React.useState<'cuml' | 'cpu' | 'cpu_ts' | 'noop' | null>(null);
 
+  // v2.0 Phase 5: signal coverage heatmap state.
+  const [showHeatmap, setShowHeatmap] = React.useState(false);
+  const [heatmap, setHeatmap] = React.useState<{
+    grid: (number | null)[][];
+    bbox: [number, number, number, number];
+    stats: { min: number; max: number; samples: number } | null;
+    backend: string;
+  } | null>(null);
+  // v2.0 Phase 5: click-to-expand. Stores the cluster id currently popped out
+  // with its node list. Clicking the pin / +N badge toggles the popover.
+  const [expandedClusterId, setExpandedClusterId] = React.useState<number | null>(null);
+  // Fast lookup: nodeId → Node so the popover can render names + status.
+  // We use a plain object instead of `Map<>` because `Map` is the pigeon-maps
+  // component imported above and the name shadows the built-in.
+  const nodeById = React.useMemo<Record<string, Node>>(() => {
+    const m: Record<string, Node> = {};
+    for (const n of nodes) m[n.id] = n;
+    return m;
+  }, [nodes]);
+
   React.useEffect(() => {
     if (positioned.length === 0) { setClusters([]); return; }
     const epsM = metersPerPixel(center[0], zoom) * PIN_COLLISION_PIXELS;
@@ -776,8 +796,92 @@ function DashboardMapWidget({ nodes }: { nodes: Node[] }) {
     return () => clearTimeout(timer);
   }, [positioned, center, zoom]);
 
+  // v2.0 Phase 5: signal coverage heatmap fetcher. Re-runs when the operator
+  // toggles the overlay on or pans/zooms; debounced like clustering so we
+  // don't hammer the sidecar mid-drag.
+  React.useEffect(() => {
+    if (!showHeatmap || positioned.length === 0) { setHeatmap(null); return; }
+    // Approximate map bbox from center + zoom + viewport size. Pigeon-maps
+    // doesn't surface bounds directly so we estimate from the rendered
+    // pixel size (the map widget is 720px tall; assume ~1080px wide for the
+    // default Dashboard layout — actual width doesn't materially affect the
+    // heatmap because we sample at a fixed grid resolution either way).
+    const mpp = metersPerPixel(center[0], zoom);
+    const halfHeightM = 720 / 2 * mpp;
+    const halfWidthM  = 1080 / 2 * mpp;
+    const latDelta = halfHeightM / 111000;             // 1° lat ≈ 111 km
+    const lngDelta = halfWidthM / (111000 * Math.cos(center[0] * Math.PI / 180));
+    const bbox: [number, number, number, number] = [
+      center[0] - latDelta,
+      center[1] - lngDelta,
+      center[0] + latDelta,
+      center[1] + lngDelta,
+    ];
+
+    const timer = setTimeout(async () => {
+      const res = await meshDataService.buildHeatmap({
+        bbox,
+        grid_width: 96,
+        grid_height: 64,
+        max_radius_m: Math.max(2000, halfHeightM * 0.4),
+      });
+      if (!res) return;
+      setHeatmap({ grid: res.grid, bbox: res.bbox, stats: res.stats, backend: res.backend });
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [showHeatmap, positioned.length, center, zoom]);
+
+  // Render the heatmap onto a hidden canvas, then position it absolutely on
+  // top of the map widget. The canvas dimensions match the grid; CSS scales
+  // it to fill the widget so we get free anti-aliasing.
+  const heatmapCanvasRef = React.useRef<HTMLCanvasElement | null>(null);
+  React.useEffect(() => {
+    const canvas = heatmapCanvasRef.current;
+    if (!canvas || !heatmap || !heatmap.stats) return;
+    const { grid, stats } = heatmap;
+    const h = grid.length;
+    const w = grid[0]?.length ?? 0;
+    if (h === 0 || w === 0) return;
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const img = ctx.createImageData(w, h);
+    const range = Math.max(1, stats.max - stats.min);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const v = grid[y][x];
+        const idx = (y * w + x) * 4;
+        if (v == null) {
+          img.data[idx + 3] = 0; // transparent
+          continue;
+        }
+        const t = Math.max(0, Math.min(1, (v - stats.min) / range));
+        // Red (weak) → Yellow (mid) → Green (strong)
+        const r = t < 0.5 ? 255 : Math.round(255 * (1 - (t - 0.5) * 2));
+        const g = t < 0.5 ? Math.round(255 * (t * 2)) : 255;
+        img.data[idx]     = r;
+        img.data[idx + 1] = g;
+        img.data[idx + 2] = 0;
+        img.data[idx + 3] = 130; // semi-transparent so map shows through
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+  }, [heatmap]);
+
   return (
     <div className="technical-panel h-[720px] overflow-hidden relative">
+      {/* v2.0 Phase 5: heatmap canvas sits between the map tiles and the
+          markers. It's stretched to fill the widget so the IDW grid (96×64
+          cells) gets free CSS-scaling smoothing — looks blurry-but-good
+          rather than pixelated. */}
+      {showHeatmap && heatmap && (
+        <canvas
+          ref={heatmapCanvasRef}
+          className="absolute inset-0 w-full h-full pointer-events-none z-[1]"
+          style={{ imageRendering: 'auto', opacity: 0.7 }}
+        />
+      )}
       <div className="absolute inset-0 z-0">
         <Map
           center={center}
@@ -791,24 +895,44 @@ function DashboardMapWidget({ nodes }: { nodes: Node[] }) {
           }}
         >
           {clusters.map(cl => {
-            // v2.0 Phase 3c: one marker per spatial cluster. Multi-radio
-            // clusters get the first hearing radio's color; singletons fall
-            // back to the brand accent when there's no heard-by data.
+            // v2.0 Phase 3c + 5: one marker per spatial cluster. The pin's
+            // primary color comes from the first hearing radio; clusters
+            // touched by multiple radios get a horizontal multi-color strip
+            // below the pin so the operator can see attribution at a glance.
+            // Click toggles the expand popover.
             const pinColor = (cl.radioIds[0] && radioColors[cl.radioIds[0]])
               || 'var(--color-brand-accent)';
+            const multiRadio = cl.radioIds.length > 1;
+            const isExpanded = expandedClusterId === cl.id;
             return (
               <Marker
                 key={cl.id}
                 width={cl.count > 1 ? 28 : 20}
                 anchor={[cl.lat, cl.lng]}
                 color={pinColor}
+                onClick={() => setExpandedClusterId(prev => prev === cl.id ? null : cl.id)}
               >
                 {cl.count > 1 && (
-                  <div
-                    title={`${cl.count} nodes clustered\n${cl.nodeIds.slice(0, 8).join(', ')}${cl.nodeIds.length > 8 ? ', …' : ''}`}
-                    className="absolute -top-1 -right-1 min-w-[16px] h-[16px] px-1 rounded-full bg-brand-bg border border-brand-accent text-brand-accent text-[9px] font-bold flex items-center justify-center pointer-events-none"
+                  <button
+                    onClick={(e) => { e.stopPropagation(); setExpandedClusterId(prev => prev === cl.id ? null : cl.id); }}
+                    title={`${cl.count} nodes clustered — click to expand`}
+                    className="absolute -top-1 -right-1 min-w-[16px] h-[16px] px-1 rounded-full bg-brand-bg border border-brand-accent text-brand-accent text-[9px] font-bold flex items-center justify-center cursor-pointer hover:bg-brand-accent hover:text-black transition-colors"
                   >
                     +{cl.count}
+                  </button>
+                )}
+                {multiRadio && (
+                  <div
+                    title={`Heard by: ${cl.radioIds.join(', ')}`}
+                    className="absolute left-1/2 -translate-x-1/2 top-full mt-0.5 flex gap-0.5 pointer-events-none"
+                  >
+                    {cl.radioIds.map(rid => (
+                      <span
+                        key={rid}
+                        className="block w-1.5 h-1.5 rounded-full border border-brand-bg"
+                        style={{ background: radioColors[rid] ?? '#888' }}
+                      />
+                    ))}
                   </div>
                 )}
               </Marker>
@@ -816,7 +940,7 @@ function DashboardMapWidget({ nodes }: { nodes: Node[] }) {
           })}
         </Map>
       </div>
-      <div className="absolute top-2 left-2 flex items-center gap-2">
+      <div className="absolute top-2 left-2 flex items-center gap-2 z-[2]">
         <div className="px-2 py-1 bg-brand-bg/80 backdrop-blur-md rounded text-[10px] font-bold uppercase tracking-widest border border-brand-line">
           Mesh Coverage
         </div>
@@ -832,7 +956,88 @@ function DashboardMapWidget({ nodes }: { nodes: Node[] }) {
             {backend === 'cuml' ? 'GPU' : backend === 'cpu' ? 'SIDECAR' : 'CPU'}
           </div>
         )}
+        {/* v2.0 Phase 5: heatmap toggle. The badge next to it surfaces the
+            sample count + min/max RSSI so the operator knows what the heatmap
+            is actually showing. */}
+        <button
+          onClick={() => setShowHeatmap(s => !s)}
+          className={cn(
+            "px-2 py-1 rounded text-[10px] font-bold uppercase tracking-widest border transition-colors backdrop-blur-md",
+            showHeatmap
+              ? "bg-amber-500/20 border-amber-500/50 text-amber-300"
+              : "bg-brand-bg/80 border-brand-line text-brand-muted hover:text-brand-ink"
+          )}
+          title="Toggle signal coverage heatmap (IDW interpolation over RSSI samples)"
+        >
+          {showHeatmap ? '● Coverage' : '○ Coverage'}
+        </button>
+        {showHeatmap && heatmap?.stats && (
+          <div className="px-2 py-1 bg-brand-bg/80 backdrop-blur-md rounded text-[9px] mono-text border border-brand-line text-brand-muted">
+            {heatmap.stats.samples} samples · {Math.round(heatmap.stats.min)} → {Math.round(heatmap.stats.max)} dBm
+          </div>
+        )}
       </div>
+
+      {/* v2.0 Phase 5: cluster expand popover. Anchored to the upper-right
+          corner of the map so it doesn't fight the cluster's actual marker
+          for screen space (pigeon-maps' Overlay would re-anchor on every pan
+          which makes the popover feel like it's chasing the cursor). */}
+      {(() => {
+        const cl = clusters.find(c => c.id === expandedClusterId);
+        if (!cl) return null;
+        return (
+          <div className="absolute top-2 right-2 z-10 w-56 bg-brand-bg/95 backdrop-blur-md border border-brand-line rounded shadow-lg overflow-hidden">
+            <div className="px-3 py-2 border-b border-brand-line flex items-center justify-between">
+              <span className="text-[10px] font-bold uppercase tracking-widest text-brand-ink">
+                Cluster · {cl.count} node{cl.count === 1 ? '' : 's'}
+              </span>
+              <button
+                onClick={() => setExpandedClusterId(null)}
+                className="text-brand-muted hover:text-brand-ink"
+                title="Close"
+              >
+                ×
+              </button>
+            </div>
+            <div className="max-h-64 overflow-y-auto py-1">
+              {cl.nodeIds.map(id => {
+                const n = nodeById[id];
+                return (
+                  <button
+                    key={id}
+                    onClick={() => { /* would deep-link to NODE_DETAILS in a follow-up */ }}
+                    className="w-full text-left px-3 py-1.5 hover:bg-brand-line/50 transition-colors flex items-center gap-2"
+                  >
+                    <span className={cn(
+                      "w-1.5 h-1.5 rounded-full flex-shrink-0",
+                      n?.online ? "bg-brand-accent" : "bg-red-500/50"
+                    )} />
+                    <div className="min-w-0 flex-1">
+                      <div className="text-[11px] font-bold text-brand-ink truncate">
+                        {n?.shortName || id.slice(-4)} · {n?.name || id}
+                      </div>
+                      <div className="text-[9px] mono-text text-brand-muted flex items-center gap-1 flex-wrap">
+                        {(n?.heardByRadios ?? []).map(rid => (
+                          <span
+                            key={rid}
+                            className="px-1 rounded border text-[8px]"
+                            style={{
+                              color: radioColors[rid] ?? '#888',
+                              borderColor: `${radioColors[rid] ?? '#888'}66`,
+                            }}
+                          >
+                            {rid}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 }
