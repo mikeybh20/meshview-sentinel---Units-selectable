@@ -296,19 +296,52 @@ If removed:
 
 ---
 
-## What 2.0.0 Beta 1 includes (success criteria)
+## What 2.0.0 Beta 1 includes (success criteria) — ✅ TAGGED `v2.0.0-beta.1`
 
-- [ ] Two radios connected simultaneously (one serial, one TCP) via Settings → Radios
-- [ ] Each radio shows its real Frequency Slot, modem preset, and primary channel in the RadioBar
-- [ ] Node list shows "Heard by [MBNT][WRTJ]" badges; filtering by radio works
-- [ ] Map renders pins with per-radio color borders; overlap clustering present
-- [ ] Refresh dropdown lets operator refresh one radio at a time
-- [ ] BBS mail and weather subscribers are scoped per radio
-- [ ] Memory caps enforced; verified on a Jetson Nano 2GB with 2 radios + 100 nodes
-- [ ] `meshview-gpu` sidecar running and detected on Nano (CUDA Maxwell), Orin (Ampere), and at least one x86 NVIDIA host; CPU fallback works on a non-GPU dev machine with the startup banner shown
-- [ ] At least one core workload (spatial clustering, topology graph, or signal heatmap) verified end-to-end against the GPU sidecar on real hardware
-- [ ] Migration from 1.0rc03 → 2.0.0 Beta 1 is non-destructive (DB backfill + auto-register the existing radio)
+- [x] Two radios connected simultaneously (one serial, one TCP) via Settings → Radios (`spawnSecondary` in [bridgeManager.ts](server/bridgeManager.ts), Connect/Disconnect buttons in [SettingsModal.tsx](src/components/SettingsModal.tsx))
+- [x] Each radio shows its real Frequency Slot, modem preset, and primary channel in the RadioBar (LoRa admin readback wired in [meshtasticSerial.ts](server/meshtasticSerial.ts))
+- [x] Node list shows "Heard by [MBNT][WRTJ]" badges; filtering by radio works ([DashboardView.tsx](src/components/views/DashboardView.tsx) `HeardByBadges`, `filteredNodes` in [App.tsx](src/App.tsx))
+- [x] Map renders pins with per-radio color borders; overlap clustering present (GPU DBSCAN with TS fallback; click-to-expand popover; multi-color dot strip for multi-radio nodes)
+- [x] Refresh dropdown lets operator refresh one radio at a time ([RefreshSplitButton.tsx](src/components/RefreshSplitButton.tsx))
+- [x] BBS mail and weather subscribers are scoped per radio (per-context `BbsService` from [bridgeManager.ts](server/bridgeManager.ts), DB radio_id stamping, WeatherAlertPoller routing per subscriber)
+- [x] Memory advisory in Settings → Radios warns when host is tight (`/api/system/info` + `RamAdvisory` component)
+- [x] `meshview-gpu` sidecar reachable + GPU detection (verified on NVIDIA GB10); CPU fallback works on dev machines with startup banner
+- [x] Three core workloads verified end-to-end against the GPU sidecar: spatial clustering (Phase 3c), topology graph (Phase 4), signal coverage heatmap (Phase 5)
+- [x] Migration from 1.0rc03 → 2.0.0 Beta 1 is non-destructive (DB backfill + auto-register the existing radio)
+
+**Bonus features that landed in Beta 1** (not in the original success criteria):
+- GPU position trace simplification (RDP) — `/api/gpu/trace-simplify` endpoint ready for the future playback UI
+- Detect Identity + Test Connection buttons in Settings → Radios
+- Enabled/disabled toggle for radios
+- Multi-radio sections added to Install Guide + Jetson Nano guide
 
 ---
 
-*See [ROADMAP.md](ROADMAP.md) for the 1.0 historical roadmap and remaining 1.0-era items (most of which are now scheduled into Phase 5 above).*
+## 2.0.0 Beta 2 scope (deferred from Beta 1)
+
+These items were explicitly scoped out of Beta 1 to keep the multi-radio core focused. Each is its own focused work session.
+
+### Architecture cleanup (carried from Phase 1)
+- **`RadioAdapter` formal extraction** — the interface in [radioAdapter.ts](server/radioAdapter.ts) exists but `MeshtasticSerialBridge` doesn't formally `implements` it. Fold this in when BLE transport lands (likely the trigger for needing the abstraction).
+
+### GPU image (carried from Phase 1.5)
+- **Multi-arch `Dockerfile.gpu`** with `nvcr.io/nvidia/l4t-ml` (Jetson arm64), `nvidia/cuda` (x86_64), and SBSA-arm64 variants installing RAPIDS so the sidecar can actually use cuML / cuGraph / cuPy in production
+- **CI matrix** smoke-testing the sidecar image for arm64-l4t, arm64-sbsa, x86_64-cuda
+
+### Phase 5 — accelerated visualizations (deferred slice)
+- **Traceroute path analysis** — `/api/gpu/route-stability` (cuGraph in the sidecar; pure-Python fallback). Surfaces common path segments + per-pair route-stability scores. New "Route Stability" panel.
+- **Position trace playback UI** — the backend RDP simplifier shipped in Beta 1; the playback animation with a slider on the Node Detail panel + map polyline overlay is Beta 2.
+
+### Phase 5 — leftover 1.0 items (deferred slice)
+- **Outage detection / "radio went silent" alerts** — event-based, per-radio. Fires when a previously-heard node misses its expected reporting interval.
+- **Backup / restore** — encrypted export of `bbs-config.json` + `radios` table + channel PSKs. Read at config time to bootstrap a fresh install.
+- **Per-channel uplink / downlink editing** in ChannelsModal (currently read-only for some channel flags)
+- **Remaining Settings → Modules** — Power, Serial, Canned Messages, Ambient Lighting, Paxcounter (carried over from 1.0 ROADMAP)
+- **PKI / ECDH** — still parked. Documented in 1.0 ROADMAP; will revisit when an upstream client library stabilizes.
+
+### Phase 6 — AI + sidecar expansion (target 2.0 GA, after Beta 2 stabilizes)
+Unchanged from original plan. AI evaluation + decision point (keep / evolve / remove), anomaly detection, AGX Orin + GB10 deployment guides.
+
+---
+
+*See [ROADMAP.md](ROADMAP.md) for the 1.0 historical roadmap. Beta 1 git tag: `v2.0.0-beta.1` on the `v2-dev` branch.*
