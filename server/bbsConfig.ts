@@ -6,11 +6,18 @@
  */
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
-import { dirname } from 'path';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+// Resolve alongside the SQLite DB (server/database.ts uses the same
+// __dirname-relative `data/` dir): /app/data in Docker, <repo>/data in dev.
+// MESHVIEW_DATA_DIR overrides for custom deployments.
 const CONFIG_PATH = process.env.MESHVIEW_DATA_DIR
-  ? `${process.env.MESHVIEW_DATA_DIR}/bbs-config.json`
-  : '/app/data/bbs-config.json';
+  ? join(process.env.MESHVIEW_DATA_DIR, 'bbs-config.json')
+  : join(__dirname, '..', 'data', 'bbs-config.json');
 
 export interface BbsConfig {
   /** Master switch. When false, ALL BBS triggers are ignored and the state

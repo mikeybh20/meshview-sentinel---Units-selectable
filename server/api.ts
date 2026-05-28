@@ -20,6 +20,7 @@ import { bridgeManager, testTransportConnection } from './bridgeManager.js';
 // v2.0 GPU sidecar boot probe. Logs sidecar reachability + detected GPU
 // at startup so the operator immediately knows their acceleration tier.
 import { probeGpuOnBoot, health as gpuHealth, clusterDbscan, buildTopology, buildHeatmap, simplifyTrace } from './gpuClient.js';
+import { sealBackup, openBackup } from './backup.js';
 probeGpuOnBoot();
 
 // v2.0 multi-radio: BbsService is instantiated per RadioContext inside
@@ -743,6 +744,67 @@ app.put('/api/mesh/radios/:radioId/lora', async (req, res) => {
 app.get('/api/gpu/health', async (_req, res) => {
   const h = await gpuHealth();
   return res.json(h);
+});
+
+// --- v2.0 Beta 2: encrypted config backup / restore ---
+// Bundles the radios registry + channels (with PSKs) + BBS config into a
+// passphrase-sealed AES-256-GCM envelope. See [backup.ts](./backup.ts).
+app.post('/api/mesh/backup', (req, res) => {
+  const passphrase = String(req.body?.passphrase ?? '');
+  try {
+    const payload = {
+      kind: 'meshview-sentinel-backup',
+      exportedAt: Date.now(),
+      systemVersion: SYSTEM_VERSION,
+      radios: meshDb().listRadios(),
+      channels: meshDb().loadChannels(),
+      bbsConfig,
+    };
+    const envelope = sealBackup(payload, passphrase);
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename="sentinel-backup-${new Date().toISOString().slice(0, 10)}.json"`);
+    return res.send(JSON.stringify(envelope, null, 2));
+  } catch (err: any) {
+    return res.status(400).json({ error: err.message });
+  }
+});
+
+app.post('/api/mesh/restore', (req, res) => {
+  const passphrase = String(req.body?.passphrase ?? '');
+  const envelope = req.body?.envelope;
+  if (!envelope || typeof envelope !== 'object') {
+    return res.status(400).json({ error: 'envelope is required' });
+  }
+  let payload: any;
+  try {
+    payload = openBackup(envelope, passphrase);
+  } catch (err: any) {
+    return res.status(400).json({ error: err.message });
+  }
+  if (payload?.kind !== 'meshview-sentinel-backup') {
+    return res.status(400).json({ error: 'not a Sentinel backup envelope' });
+  }
+  // Restore is Sentinel-side only: rewrites the radios table, channels cache,
+  // and BBS config. Does NOT push anything to radio firmware — devices keep
+  // their own config; reconnecting re-reads their actual channel state.
+  const summary = { radios: 0, channels: 0, bbsConfig: false };
+  try {
+    if (Array.isArray(payload.radios)) {
+      for (const r of payload.radios) { meshDb().upsertRadio(r); summary.radios++; }
+    }
+    if (Array.isArray(payload.channels)) {
+      for (const c of payload.channels) { meshDb().upsertChannel(c); summary.channels++; }
+    }
+    if (payload.bbsConfig && typeof payload.bbsConfig === 'object') {
+      bbsConfig = normalizeBbsConfig(payload.bbsConfig);
+      saveBbsConfig(bbsConfig);
+      bridgeManager.setBbsConfig(bbsConfig);
+      summary.bbsConfig = true;
+    }
+    return res.json({ ok: true, restored: summary });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 // --- v2.0 Phase 5: host system info ---

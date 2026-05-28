@@ -144,6 +144,21 @@ export function useMeshNotifications({
     const newOnes = lastIdx >= 0 ? events.slice(0, lastIdx) : (lastEventIdRef.current ? [] : events);
 
     for (const e of newOnes) {
+      // v2.0 Beta 2: favorites now emit a dedicated OUTAGE event (covering
+      // both "went silent" and "back online"); the event text already carries
+      // the ⚠/✓ marker so we surface it directly. NODE_LOST stays handled too
+      // for back-compat with any favorite still on the old path.
+      if (e.type === 'OUTAGE') {
+        const node = nodes.find(n => n.id === e.nodeId);
+        try {
+          new Notification(node?.name ? `${node.name} — radio status` : 'Radio status', {
+            body: e.details,
+            tag: `outage-${e.nodeId}`,
+            icon: '/favicon.ico',
+          });
+        } catch { /* noop */ }
+        continue;
+      }
       if (e.type !== 'NODE_LOST') continue;
       const node = nodes.find(n => n.id === e.nodeId);
       if (!node?.favorite) continue;

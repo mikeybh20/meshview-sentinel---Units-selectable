@@ -145,7 +145,7 @@ interface ResendContext {
 
 export interface MeshEvent {
   id: string;
-  type: 'NODE_JOINED' | 'NODE_LOST' | 'MESSAGE' | 'TELEMETRY' | 'POSITION_UPDATE' | 'WEATHER_ALERT';
+  type: 'NODE_JOINED' | 'NODE_LOST' | 'MESSAGE' | 'TELEMETRY' | 'POSITION_UPDATE' | 'WEATHER_ALERT' | 'OUTAGE';
   nodeId: string;
   timestamp: number;
   details: string;
@@ -1860,6 +1860,11 @@ export class MeshtasticSerialBridge extends EventEmitter {
 
       if (isNew) {
         this.addEvent('NODE_JOINED', nodeId, `${node.name} discovered on mesh`);
+      } else if (!wasOnline && nodeId !== this.localNodeId && node.favorite) {
+        // v2.0 Beta 2: outage recovery. A known favorite that was offline is
+        // back — close the loop on the OUTAGE alert so the operator sees the
+        // node recovered rather than wondering if it's still down.
+        this.addEvent('OUTAGE', nodeId, `✓ ${node.name} (favorite) is back online`);
       }
       if (publicKey && !hadKey) {
         console.log(`[MeshtasticSerial] PKC public key learned for ${nodeId} (${node.name})`);
@@ -3544,7 +3549,18 @@ export class MeshtasticSerialBridge extends EventEmitter {
       if (node.online && (now - node.lastSeen) > this.staleThresholdMs) {
         node.online = false;
         this.upsertNode(node);
-        this.addEvent('NODE_LOST', id, `${node.name} went offline (stale)`);
+        // v2.0 Beta 2: outage detection. Favorites are operator-flagged
+        // "important" nodes (gateways, repeaters, key peers). When one goes
+        // silent we elevate it to a distinct OUTAGE event — which fires a
+        // browser notification and stands out in the Event Log — instead of
+        // the routine NODE_LOST churn that floods in from a 200-node public
+        // mesh. Non-favorites keep the quiet NODE_LOST treatment.
+        const silentMin = Math.round((now - node.lastSeen) / 60000);
+        if (node.favorite) {
+          this.addEvent('OUTAGE', id, `⚠ ${node.name} (favorite) went silent — last heard ${silentMin} min ago`);
+        } else {
+          this.addEvent('NODE_LOST', id, `${node.name} went offline (stale)`);
+        }
         // Close the session for uptime tracking. Use lastSeen as the close
         // time — it's a more accurate "when did the node actually go away"
         // than `now` (which is up to staleThresholdMs late).

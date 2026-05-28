@@ -371,7 +371,7 @@ function NotificationsSection({
         </div>
 
         <div className="text-[11px] text-brand-muted leading-relaxed border-t border-brand-line/50 pt-3 space-y-1">
-          <p><strong className="text-brand-ink">Triggers:</strong> incoming DMs to the local node (suppressed if you're already viewing that chat) and NODE_LOST events for favorited nodes.</p>
+          <p><strong className="text-brand-ink">Triggers:</strong> incoming DMs to the local node (suppressed if you're already viewing that chat) and OUTAGE events for favorited nodes — fired when a favorite goes silent past the staleness threshold and again when it returns.</p>
           <p>Notifications include a "click to open chat" action that switches to the messages tab with the sender's chat active.</p>
         </div>
       </div>
@@ -546,6 +546,159 @@ function DataSection({ onOpenExport, onOpenImport, onClose }: SettingsModalProps
           <p className="text-[10px] text-brand-muted leading-snug">Bulk-import node data from CSV.</p>
         </button>
       </div>
+
+      {/* v2.0 Beta 2: encrypted config backup/restore. Separate from the CSV
+          export above — this captures the radios registry + channels (with
+          PSKs) + BBS config so a fresh install can be bootstrapped. */}
+      <ConfigBackupSection />
+    </div>
+  );
+}
+
+function ConfigBackupSection() {
+  const [exportPass, setExportPass] = React.useState('');
+  const [restorePass, setRestorePass] = React.useState('');
+  const [msg, setMsg] = React.useState<{ tone: 'ok' | 'err'; text: string } | null>(null);
+  const [busy, setBusy] = React.useState(false);
+  const fileRef = React.useRef<HTMLInputElement | null>(null);
+  const [pendingEnvelope, setPendingEnvelope] = React.useState<any>(null);
+
+  const doExport = async () => {
+    setMsg(null);
+    if (exportPass.length < 6) { setMsg({ tone: 'err', text: 'Passphrase must be at least 6 characters.' }); return; }
+    setBusy(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/backup`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ passphrase: exportPass }),
+      });
+      if (!res.ok) {
+        const b = await res.json().catch(() => ({}));
+        setMsg({ tone: 'err', text: b.error || `HTTP ${res.status}` });
+        return;
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `sentinel-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      setMsg({ tone: 'ok', text: 'Backup downloaded.' });
+      setExportPass('');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onFilePicked = async (file: File) => {
+    setMsg(null);
+    try {
+      const text = await file.text();
+      const env = JSON.parse(text);
+      if (env?.alg !== 'aes-256-gcm') { setMsg({ tone: 'err', text: 'Not a Sentinel backup file.' }); return; }
+      setPendingEnvelope(env);
+      setMsg({ tone: 'ok', text: 'Backup loaded. Enter its passphrase and click Restore.' });
+    } catch {
+      setMsg({ tone: 'err', text: 'Could not read that file as JSON.' });
+    }
+  };
+
+  const doRestore = async () => {
+    setMsg(null);
+    if (!pendingEnvelope) { setMsg({ tone: 'err', text: 'Pick a backup file first.' }); return; }
+    if (!restorePass) { setMsg({ tone: 'err', text: 'Enter the backup passphrase.' }); return; }
+    if (!confirm('Restore will overwrite your radios registry, channel cache, and BBS config from the backup. Continue?')) return;
+    setBusy(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/restore`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ passphrase: restorePass, envelope: pendingEnvelope }),
+      });
+      const b = await res.json().catch(() => ({}));
+      if (!res.ok) { setMsg({ tone: 'err', text: b.error || `HTTP ${res.status}` }); return; }
+      setMsg({ tone: 'ok', text: `Restored: ${b.restored.radios} radios, ${b.restored.channels} channels${b.restored.bbsConfig ? ', BBS config' : ''}. Reconnect radios to resync device state.` });
+      setRestorePass('');
+      setPendingEnvelope(null);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="border-t border-brand-line pt-4 space-y-3">
+      <SectionHeader
+        title="Config Backup"
+        subtitle="Encrypted export of the radios registry, channels (including PSKs), and BBS config. Sealed with AES-256-GCM — keep the passphrase safe; there's no recovery without it."
+      />
+
+      {msg && (
+        <div className={cn(
+          'flex items-center gap-2 rounded px-3 py-2 text-[11px] border',
+          msg.tone === 'ok' ? 'border-brand-accent/40 bg-brand-accent/10 text-brand-accent'
+                            : 'border-red-500/40 bg-red-500/10 text-red-300'
+        )}>
+          {msg.tone === 'ok' ? <Check size={12} /> : <AlertCircle size={12} />}
+          <span>{msg.text}</span>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div className="space-y-2">
+          <p className="text-[10px] font-bold uppercase tracking-widest text-brand-muted">Export</p>
+          <input
+            type="password"
+            value={exportPass}
+            onChange={e => setExportPass(e.target.value)}
+            placeholder="Encryption passphrase (≥6 chars)"
+            className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs text-brand-ink"
+          />
+          <button
+            onClick={doExport}
+            disabled={busy}
+            className="flex items-center gap-1 bg-brand-accent/10 hover:bg-brand-accent/20 disabled:opacity-40 border border-brand-accent/40 text-brand-accent text-[10px] font-bold uppercase tracking-widest rounded px-3 py-1.5"
+          >
+            <Download size={12} /> Download Backup
+          </button>
+        </div>
+
+        <div className="space-y-2">
+          <p className="text-[10px] font-bold uppercase tracking-widest text-brand-muted">Restore</p>
+          <input
+            ref={fileRef}
+            type="file"
+            accept="application/json,.json"
+            onChange={e => { const f = e.target.files?.[0]; if (f) onFilePicked(f); }}
+            className="hidden"
+          />
+          <button
+            onClick={() => fileRef.current?.click()}
+            className="w-full flex items-center gap-1 border border-brand-line text-brand-muted hover:text-brand-ink hover:border-brand-accent/40 text-[10px] font-bold uppercase tracking-widest rounded px-3 py-1.5"
+          >
+            <FileUp size={12} /> {pendingEnvelope ? 'Backup loaded ✓' : 'Choose Backup File'}
+          </button>
+          <input
+            type="password"
+            value={restorePass}
+            onChange={e => setRestorePass(e.target.value)}
+            placeholder="Backup passphrase"
+            className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs text-brand-ink"
+          />
+          <button
+            onClick={doRestore}
+            disabled={busy || !pendingEnvelope}
+            className="flex items-center gap-1 bg-amber-500/10 hover:bg-amber-500/20 disabled:opacity-40 border border-amber-500/40 text-amber-300 text-[10px] font-bold uppercase tracking-widest rounded px-3 py-1.5"
+          >
+            <Undo2 size={12} /> Restore
+          </button>
+        </div>
+      </div>
+      <p className="text-[10px] text-brand-muted/80 italic">
+        Restore rewrites Sentinel's own DB + config only — it does not push anything to radio firmware.
+        Reconnect each radio afterward to resync the device's live state.
+      </p>
     </div>
   );
 }

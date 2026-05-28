@@ -163,7 +163,7 @@ export interface Message {
 
 export interface RadioEvent {
   id: string;
-  type: 'NODE_JOINED' | 'NODE_LOST' | 'MESSAGE' | 'TELEMETRY' | 'POSITION_UPDATE' | 'WEATHER_ALERT';
+  type: 'NODE_JOINED' | 'NODE_LOST' | 'MESSAGE' | 'TELEMETRY' | 'POSITION_UPDATE' | 'WEATHER_ALERT' | 'OUTAGE';
   nodeId: string;
   timestamp: number;
   details: string;

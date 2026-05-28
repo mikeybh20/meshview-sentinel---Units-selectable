@@ -84,6 +84,7 @@ export function LogsView({ events }: LogsViewProps) {
                 event.type === 'MESSAGE' ? "text-brand-info" :
                 event.type === 'TELEMETRY' ? "text-brand-accent" :
                 event.type === 'NODE_JOINED' ? "text-brand-warning" :
+                event.type === 'OUTAGE' ? "text-brand-error" :
                 event.type === 'WEATHER_ALERT' ? "text-brand-error" : "text-brand-muted"
               )}>{event.type}</span>
               <span className="text-brand-ink truncate">{event.details}</span>
