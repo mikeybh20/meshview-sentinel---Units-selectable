@@ -337,23 +337,17 @@ Critical Beta 1 bugs that meant LoRa readback never actually worked, plus a wave
 - ✅ **Network config readback** (WiFi/Eth/NTP) — read-only display (bonus, wasn't originally scoped)
 - ✅ **Radio Health line** — firmware / reboots / battery / voltage per radio (bonus)
 - ✅ **Detect Identity / Test Connection** live-state fallback when the port is already held
+- ✅ **Canned Messages module** — admin builder + parser + Settings card + dashboard quick-send palette ([meshtasticSerial.ts](server/meshtasticSerial.ts) `requestCannedMessages`/`setCannedMessages`)
+- ✅ **Position-trace playback UI** — slider + map polyline overlay on the Node Detail panel (`PositionPlayback` in [DashboardView.tsx](src/components/views/DashboardView.tsx))
+- ✅ **Outage detection / "radio went silent" alerts** — favorites emit a dedicated `OUTAGE` event on going silent + on recovery; browser notification + Event Log highlight ([meshtasticSerial.ts](server/meshtasticSerial.ts) `markStaleNodesOffline`, [useMeshNotifications.ts](src/hooks/useMeshNotifications.ts))
+- ✅ **Backup / restore** — passphrase-sealed AES-256-GCM export of the radios registry + channels (PSKs) + BBS config ([backup.ts](server/backup.ts), `/api/mesh/backup` + `/api/mesh/restore`, Settings → Data)
+- ✅ **Settings → Modules: Serial / Ambient Lighting / Paxcounter** — full editors mirroring the Power/Audio pattern (admin builder + parser + readback + UI card)
 
 ### 🔲 Still open — feature work
 
-- 🔲 **Canned Messages module** — admin builder + parser + Settings card + a dashboard quick-send palette. Lets operators preload short broadcasts and one-click send.
-- 🔲 **Position-trace playback UI** — the backend RDP simplifier shipped in Beta 1 (`/api/gpu/trace-simplify`); this is the slider + map polyline overlay on the Node Detail panel.
-- 🔲 **Outage detection / "radio went silent" alerts** — event-based, per-radio. Fires when a previously-heard node misses its expected reporting interval.
-- 🔲 **Backup / restore** — encrypted export of `bbs-config.json` + `radios` table + channel PSKs. Read at config time to bootstrap a fresh install.
 - 🚧 **Detection Sensor event timeline** — blocked on wiring a physical GPIO sensor; firmware triggers arrive as plain text broadcasts, so the timeline design needs a real signal to match against.
 - 🔲 **Traceroute route-stability analysis** — `/api/gpu/route-stability` (cuGraph in the sidecar; pure-Python fallback). Common path segments + per-pair stability scores + a "Route Stability" panel.
-
-### 🔲 Still open — remaining Settings → Modules
-
-Each mirrors the Power module pattern (admin builder + parser + readback + UI card):
-
-- 🔲 **Serial** — UART-based external device integration
-- 🔲 **Ambient Lighting** — WS2812 LED control (boards with the strip)
-- 🔲 **Paxcounter** — BLE/WiFi device counting (foot-traffic estimation)
+- 🔲 **Settings → Modules: Remote Hardware** — the last unshipped module (GPIO remote control).
 
 ### 🔲 Still open — infrastructure / cleanup
 

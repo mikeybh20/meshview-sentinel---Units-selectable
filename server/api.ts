@@ -1628,6 +1628,131 @@ app.post('/api/mesh/modules/audio', async (req, res) => {
   }
 });
 
+// Serial module: refresh + write
+app.post('/api/mesh/modules/serial/refresh', async (_req, res) => {
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.requestSerialConfig();
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/mesh/modules/serial', async (req, res) => {
+  const body = req.body ?? {};
+  const requireBool = (v: any, name: string) => typeof v === 'boolean' ? null : `${name} must be a boolean`;
+  const requireUint = (v: any, name: string, max: number) =>
+    typeof v === 'number' && v >= 0 && v <= max ? null : `${name} must be 0..${max}`;
+
+  const errs: (string | null)[] = [
+    requireBool(body.enabled, 'enabled'),
+    requireBool(body.echo, 'echo'),
+    requireUint(body.rxd, 'rxd', 64),
+    requireUint(body.txd, 'txd', 64),
+    requireUint(body.baud, 'baud', 15),
+    requireUint(body.timeout, 'timeout', 60000),
+    requireUint(body.mode, 'mode', 7),
+  ].filter(Boolean);
+  if (errs.length) return res.status(400).json({ error: errs.join('; ') });
+
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.setSerialConfig({
+      enabled: body.enabled,
+      echo: body.echo,
+      rxd: body.rxd,
+      txd: body.txd,
+      baud: body.baud,
+      timeout: body.timeout,
+      mode: body.mode,
+    });
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Ambient Lighting module: refresh + write
+app.post('/api/mesh/modules/ambient-lighting/refresh', async (_req, res) => {
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.requestAmbientLightingConfig();
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/mesh/modules/ambient-lighting', async (req, res) => {
+  const body = req.body ?? {};
+  const requireBool = (v: any, name: string) => typeof v === 'boolean' ? null : `${name} must be a boolean`;
+  const requireUint = (v: any, name: string, max: number) =>
+    typeof v === 'number' && v >= 0 && v <= max ? null : `${name} must be 0..${max}`;
+
+  const errs: (string | null)[] = [
+    requireBool(body.ledState, 'ledState'),
+    requireUint(body.current, 'current', 255),
+    requireUint(body.red, 'red', 255),
+    requireUint(body.green, 'green', 255),
+    requireUint(body.blue, 'blue', 255),
+  ].filter(Boolean);
+  if (errs.length) return res.status(400).json({ error: errs.join('; ') });
+
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.setAmbientLightingConfig({
+      ledState: body.ledState,
+      current: body.current,
+      red: body.red,
+      green: body.green,
+      blue: body.blue,
+    });
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Paxcounter module: refresh + write
+app.post('/api/mesh/modules/paxcounter/refresh', async (_req, res) => {
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.requestPaxcounterConfig();
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/mesh/modules/paxcounter', async (req, res) => {
+  const body = req.body ?? {};
+  const requireBool = (v: any, name: string) => typeof v === 'boolean' ? null : `${name} must be a boolean`;
+  const requireUint = (v: any, name: string, max: number) =>
+    typeof v === 'number' && v >= 0 && v <= max ? null : `${name} must be 0..${max}`;
+
+  const errs: (string | null)[] = [
+    requireBool(body.enabled, 'enabled'),
+    requireUint(body.updateIntervalSecs, 'updateIntervalSecs', 86400),
+    requireUint(body.wifiThreshold, 'wifiThreshold', 255),
+    requireUint(body.bleThreshold, 'bleThreshold', 255),
+  ].filter(Boolean);
+  if (errs.length) return res.status(400).json({ error: errs.join('; ') });
+
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.setPaxcounterConfig({
+      enabled: body.enabled,
+      updateIntervalSecs: body.updateIntervalSecs,
+      wifiThreshold: body.wifiThreshold,
+      bleThreshold: body.bleThreshold,
+    });
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // External Notification module: refresh + write
 app.post('/api/mesh/modules/external-notification/refresh', async (_req, res) => {
   if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });

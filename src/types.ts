@@ -281,6 +281,39 @@ export interface AudioModuleConfig {
   lastReadAt: number;
 }
 
+export interface SerialModuleConfig {
+  enabled: boolean;
+  echo: boolean;
+  rxd: number;
+  txd: number;
+  /** Serial_Baud enum value. */
+  baud: number;
+  timeout: number;
+  /** Serial_Mode enum value. */
+  mode: number;
+  /** Epoch ms when this config was last read from the radio. */
+  lastReadAt: number;
+}
+
+export interface AmbientLightingModuleConfig {
+  ledState: boolean;
+  current: number;
+  red: number;
+  green: number;
+  blue: number;
+  /** Epoch ms when this config was last read from the radio. */
+  lastReadAt: number;
+}
+
+export interface PaxcounterModuleConfig {
+  enabled: boolean;
+  updateIntervalSecs: number;
+  wifiThreshold: number;
+  bleThreshold: number;
+  /** Epoch ms when this config was last read from the radio. */
+  lastReadAt: number;
+}
+
 export interface MqttModuleConfig {
   enabled: boolean;
   address: string;
@@ -353,6 +386,12 @@ export interface LocalModuleConfigSnapshot {
   detectionSensor?: DetectionSensorModuleConfig;
   /** Authoritative Audio module config (Codec2 voice over LoRa). */
   audio?: AudioModuleConfig;
+  /** Authoritative Serial module config (UART passthrough to external devices). */
+  serial?: SerialModuleConfig;
+  /** Authoritative Ambient Lighting module config (RGB LED control). */
+  ambientLighting?: AmbientLightingModuleConfig;
+  /** Authoritative Paxcounter module config (WiFi/BLE device counting). */
+  paxcounter?: PaxcounterModuleConfig;
   /** Live state of timed surveys (Range Test sender / NeighborInfo cadence). */
   activeSurveys?: {
     rangeTestExpiresAt: number | null;

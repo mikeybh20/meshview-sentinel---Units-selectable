@@ -1294,6 +1294,121 @@ export class MeshDataService {
     }
   }
 
+  /** Ask the radio to re-send its current Serial module config. Local admin only. */
+  async refreshSerialConfig(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/serial/refresh`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Configure the Serial (UART passthrough) module on the connected radio. */
+  async setSerialConfig(cfg: {
+    enabled: boolean;
+    echo: boolean;
+    rxd: number;
+    txd: number;
+    baud: number;
+    timeout: number;
+    mode: number;
+  }): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/serial`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(cfg),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Ask the radio to re-send its current Ambient Lighting module config. Local admin only. */
+  async refreshAmbientLightingConfig(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/ambient-lighting/refresh`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Configure the Ambient Lighting (RGB LED) module on the connected radio. */
+  async setAmbientLightingConfig(cfg: {
+    ledState: boolean;
+    current: number;
+    red: number;
+    green: number;
+    blue: number;
+  }): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/ambient-lighting`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(cfg),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Ask the radio to re-send its current Paxcounter module config. Local admin only. */
+  async refreshPaxcounterConfig(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/paxcounter/refresh`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Configure the Paxcounter (WiFi/BLE device counting) module on the connected radio. */
+  async setPaxcounterConfig(cfg: {
+    enabled: boolean;
+    updateIntervalSecs: number;
+    wifiThreshold: number;
+    bleThreshold: number;
+  }): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/paxcounter`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(cfg),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
   /** Ask the radio to re-send its current MQTT module config. Local admin only. */
   async refreshMqttConfig(): Promise<{ ok: boolean; error?: string }> {
     try {

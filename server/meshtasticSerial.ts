@@ -304,6 +304,53 @@ export interface AudioModuleConfig {
   lastReadAt: number;
 }
 
+export interface SerialModuleConfig {
+  /** Master enable for the Serial module (UART passthrough to an external device). */
+  enabled: boolean;
+  /** Echo received serial bytes back out the port (loopback debug aid). */
+  echo: boolean;
+  /** UART RX GPIO pin (0 = firmware/board default). */
+  rxd: number;
+  /** UART TX GPIO pin (0 = firmware/board default). */
+  txd: number;
+  /** Serial_Baud enum value (0=default, ... see SERIAL_BAUD_OPTIONS). */
+  baud: number;
+  /** Idle timeout in ms before a partial line is flushed (0 = firmware default). */
+  timeout: number;
+  /** Serial_Mode enum value (0=default, 1=simple, 2=proto, 3=textmsg, 4=nmea, 5=caltopo, 6=ws85, 7=ve_direct). */
+  mode: number;
+  /** Epoch ms when this config was last read from the radio. */
+  lastReadAt: number;
+}
+
+export interface AmbientLightingModuleConfig {
+  /** True = the RGB LED is driven; false = LED off. */
+  ledState: boolean;
+  /** LED current register value (board-specific; 0 = default). */
+  current: number;
+  /** Red channel intensity (0-255). */
+  red: number;
+  /** Green channel intensity (0-255). */
+  green: number;
+  /** Blue channel intensity (0-255). */
+  blue: number;
+  /** Epoch ms when this config was last read from the radio. */
+  lastReadAt: number;
+}
+
+export interface PaxcounterModuleConfig {
+  /** Master enable for the Paxcounter module (counts nearby WiFi/BLE devices). */
+  enabled: boolean;
+  /** Seconds between paxcounter broadcasts (0 = firmware default). */
+  updateIntervalSecs: number;
+  /** RSSI threshold for counting a WiFi device (0 = firmware default). */
+  wifiThreshold: number;
+  /** RSSI threshold for counting a BLE device (0 = firmware default). */
+  bleThreshold: number;
+  /** Epoch ms when this config was last read from the radio. */
+  lastReadAt: number;
+}
+
 export interface MqttModuleConfig {
   /** Master enable for the MQTT module on the local radio. */
   enabled: boolean;
@@ -461,6 +508,12 @@ export interface LocalModuleConfigSnapshot {
   detectionSensor?: DetectionSensorModuleConfig;
   /** Authoritative Audio module config (Codec2 voice over LoRa). */
   audio?: AudioModuleConfig;
+  /** Authoritative Serial module config (UART passthrough to external devices). */
+  serial?: SerialModuleConfig;
+  /** Authoritative Ambient Lighting module config (RGB LED control). */
+  ambientLighting?: AmbientLightingModuleConfig;
+  /** Authoritative Paxcounter module config (WiFi/BLE device counting). */
+  paxcounter?: PaxcounterModuleConfig;
   /**
    * Active timed surveys: epoch-ms restore deadlines for any module currently
    * running an accelerated cadence. `null` for any module that's not in survey mode.
@@ -1581,6 +1634,9 @@ export class MeshtasticSerialBridge extends EventEmitter {
               this.requestMqttConfig().catch(() => { /* best-effort */ });
               this.requestDetectionSensorConfig().catch(() => { /* best-effort */ });
               this.requestAudioConfig().catch(() => { /* best-effort */ });
+              this.requestSerialConfig().catch(() => { /* best-effort */ });
+              this.requestAmbientLightingConfig().catch(() => { /* best-effort */ });
+              this.requestPaxcounterConfig().catch(() => { /* best-effort */ });
             }, 500);
           }
         } else if (fieldNumber === 8) {
@@ -3870,6 +3926,12 @@ export class MeshtasticSerialBridge extends EventEmitter {
   private static readonly MODULE_CFG_DETECTION_SENSOR = 11;
   /** ModuleConfigType enum value for Audio (mesh.proto). */
   private static readonly MODULE_CFG_AUDIO = 7;
+  /** ModuleConfigType enum value for Serial (mesh.proto). */
+  private static readonly MODULE_CFG_SERIAL = 1;
+  /** ModuleConfigType enum value for Ambient Lighting (mesh.proto). */
+  private static readonly MODULE_CFG_AMBIENT_LIGHTING = 10;
+  /** ModuleConfigType enum value for Paxcounter (mesh.proto). */
+  private static readonly MODULE_CFG_PAXCOUNTER = 12;
 
   /**
    * Ask the local radio for its current NeighborInfo module config. The reply
@@ -4866,6 +4928,148 @@ export class MeshtasticSerialBridge extends EventEmitter {
     console.log('[MeshtasticSerial] Requested Audio module config readback');
   }
 
+  // ---- Serial module ------------------------------------------------------
+
+  /**
+   * Build AdminMessage { set_module_config: ModuleConfig { serial: ... } }.
+   * Field numbers per module_config.proto:
+   *   ModuleConfig.serial = 2 (length-delim SerialConfig)
+   *   SerialConfig: 1=enabled, 2=echo, 3=rxd, 4=txd, 5=baud (enum),
+   *     6=timeout, 7=mode (enum)
+   */
+  private buildAdminSetSerialConfig(cfg: Omit<SerialModuleConfig, 'lastReadAt'>): Buffer {
+    const sCfg = Buffer.concat([
+      this.encodeTagBool(1, cfg.enabled),
+      this.encodeTagBool(2, cfg.echo),
+      this.encodeTagVarint(3, Math.max(0, Math.floor(cfg.rxd))),
+      this.encodeTagVarint(4, Math.max(0, Math.floor(cfg.txd))),
+      this.encodeTagVarint(5, Math.max(0, Math.floor(cfg.baud))),
+      this.encodeTagVarint(6, Math.max(0, Math.floor(cfg.timeout))),
+      this.encodeTagVarint(7, Math.max(0, Math.floor(cfg.mode))),
+    ]);
+    const moduleConfig = this.encodeTagLen(2, sCfg);     // ModuleConfig.serial
+    return this.encodeTagLen(34, moduleConfig);           // AdminMessage.set_module_config
+  }
+
+  async setSerialConfig(cfg: Omit<SerialModuleConfig, 'lastReadAt'>): Promise<void> {
+    if (!this.isLinkOpen()) throw new Error('Radio not connected');
+    if (!this.localNodeNum) throw new Error('Local node not yet identified — try again in a moment');
+
+    this.sendAdminMessage(this.buildAdminSetSerialConfig(cfg));
+    await new Promise(r => setTimeout(r, 80));
+    this.sendAdminMessage(this.buildAdminCommit());
+
+    console.log(`[MeshtasticSerial] Serial module ${cfg.enabled ? 'ENABLED' : 'DISABLED'} (mode=${cfg.mode} baud=${cfg.baud} rxd=${cfg.rxd} txd=${cfg.txd})`);
+    this.addEvent('TELEMETRY', this.localNodeId || '!local',
+      `Serial module ${cfg.enabled ? 'enabled' : 'disabled'}`);
+
+    this.localModuleConfig.serial = { ...cfg, lastReadAt: Date.now() };
+    this.updateLocalModuleConfig();
+
+    setTimeout(() => { this.requestSerialConfig().catch(() => { /* best-effort */ }); }, 250);
+  }
+
+  async requestSerialConfig(): Promise<void> {
+    if (!this.isLinkOpen()) return;
+    if (!this.localNodeNum) return;
+    const adminPayload = this.encodeTagVarint(3, MeshtasticSerialBridge.MODULE_CFG_SERIAL);
+    this.sendAdminMessage(adminPayload);
+    console.log('[MeshtasticSerial] Requested Serial module config readback');
+  }
+
+  // ---- Ambient Lighting module -------------------------------------------
+
+  /**
+   * Build AdminMessage { set_module_config: ModuleConfig { ambient_lighting: ... } }.
+   * Field numbers per module_config.proto:
+   *   ModuleConfig.ambient_lighting = 11 (length-delim AmbientLightingConfig)
+   *   AmbientLightingConfig: 1=led_state, 2=current, 3=red, 4=green, 5=blue
+   */
+  private buildAdminSetAmbientLightingConfig(cfg: Omit<AmbientLightingModuleConfig, 'lastReadAt'>): Buffer {
+    const clampByte = (n: number) => Math.max(0, Math.min(255, Math.floor(n)));
+    const alCfg = Buffer.concat([
+      this.encodeTagBool(1, cfg.ledState),
+      this.encodeTagVarint(2, Math.max(0, Math.floor(cfg.current))),
+      this.encodeTagVarint(3, clampByte(cfg.red)),
+      this.encodeTagVarint(4, clampByte(cfg.green)),
+      this.encodeTagVarint(5, clampByte(cfg.blue)),
+    ]);
+    const moduleConfig = this.encodeTagLen(11, alCfg);   // ModuleConfig.ambient_lighting
+    return this.encodeTagLen(34, moduleConfig);           // AdminMessage.set_module_config
+  }
+
+  async setAmbientLightingConfig(cfg: Omit<AmbientLightingModuleConfig, 'lastReadAt'>): Promise<void> {
+    if (!this.isLinkOpen()) throw new Error('Radio not connected');
+    if (!this.localNodeNum) throw new Error('Local node not yet identified — try again in a moment');
+
+    this.sendAdminMessage(this.buildAdminSetAmbientLightingConfig(cfg));
+    await new Promise(r => setTimeout(r, 80));
+    this.sendAdminMessage(this.buildAdminCommit());
+
+    console.log(`[MeshtasticSerial] Ambient Lighting module led=${cfg.ledState} rgb=(${cfg.red},${cfg.green},${cfg.blue}) current=${cfg.current}`);
+    this.addEvent('TELEMETRY', this.localNodeId || '!local',
+      `Ambient Lighting ${cfg.ledState ? 'on' : 'off'}`);
+
+    this.localModuleConfig.ambientLighting = { ...cfg, lastReadAt: Date.now() };
+    this.updateLocalModuleConfig();
+
+    setTimeout(() => { this.requestAmbientLightingConfig().catch(() => { /* best-effort */ }); }, 250);
+  }
+
+  async requestAmbientLightingConfig(): Promise<void> {
+    if (!this.isLinkOpen()) return;
+    if (!this.localNodeNum) return;
+    const adminPayload = this.encodeTagVarint(3, MeshtasticSerialBridge.MODULE_CFG_AMBIENT_LIGHTING);
+    this.sendAdminMessage(adminPayload);
+    console.log('[MeshtasticSerial] Requested Ambient Lighting module config readback');
+  }
+
+  // ---- Paxcounter module --------------------------------------------------
+
+  /**
+   * Build AdminMessage { set_module_config: ModuleConfig { paxcounter: ... } }.
+   * Field numbers per module_config.proto:
+   *   ModuleConfig.paxcounter = 13 (length-delim PaxcounterConfig)
+   *   PaxcounterConfig: 1=enabled, 2=paxcounter_update_interval,
+   *     3=wifi_threshold, 4=ble_threshold
+   */
+  private buildAdminSetPaxcounterConfig(cfg: Omit<PaxcounterModuleConfig, 'lastReadAt'>): Buffer {
+    const pCfg = Buffer.concat([
+      this.encodeTagBool(1, cfg.enabled),
+      this.encodeTagVarint(2, Math.max(0, Math.floor(cfg.updateIntervalSecs))),
+      this.encodeTagVarint(3, Math.max(0, Math.floor(cfg.wifiThreshold))),
+      this.encodeTagVarint(4, Math.max(0, Math.floor(cfg.bleThreshold))),
+    ]);
+    const moduleConfig = this.encodeTagLen(13, pCfg);    // ModuleConfig.paxcounter
+    return this.encodeTagLen(34, moduleConfig);           // AdminMessage.set_module_config
+  }
+
+  async setPaxcounterConfig(cfg: Omit<PaxcounterModuleConfig, 'lastReadAt'>): Promise<void> {
+    if (!this.isLinkOpen()) throw new Error('Radio not connected');
+    if (!this.localNodeNum) throw new Error('Local node not yet identified — try again in a moment');
+
+    this.sendAdminMessage(this.buildAdminSetPaxcounterConfig(cfg));
+    await new Promise(r => setTimeout(r, 80));
+    this.sendAdminMessage(this.buildAdminCommit());
+
+    console.log(`[MeshtasticSerial] Paxcounter module ${cfg.enabled ? 'ENABLED' : 'DISABLED'} (interval=${cfg.updateIntervalSecs}s wifi=${cfg.wifiThreshold} ble=${cfg.bleThreshold})`);
+    this.addEvent('TELEMETRY', this.localNodeId || '!local',
+      `Paxcounter module ${cfg.enabled ? 'enabled' : 'disabled'}`);
+
+    this.localModuleConfig.paxcounter = { ...cfg, lastReadAt: Date.now() };
+    this.updateLocalModuleConfig();
+
+    setTimeout(() => { this.requestPaxcounterConfig().catch(() => { /* best-effort */ }); }, 250);
+  }
+
+  async requestPaxcounterConfig(): Promise<void> {
+    if (!this.isLinkOpen()) return;
+    if (!this.localNodeNum) return;
+    const adminPayload = this.encodeTagVarint(3, MeshtasticSerialBridge.MODULE_CFG_PAXCOUNTER);
+    this.sendAdminMessage(adminPayload);
+    console.log('[MeshtasticSerial] Requested Paxcounter module config readback');
+  }
+
   /**
    * Parse an inbound PORT_ADMIN_APP packet. We're looking for
    * `get_module_config_response` (AdminMessage field 4) which contains a
@@ -5021,6 +5225,24 @@ export class MeshtasticSerialBridge extends EventEmitter {
           this.localModuleConfig.audio = { ...cfg, lastReadAt: Date.now() };
           console.log(`[MeshtasticSerial] Audio readback: codec2=${cfg.codec2Enabled} ptt=${cfg.pttPin} bitrate=${cfg.bitrate}`);
           this.updateLocalModuleConfig();
+        } else if (fieldNumber === 2) {
+          // ModuleConfig.serial (SerialConfig)
+          const cfg = this.parseSerialConfigSub(sub);
+          this.localModuleConfig.serial = { ...cfg, lastReadAt: Date.now() };
+          console.log(`[MeshtasticSerial] Serial readback: enabled=${cfg.enabled} mode=${cfg.mode} baud=${cfg.baud} rxd=${cfg.rxd} txd=${cfg.txd} echo=${cfg.echo}`);
+          this.updateLocalModuleConfig();
+        } else if (fieldNumber === 11) {
+          // ModuleConfig.ambient_lighting (AmbientLightingConfig)
+          const cfg = this.parseAmbientLightingConfigSub(sub);
+          this.localModuleConfig.ambientLighting = { ...cfg, lastReadAt: Date.now() };
+          console.log(`[MeshtasticSerial] Ambient Lighting readback: led=${cfg.ledState} rgb=(${cfg.red},${cfg.green},${cfg.blue}) current=${cfg.current}`);
+          this.updateLocalModuleConfig();
+        } else if (fieldNumber === 13) {
+          // ModuleConfig.paxcounter (PaxcounterConfig)
+          const cfg = this.parsePaxcounterConfigSub(sub);
+          this.localModuleConfig.paxcounter = { ...cfg, lastReadAt: Date.now() };
+          console.log(`[MeshtasticSerial] Paxcounter readback: enabled=${cfg.enabled} interval=${cfg.updateIntervalSecs}s wifi=${cfg.wifiThreshold} ble=${cfg.bleThreshold}`);
+          this.updateLocalModuleConfig();
         }
       } else if (wireType === 0) {
         const { bytesRead } = this.readVarint(buf, offset);
@@ -5143,6 +5365,83 @@ export class MeshtasticSerialBridge extends EventEmitter {
       } else { break; }
     }
     return { codec2Enabled, pttPin, bitrate, i2sWs, i2sSd, i2sDin, i2sSck };
+  }
+
+  private parseSerialConfigSub(buf: Buffer): Omit<SerialModuleConfig, 'lastReadAt'> {
+    let enabled = false;
+    let echo = false;
+    let rxd = 0;
+    let txd = 0;
+    let baud = 0;
+    let timeout = 0;
+    let mode = 0;
+    let offset = 0;
+
+    while (offset < buf.length) {
+      const tag = buf[offset++];
+      const fieldNumber = tag >> 3;
+      const wireType = tag & 0x07;
+      if (wireType === 0) {
+        const { value, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (fieldNumber === 1) enabled = value !== 0;
+        else if (fieldNumber === 2) echo = value !== 0;
+        else if (fieldNumber === 3) rxd = value;
+        else if (fieldNumber === 4) txd = value;
+        else if (fieldNumber === 5) baud = value;
+        else if (fieldNumber === 6) timeout = value;
+        else if (fieldNumber === 7) mode = value;
+      } else { break; }
+    }
+    return { enabled, echo, rxd, txd, baud, timeout, mode };
+  }
+
+  private parseAmbientLightingConfigSub(buf: Buffer): Omit<AmbientLightingModuleConfig, 'lastReadAt'> {
+    let ledState = false;
+    let current = 0;
+    let red = 0;
+    let green = 0;
+    let blue = 0;
+    let offset = 0;
+
+    while (offset < buf.length) {
+      const tag = buf[offset++];
+      const fieldNumber = tag >> 3;
+      const wireType = tag & 0x07;
+      if (wireType === 0) {
+        const { value, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (fieldNumber === 1) ledState = value !== 0;
+        else if (fieldNumber === 2) current = value;
+        else if (fieldNumber === 3) red = value;
+        else if (fieldNumber === 4) green = value;
+        else if (fieldNumber === 5) blue = value;
+      } else { break; }
+    }
+    return { ledState, current, red, green, blue };
+  }
+
+  private parsePaxcounterConfigSub(buf: Buffer): Omit<PaxcounterModuleConfig, 'lastReadAt'> {
+    let enabled = false;
+    let updateIntervalSecs = 0;
+    let wifiThreshold = 0;
+    let bleThreshold = 0;
+    let offset = 0;
+
+    while (offset < buf.length) {
+      const tag = buf[offset++];
+      const fieldNumber = tag >> 3;
+      const wireType = tag & 0x07;
+      if (wireType === 0) {
+        const { value, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (fieldNumber === 1) enabled = value !== 0;
+        else if (fieldNumber === 2) updateIntervalSecs = value;
+        else if (fieldNumber === 3) wifiThreshold = value;
+        else if (fieldNumber === 4) bleThreshold = value;
+      } else { break; }
+    }
+    return { enabled, updateIntervalSecs, wifiThreshold, bleThreshold };
   }
 
   private parseMqttConfigSub(buf: Buffer): Omit<MqttModuleConfig, 'lastReadAt'> {

@@ -2497,8 +2497,17 @@ function ModulesSection({ localModuleConfig, radioConnected }: SettingsModalProp
       {/* Audio (Codec2 over LoRa) */}
       <AudioModuleCard radioConnected={radioConnected} a={localModuleConfig.audio} />
 
+      {/* Serial (UART passthrough) */}
+      <SerialModuleCard radioConnected={radioConnected} s={localModuleConfig.serial} />
+
+      {/* Ambient Lighting (RGB LED) */}
+      <AmbientLightingModuleCard radioConnected={radioConnected} al={localModuleConfig.ambientLighting} />
+
+      {/* Paxcounter (WiFi/BLE device counting) */}
+      <PaxcounterModuleCard radioConnected={radioConnected} px={localModuleConfig.paxcounter} />
+
       <p className="text-[10px] text-brand-muted leading-relaxed">
-        Eight modules now configurable end-to-end. Canned Messages, Remote Hardware, Ambient Lighting, and Paxcounter remain on the roadmap.
+        Eleven modules now configurable end-to-end. Remote Hardware remains on the roadmap.
       </p>
     </div>
   );
@@ -4341,6 +4350,557 @@ function AudioModuleCard({ radioConnected, a }: {
             : a
               ? 'Set by you (no readback yet)'
               : 'No readback yet — Save will apply your values'}
+        </p>
+        <button
+          onClick={handleSave}
+          disabled={!radioConnected || busy || !dirty}
+          className="flex items-center gap-1.5 bg-brand-accent/20 hover:bg-brand-accent/30 border border-brand-accent/50 text-brand-accent text-xs font-bold uppercase tracking-widest rounded px-3 py-1.5 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          {busy ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
+          {busy ? 'Saving…' : dirty ? 'Save' : 'No changes'}
+        </button>
+      </div>
+
+      {status && (
+        <p className={`text-[10px] leading-snug ${status.kind === 'ok' ? 'text-brand-accent' : 'text-brand-error'}`}>
+          {status.text}
+        </p>
+      )}
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------
+// Serial module — UART passthrough to an external device
+// ----------------------------------------------------------------------------
+const SERIAL_BAUD_OPTIONS = [
+  { value: 0, label: 'Default' },
+  { value: 4, label: '1200 baud' },
+  { value: 7, label: '9600 baud' },
+  { value: 8, label: '19200 baud' },
+  { value: 9, label: '38400 baud' },
+  { value: 10, label: '57600 baud' },
+  { value: 11, label: '115200 baud' },
+  { value: 12, label: '230400 baud' },
+];
+const SERIAL_MODE_OPTIONS = [
+  { value: 0, label: 'Default' },
+  { value: 1, label: 'Simple (raw passthrough)' },
+  { value: 2, label: 'Proto (framed)' },
+  { value: 3, label: 'Text messages' },
+  { value: 4, label: 'NMEA (GPS out)' },
+  { value: 5, label: 'CalTopo' },
+  { value: 6, label: 'WS85 weather station' },
+  { value: 7, label: 'VE.Direct (Victron)' },
+];
+
+function SerialModuleCard({ radioConnected, s }: {
+  radioConnected: boolean;
+  s: import('../types').SerialModuleConfig | undefined;
+}) {
+  const [enabled, setEnabled] = React.useState<boolean>(s?.enabled ?? false);
+  const [echo, setEcho] = React.useState<boolean>(s?.echo ?? false);
+  const [rxd, setRxd] = React.useState<number>(s?.rxd ?? 0);
+  const [txd, setTxd] = React.useState<number>(s?.txd ?? 0);
+  const [baud, setBaud] = React.useState<number>(s?.baud ?? 0);
+  const [timeout, setTimeoutMs] = React.useState<number>(s?.timeout ?? 0);
+  const [mode, setMode] = React.useState<number>(s?.mode ?? 0);
+
+  const [busy, setBusy] = React.useState(false);
+  const [refreshing, setRefreshing] = React.useState(false);
+  const [status, setStatus] = React.useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
+
+  const lastSyncedRef = React.useRef<number | null>(null);
+  React.useEffect(() => {
+    if (!s || busy) return;
+    if (lastSyncedRef.current === s.lastReadAt) return;
+    lastSyncedRef.current = s.lastReadAt;
+    setEnabled(s.enabled);
+    setEcho(s.echo);
+    setRxd(s.rxd);
+    setTxd(s.txd);
+    setBaud(s.baud);
+    setTimeoutMs(s.timeout);
+    setMode(s.mode);
+  }, [s?.lastReadAt, s, busy]);
+
+  const dirty = !s
+    ? true
+    : (enabled !== s.enabled || echo !== s.echo || rxd !== s.rxd || txd !== s.txd ||
+       baud !== s.baud || timeout !== s.timeout || mode !== s.mode);
+
+  const handleSave = async () => {
+    setBusy(true);
+    setStatus(null);
+    const r = await meshDataService.setSerialConfig({ enabled, echo, rxd, txd, baud, timeout, mode });
+    setBusy(false);
+    if (r.ok) setStatus({ kind: 'ok', text: 'Saved — radio is committing the new config' });
+    else setStatus({ kind: 'error', text: r.error ?? 'Save failed' });
+  };
+
+  const handleRefresh = async () => {
+    setRefreshing(true);
+    setStatus(null);
+    const r = await meshDataService.refreshSerialConfig();
+    setRefreshing(false);
+    if (!r.ok) setStatus({ kind: 'error', text: r.error ?? 'Refresh failed' });
+  };
+
+  const lastReadLabel = s?.lastReadAt
+    ? new Date(s.lastReadAt).toLocaleString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' })
+    : null;
+
+  return (
+    <div className="bg-brand-line/40 border border-brand-line rounded-lg p-4 space-y-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <div className="flex items-center gap-2">
+            <Network size={14} className="text-brand-accent" />
+            <h5 className="text-xs font-bold uppercase tracking-tight text-brand-ink">Serial</h5>
+            {s && (
+              <span className={cn(
+                'text-[9px] uppercase font-bold mono-text px-1.5 py-0.5 rounded border',
+                s.enabled
+                  ? 'text-brand-accent bg-brand-accent/10 border-brand-accent/30'
+                  : 'text-brand-muted bg-brand-line border-brand-line',
+              )}>
+                {s.enabled ? 'Enabled' : 'Disabled'}
+              </span>
+            )}
+            {!s && radioConnected && (
+              <span className="text-[9px] uppercase font-bold mono-text px-1.5 py-0.5 rounded border border-brand-line text-brand-muted bg-brand-line">
+                Reading…
+              </span>
+            )}
+          </div>
+          <p className="text-[11px] text-brand-muted mt-1 leading-relaxed">
+            UART passthrough to a wired peripheral — GPS feeds, weather stations (WS85), Victron solar (VE.Direct), or raw text bridging. Leave disabled unless you have a device wired to the radio's TX/RX pins.
+          </p>
+        </div>
+        <button
+          onClick={handleRefresh}
+          disabled={!radioConnected || refreshing}
+          title="Re-read the config from the radio"
+          className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest text-brand-muted hover:text-brand-ink border border-brand-line hover:border-brand-muted rounded px-2 py-1 transition-colors disabled:opacity-50"
+        >
+          <RefreshCw size={10} className={refreshing ? 'animate-spin' : ''} />
+          {refreshing ? '...' : 'Refresh'}
+        </button>
+      </div>
+
+      <label className="flex items-center justify-between cursor-pointer">
+        <div>
+          <p className="text-xs font-bold text-brand-ink">Serial module enabled</p>
+          <p className="text-[10px] text-brand-muted">Master switch — disables every Serial control below when off.</p>
+        </div>
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={e => setEnabled(e.target.checked)}
+          disabled={!radioConnected}
+          className="w-4 h-4 accent-emerald-500"
+        />
+      </label>
+
+      <div className="grid grid-cols-2 gap-3">
+        <div className="space-y-1">
+          <label className="text-[10px] uppercase font-bold text-brand-muted block">Mode</label>
+          <select
+            value={mode}
+            onChange={e => setMode(parseInt(e.target.value, 10))}
+            disabled={!radioConnected || !enabled}
+            className="w-full bg-brand-line text-xs rounded px-3 py-2 border border-brand-line hover:border-brand-muted focus:outline-none focus:border-brand-accent/50 disabled:opacity-50"
+          >
+            {SERIAL_MODE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+          </select>
+        </div>
+        <div className="space-y-1">
+          <label className="text-[10px] uppercase font-bold text-brand-muted block">Baud</label>
+          <select
+            value={baud}
+            onChange={e => setBaud(parseInt(e.target.value, 10))}
+            disabled={!radioConnected || !enabled}
+            className="w-full bg-brand-line text-xs rounded px-3 py-2 border border-brand-line hover:border-brand-muted focus:outline-none focus:border-brand-accent/50 disabled:opacity-50"
+          >
+            {SERIAL_BAUD_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+          </select>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-3 gap-2">
+        <div className="space-y-1">
+          <label className="text-[10px] uppercase font-bold text-brand-muted block">RX pin</label>
+          <input
+            type="number" min={0} max={64} value={rxd}
+            onChange={e => setRxd(Math.max(0, Math.min(64, parseInt(e.target.value, 10) || 0)))}
+            disabled={!radioConnected || !enabled}
+            className="w-full bg-brand-line text-xs mono-text rounded px-2 py-1.5 border border-brand-line hover:border-brand-muted focus:outline-none focus:border-brand-accent/50 disabled:opacity-50"
+          />
+        </div>
+        <div className="space-y-1">
+          <label className="text-[10px] uppercase font-bold text-brand-muted block">TX pin</label>
+          <input
+            type="number" min={0} max={64} value={txd}
+            onChange={e => setTxd(Math.max(0, Math.min(64, parseInt(e.target.value, 10) || 0)))}
+            disabled={!radioConnected || !enabled}
+            className="w-full bg-brand-line text-xs mono-text rounded px-2 py-1.5 border border-brand-line hover:border-brand-muted focus:outline-none focus:border-brand-accent/50 disabled:opacity-50"
+          />
+        </div>
+        <div className="space-y-1">
+          <label className="text-[10px] uppercase font-bold text-brand-muted block">Timeout (ms)</label>
+          <input
+            type="number" min={0} max={60000} value={timeout}
+            onChange={e => setTimeoutMs(Math.max(0, Math.min(60000, parseInt(e.target.value, 10) || 0)))}
+            disabled={!radioConnected || !enabled}
+            className="w-full bg-brand-line text-xs mono-text rounded px-2 py-1.5 border border-brand-line hover:border-brand-muted focus:outline-none focus:border-brand-accent/50 disabled:opacity-50"
+          />
+        </div>
+      </div>
+
+      <label className="flex items-center justify-between cursor-pointer">
+        <div>
+          <p className="text-xs font-bold text-brand-ink">Echo</p>
+          <p className="text-[10px] text-brand-muted">Loop received bytes back out the port (debug aid).</p>
+        </div>
+        <input
+          type="checkbox"
+          checked={echo}
+          onChange={e => setEcho(e.target.checked)}
+          disabled={!radioConnected || !enabled}
+          className="w-4 h-4 accent-emerald-500"
+        />
+      </label>
+
+      <div className="flex items-center justify-between gap-2 pt-2 border-t border-brand-line">
+        <p className="text-[9px] mono-text text-brand-muted">
+          {lastReadLabel ? `Last read: ${lastReadLabel}` : s ? 'Set by you (no readback yet)' : 'No readback yet — Save will apply your values'}
+        </p>
+        <button
+          onClick={handleSave}
+          disabled={!radioConnected || busy || !dirty}
+          className="flex items-center gap-1.5 bg-brand-accent/20 hover:bg-brand-accent/30 border border-brand-accent/50 text-brand-accent text-xs font-bold uppercase tracking-widest rounded px-3 py-1.5 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          {busy ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
+          {busy ? 'Saving…' : dirty ? 'Save' : 'No changes'}
+        </button>
+      </div>
+
+      {status && (
+        <p className={`text-[10px] leading-snug ${status.kind === 'ok' ? 'text-brand-accent' : 'text-brand-error'}`}>
+          {status.text}
+        </p>
+      )}
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------
+// Ambient Lighting module — onboard RGB LED control
+// ----------------------------------------------------------------------------
+function AmbientLightingModuleCard({ radioConnected, al }: {
+  radioConnected: boolean;
+  al: import('../types').AmbientLightingModuleConfig | undefined;
+}) {
+  const [ledState, setLedState] = React.useState<boolean>(al?.ledState ?? false);
+  const [current, setCurrent] = React.useState<number>(al?.current ?? 10);
+  const [red, setRed] = React.useState<number>(al?.red ?? 0);
+  const [green, setGreen] = React.useState<number>(al?.green ?? 0);
+  const [blue, setBlue] = React.useState<number>(al?.blue ?? 0);
+
+  const [busy, setBusy] = React.useState(false);
+  const [refreshing, setRefreshing] = React.useState(false);
+  const [status, setStatus] = React.useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
+
+  const lastSyncedRef = React.useRef<number | null>(null);
+  React.useEffect(() => {
+    if (!al || busy) return;
+    if (lastSyncedRef.current === al.lastReadAt) return;
+    lastSyncedRef.current = al.lastReadAt;
+    setLedState(al.ledState);
+    setCurrent(al.current);
+    setRed(al.red);
+    setGreen(al.green);
+    setBlue(al.blue);
+  }, [al?.lastReadAt, al, busy]);
+
+  const dirty = !al
+    ? true
+    : (ledState !== al.ledState || current !== al.current ||
+       red !== al.red || green !== al.green || blue !== al.blue);
+
+  const handleSave = async () => {
+    setBusy(true);
+    setStatus(null);
+    const r = await meshDataService.setAmbientLightingConfig({ ledState, current, red, green, blue });
+    setBusy(false);
+    if (r.ok) setStatus({ kind: 'ok', text: 'Saved — radio is committing the new config' });
+    else setStatus({ kind: 'error', text: r.error ?? 'Save failed' });
+  };
+
+  const handleRefresh = async () => {
+    setRefreshing(true);
+    setStatus(null);
+    const r = await meshDataService.refreshAmbientLightingConfig();
+    setRefreshing(false);
+    if (!r.ok) setStatus({ kind: 'error', text: r.error ?? 'Refresh failed' });
+  };
+
+  const lastReadLabel = al?.lastReadAt
+    ? new Date(al.lastReadAt).toLocaleString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' })
+    : null;
+
+  const swatch = `rgb(${red}, ${green}, ${blue})`;
+  const channel = (val: number, set: (v: number) => void, label: string, accent: string) => (
+    <div className="space-y-1">
+      <label className="text-[10px] uppercase font-bold text-brand-muted block">{label} <span className="mono-text text-brand-ink">{val}</span></label>
+      <input
+        type="range" min={0} max={255} value={val}
+        onChange={e => set(parseInt(e.target.value, 10))}
+        disabled={!radioConnected || !ledState}
+        className="w-full disabled:opacity-50"
+        style={{ accentColor: accent }}
+      />
+    </div>
+  );
+
+  return (
+    <div className="bg-brand-line/40 border border-brand-line rounded-lg p-4 space-y-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <div className="flex items-center gap-2">
+            <Network size={14} className="text-brand-accent" />
+            <h5 className="text-xs font-bold uppercase tracking-tight text-brand-ink">Ambient Lighting</h5>
+            {al && (
+              <span className={cn(
+                'text-[9px] uppercase font-bold mono-text px-1.5 py-0.5 rounded border',
+                al.ledState
+                  ? 'text-brand-accent bg-brand-accent/10 border-brand-accent/30'
+                  : 'text-brand-muted bg-brand-line border-brand-line',
+              )}>
+                {al.ledState ? 'On' : 'Off'}
+              </span>
+            )}
+            {!al && radioConnected && (
+              <span className="text-[9px] uppercase font-bold mono-text px-1.5 py-0.5 rounded border border-brand-line text-brand-muted bg-brand-line">
+                Reading…
+              </span>
+            )}
+          </div>
+          <p className="text-[11px] text-brand-muted mt-1 leading-relaxed">
+            Drives an onboard or attached WS2812/NeoPixel RGB LED. Only boards with the LED wired (e.g. some Heltec / RAK variants) will respond.
+          </p>
+        </div>
+        <button
+          onClick={handleRefresh}
+          disabled={!radioConnected || refreshing}
+          title="Re-read the config from the radio"
+          className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest text-brand-muted hover:text-brand-ink border border-brand-line hover:border-brand-muted rounded px-2 py-1 transition-colors disabled:opacity-50"
+        >
+          <RefreshCw size={10} className={refreshing ? 'animate-spin' : ''} />
+          {refreshing ? '...' : 'Refresh'}
+        </button>
+      </div>
+
+      <label className="flex items-center justify-between cursor-pointer">
+        <div>
+          <p className="text-xs font-bold text-brand-ink">LED on</p>
+          <p className="text-[10px] text-brand-muted">Master switch — disables the color controls below when off.</p>
+        </div>
+        <input
+          type="checkbox"
+          checked={ledState}
+          onChange={e => setLedState(e.target.checked)}
+          disabled={!radioConnected}
+          className="w-4 h-4 accent-emerald-500"
+        />
+      </label>
+
+      <div className="flex items-center gap-3">
+        <div
+          className="w-10 h-10 rounded border border-brand-line flex-shrink-0"
+          style={{ background: ledState ? swatch : 'transparent' }}
+          title={swatch}
+        />
+        <div className="flex-1 grid grid-cols-3 gap-3">
+          {channel(red, setRed, 'Red', '#ef4444')}
+          {channel(green, setGreen, 'Green', '#22c55e')}
+          {channel(blue, setBlue, 'Blue', '#3b82f6')}
+        </div>
+      </div>
+
+      <div className="space-y-1">
+        <label className="text-[10px] uppercase font-bold text-brand-muted block">LED current <span className="mono-text text-brand-ink">{current}</span></label>
+        <input
+          type="number" min={0} max={255} value={current}
+          onChange={e => setCurrent(Math.max(0, Math.min(255, parseInt(e.target.value, 10) || 0)))}
+          disabled={!radioConnected || !ledState}
+          className="w-full bg-brand-line text-xs mono-text rounded px-2 py-1.5 border border-brand-line hover:border-brand-muted focus:outline-none focus:border-brand-accent/50 disabled:opacity-50"
+        />
+        <p className="text-[10px] text-brand-muted">Driver current register (board-specific; lower = dimmer). Leave at default if unsure.</p>
+      </div>
+
+      <div className="flex items-center justify-between gap-2 pt-2 border-t border-brand-line">
+        <p className="text-[9px] mono-text text-brand-muted">
+          {lastReadLabel ? `Last read: ${lastReadLabel}` : al ? 'Set by you (no readback yet)' : 'No readback yet — Save will apply your values'}
+        </p>
+        <button
+          onClick={handleSave}
+          disabled={!radioConnected || busy || !dirty}
+          className="flex items-center gap-1.5 bg-brand-accent/20 hover:bg-brand-accent/30 border border-brand-accent/50 text-brand-accent text-xs font-bold uppercase tracking-widest rounded px-3 py-1.5 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          {busy ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
+          {busy ? 'Saving…' : dirty ? 'Save' : 'No changes'}
+        </button>
+      </div>
+
+      {status && (
+        <p className={`text-[10px] leading-snug ${status.kind === 'ok' ? 'text-brand-accent' : 'text-brand-error'}`}>
+          {status.text}
+        </p>
+      )}
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------
+// Paxcounter module — count nearby WiFi / BLE devices (foot-traffic estimation)
+// ----------------------------------------------------------------------------
+function PaxcounterModuleCard({ radioConnected, px }: {
+  radioConnected: boolean;
+  px: import('../types').PaxcounterModuleConfig | undefined;
+}) {
+  const [enabled, setEnabled] = React.useState<boolean>(px?.enabled ?? false);
+  const [updateIntervalSecs, setUpdateIntervalSecs] = React.useState<number>(px?.updateIntervalSecs ?? 0);
+  const [wifiThreshold, setWifiThreshold] = React.useState<number>(px?.wifiThreshold ?? 0);
+  const [bleThreshold, setBleThreshold] = React.useState<number>(px?.bleThreshold ?? 0);
+
+  const [busy, setBusy] = React.useState(false);
+  const [refreshing, setRefreshing] = React.useState(false);
+  const [status, setStatus] = React.useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
+
+  const lastSyncedRef = React.useRef<number | null>(null);
+  React.useEffect(() => {
+    if (!px || busy) return;
+    if (lastSyncedRef.current === px.lastReadAt) return;
+    lastSyncedRef.current = px.lastReadAt;
+    setEnabled(px.enabled);
+    setUpdateIntervalSecs(px.updateIntervalSecs);
+    setWifiThreshold(px.wifiThreshold);
+    setBleThreshold(px.bleThreshold);
+  }, [px?.lastReadAt, px, busy]);
+
+  const dirty = !px
+    ? true
+    : (enabled !== px.enabled || updateIntervalSecs !== px.updateIntervalSecs ||
+       wifiThreshold !== px.wifiThreshold || bleThreshold !== px.bleThreshold);
+
+  const handleSave = async () => {
+    setBusy(true);
+    setStatus(null);
+    const r = await meshDataService.setPaxcounterConfig({ enabled, updateIntervalSecs, wifiThreshold, bleThreshold });
+    setBusy(false);
+    if (r.ok) setStatus({ kind: 'ok', text: 'Saved — radio is committing the new config' });
+    else setStatus({ kind: 'error', text: r.error ?? 'Save failed' });
+  };
+
+  const handleRefresh = async () => {
+    setRefreshing(true);
+    setStatus(null);
+    const r = await meshDataService.refreshPaxcounterConfig();
+    setRefreshing(false);
+    if (!r.ok) setStatus({ kind: 'error', text: r.error ?? 'Refresh failed' });
+  };
+
+  const lastReadLabel = px?.lastReadAt
+    ? new Date(px.lastReadAt).toLocaleString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' })
+    : null;
+
+  return (
+    <div className="bg-brand-line/40 border border-brand-line rounded-lg p-4 space-y-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <div className="flex items-center gap-2">
+            <Network size={14} className="text-brand-accent" />
+            <h5 className="text-xs font-bold uppercase tracking-tight text-brand-ink">Paxcounter</h5>
+            {px && (
+              <span className={cn(
+                'text-[9px] uppercase font-bold mono-text px-1.5 py-0.5 rounded border',
+                px.enabled
+                  ? 'text-brand-accent bg-brand-accent/10 border-brand-accent/30'
+                  : 'text-brand-muted bg-brand-line border-brand-line',
+              )}>
+                {px.enabled ? 'Enabled' : 'Disabled'}
+              </span>
+            )}
+            {!px && radioConnected && (
+              <span className="text-[9px] uppercase font-bold mono-text px-1.5 py-0.5 rounded border border-brand-line text-brand-muted bg-brand-line">
+                Reading…
+              </span>
+            )}
+          </div>
+          <p className="text-[11px] text-brand-muted mt-1 leading-relaxed">
+            Counts nearby WiFi + BLE devices as a rough foot-traffic estimate and broadcasts the tally as telemetry. Privacy-preserving — it counts, it doesn't track. Repurposes the radio's WiFi/BLE, so it won't pair with a phone while active.
+          </p>
+        </div>
+        <button
+          onClick={handleRefresh}
+          disabled={!radioConnected || refreshing}
+          title="Re-read the config from the radio"
+          className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest text-brand-muted hover:text-brand-ink border border-brand-line hover:border-brand-muted rounded px-2 py-1 transition-colors disabled:opacity-50"
+        >
+          <RefreshCw size={10} className={refreshing ? 'animate-spin' : ''} />
+          {refreshing ? '...' : 'Refresh'}
+        </button>
+      </div>
+
+      <label className="flex items-center justify-between cursor-pointer">
+        <div>
+          <p className="text-xs font-bold text-brand-ink">Paxcounter enabled</p>
+          <p className="text-[10px] text-brand-muted">Master switch — disables the controls below when off.</p>
+        </div>
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={e => setEnabled(e.target.checked)}
+          disabled={!radioConnected}
+          className="w-4 h-4 accent-emerald-500"
+        />
+      </label>
+
+      <div className="grid grid-cols-3 gap-2">
+        <div className="space-y-1">
+          <label className="text-[10px] uppercase font-bold text-brand-muted block">Interval (s)</label>
+          <input
+            type="number" min={0} max={86400} value={updateIntervalSecs}
+            onChange={e => setUpdateIntervalSecs(Math.max(0, Math.min(86400, parseInt(e.target.value, 10) || 0)))}
+            disabled={!radioConnected || !enabled}
+            className="w-full bg-brand-line text-xs mono-text rounded px-2 py-1.5 border border-brand-line hover:border-brand-muted focus:outline-none focus:border-brand-accent/50 disabled:opacity-50"
+          />
+        </div>
+        <div className="space-y-1">
+          <label className="text-[10px] uppercase font-bold text-brand-muted block">WiFi thresh</label>
+          <input
+            type="number" min={0} max={255} value={wifiThreshold}
+            onChange={e => setWifiThreshold(Math.max(0, Math.min(255, parseInt(e.target.value, 10) || 0)))}
+            disabled={!radioConnected || !enabled}
+            className="w-full bg-brand-line text-xs mono-text rounded px-2 py-1.5 border border-brand-line hover:border-brand-muted focus:outline-none focus:border-brand-accent/50 disabled:opacity-50"
+          />
+        </div>
+        <div className="space-y-1">
+          <label className="text-[10px] uppercase font-bold text-brand-muted block">BLE thresh</label>
+          <input
+            type="number" min={0} max={255} value={bleThreshold}
+            onChange={e => setBleThreshold(Math.max(0, Math.min(255, parseInt(e.target.value, 10) || 0)))}
+            disabled={!radioConnected || !enabled}
+            className="w-full bg-brand-line text-xs mono-text rounded px-2 py-1.5 border border-brand-line hover:border-brand-muted focus:outline-none focus:border-brand-accent/50 disabled:opacity-50"
+          />
+        </div>
+      </div>
+      <p className="text-[10px] text-brand-muted leading-snug">Interval 0 = firmware default. Thresholds 0 = firmware default; raise to ignore weak/distant signals.</p>
+
+      <div className="flex items-center justify-between gap-2 pt-2 border-t border-brand-line">
+        <p className="text-[9px] mono-text text-brand-muted">
+          {lastReadLabel ? `Last read: ${lastReadLabel}` : px ? 'Set by you (no readback yet)' : 'No readback yet — Save will apply your values'}
         </p>
         <button
           onClick={handleSave}
