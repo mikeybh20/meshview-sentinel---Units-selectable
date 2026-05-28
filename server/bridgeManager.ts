@@ -32,7 +32,7 @@ const FORWARDED_EVENTS = [
   'channelUpdate', 'waypointsChanged', 'traceUpdate',
   'neighborInfoUpdate', 'storeForwardUpdate',
   'localModuleConfigUpdate', 'loraConfigUpdate',
-  'networkConfigUpdate', 'powerConfigUpdate',
+  'networkConfigUpdate', 'powerConfigUpdate', 'cannedMessagesUpdate',
   'ackUpdate', 'bbsMail', 'bbsSubscriber',
 ] as const;
 
@@ -250,10 +250,12 @@ class BridgeManager extends EventEmitter {
     bridge.requestLoraConfig().catch(err => {
       console.warn('[BridgeManager] initial LoRa readback failed:', err?.message ?? err);
     });
-    // v2.0 Beta 2: also ask for Network + Power configs so the Radios view
-    // has them on first paint without the operator clicking Refresh.
+    // v2.0 Beta 2: also ask for Network + Power configs + canned messages so
+    // the Radios view + quick-send palette have them on first paint without
+    // the operator clicking Refresh.
     bridge.requestNetworkConfig().catch(() => {});
     bridge.requestPowerConfig().catch(() => {});
+    bridge.requestCannedMessages().catch(() => {});
   }
 
   private guessTarget(bridge: MeshtasticSerialBridge): string {
@@ -345,9 +347,11 @@ class BridgeManager extends EventEmitter {
       bridge.requestLoraConfig().catch(err => {
         console.warn(`[BridgeManager] LoRa readback failed for ${radioId}:`, err?.message ?? err);
       });
-      // v2.0 Beta 2: same Network + Power readbacks as the default radio path.
+      // v2.0 Beta 2: same Network + Power + canned-message readbacks as the
+      // default radio path.
       bridge.requestNetworkConfig().catch(() => {});
       bridge.requestPowerConfig().catch(() => {});
+      bridge.requestCannedMessages().catch(() => {});
     };
     bridge.on('nodeUpdate', fireOnIdentityKnown);
 

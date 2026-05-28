@@ -12,6 +12,8 @@ import { meshDataService } from '../../services/meshDataService';
 import { parseMentions } from '../../lib/mentions';
 import { useRadios } from '../../hooks/useRadios';
 
+const API_BASE = import.meta.env.VITE_API_URL || '';
+
 interface MessagesViewProps {
   nodes: Node[];
   messages: Message[];
@@ -221,13 +223,31 @@ export function MessagesView({
   const [highlightId, setHighlightId] = React.useState<string | null>(null);
 
   // v2.0 multi-radio: look up the per-radio color for the message chip.
-  const { radios } = useRadios();
+  const { radios, selectedRadioId, defaultRadioId } = useRadios();
   const radioColors = React.useMemo<Record<string, string>>(() => {
     const m: Record<string, string> = {};
     for (const r of radios) if (r.color_hex) m[r.radio_id] = r.color_hex;
     return m;
   }, [radios]);
   const showRadioChips = radios.length > 1;
+
+  // v2.0 Beta 2: canned-message quick-send palette. Pulls the preset list
+  // from the radio the compose box will actually send through (the selected
+  // radio, else the default). Re-fetches on radio switch + on the
+  // cannedMessages SSE event so edits in the Radios panel reflect here.
+  const activeRadioForSend = selectedRadioId ?? defaultRadioId;
+  const [cannedMessages, setCannedMessages] = React.useState<string[]>([]);
+  React.useEffect(() => {
+    if (!activeRadioForSend) { setCannedMessages([]); return; }
+    let cancelled = false;
+    const load = () => meshDataService.getRadioCannedMessages(activeRadioForSend).then(data => {
+      if (!cancelled && data) setCannedMessages(data.messages ?? []);
+    });
+    load();
+    const es = new EventSource(`${API_BASE}/api/mesh/stream`);
+    es.addEventListener('cannedMessages', load);
+    return () => { cancelled = true; es.removeEventListener('cannedMessages', load); es.close(); };
+  }, [activeRadioForSend]);
 
   // Auto-scroll to bottom when new messages arrive (suppressed briefly while a
   // search-result highlight is anchoring on a specific older message).
@@ -845,24 +865,44 @@ export function MessagesView({
                 );
               }
               return (
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    value={draftMessage}
-                    onChange={(e) => setDraftMessage(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && handleSendWithReply()}
-                    placeholder={
-                      replyingTo ? 'Reply…'
-                      : `Message ${activeChannel ? channelLabel(activeChannel) : activeChatPartner?.name || 'the network'}…`
-                    }
-                    className="flex-1 bg-brand-line border border-brand-line rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-brand-accent"
-                  />
-                  <button
-                    onClick={handleSendWithReply}
-                    className="bg-brand-accent text-black px-4 py-2 rounded-lg font-bold text-sm hover:brightness-110 transition-all"
-                  >
-                    SEND
-                  </button>
+                <div className="space-y-2">
+                  {/* v2.0 Beta 2: canned-message quick-send palette. One-click
+                      sends a preset through the active radio (same routing as
+                      the compose box). Only rendered when the active radio has
+                      canned messages configured. */}
+                  {cannedMessages.length > 0 && (
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      {cannedMessages.map((m, i) => (
+                        <button
+                          key={i}
+                          onClick={() => handleSendMessage(m)}
+                          title={`Quick-send: "${m}"`}
+                          className="text-[11px] px-2.5 py-1 rounded-full border border-brand-line text-brand-muted hover:text-brand-accent hover:border-brand-accent/40 transition-colors truncate max-w-[200px]"
+                        >
+                          {m}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={draftMessage}
+                      onChange={(e) => setDraftMessage(e.target.value)}
+                      onKeyDown={(e) => e.key === 'Enter' && handleSendWithReply()}
+                      placeholder={
+                        replyingTo ? 'Reply…'
+                        : `Message ${activeChannel ? channelLabel(activeChannel) : activeChatPartner?.name || 'the network'}…`
+                      }
+                      className="flex-1 bg-brand-line border border-brand-line rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-brand-accent"
+                    />
+                    <button
+                      onClick={handleSendWithReply}
+                      className="bg-brand-accent text-black px-4 py-2 rounded-lg font-bold text-sm hover:brightness-110 transition-all"
+                    >
+                      SEND
+                    </button>
+                  </div>
                 </div>
               );
             })()}

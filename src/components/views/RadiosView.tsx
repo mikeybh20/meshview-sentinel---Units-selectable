@@ -854,6 +854,136 @@ function RadioEditor({ row, onChanged }: { row: RadioRow; onChanged: () => void 
 
       <NetworkConfigSection radioId={row.radio_id} />
       <PowerConfigSection radioId={row.radio_id} />
+      <CannedMessagesSection radioId={row.radio_id} />
+    </div>
+  );
+}
+
+/**
+ * v2.0 Beta 2 — Canned Messages editor.
+ *
+ * The device stores a pipe-delimited preset list (max ~200 bytes total).
+ * Editable here per radio; the same list powers the dashboard quick-send
+ * palette in the Messages view. Originally a hardware-input feature (rotary
+ * encoder / buttons) but equally useful as operator presets.
+ */
+function CannedMessagesSection({ radioId }: { radioId: string }) {
+  const [messages, setMessages] = React.useState<string[]>([]);
+  const [loaded, setLoaded] = React.useState(false);
+  const [draft, setDraft] = React.useState('');
+  const [saving, setSaving] = React.useState(false);
+  const [refreshing, setRefreshing] = React.useState(false);
+  const [msg, setMsg] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    meshDataService.getRadioCannedMessages(radioId).then(data => {
+      if (cancelled || !data) return;
+      setMessages(data.messages ?? []);
+      setLoaded(true);
+    });
+    return () => { cancelled = true; };
+  }, [radioId]);
+
+  const refresh = async () => {
+    setRefreshing(true);
+    await meshDataService.refreshRadioCannedMessages(radioId);
+    setTimeout(async () => {
+      const data = await meshDataService.getRadioCannedMessages(radioId);
+      if (data) { setMessages(data.messages ?? []); setLoaded(true); }
+      setRefreshing(false);
+    }, 1200);
+  };
+
+  const addDraft = () => {
+    const t = draft.trim();
+    if (!t) return;
+    setMessages([...messages, t]);
+    setDraft('');
+  };
+
+  const removeAt = (i: number) => setMessages(messages.filter((_, idx) => idx !== i));
+
+  const save = async () => {
+    setSaving(true);
+    setMsg(null);
+    const r = await meshDataService.setRadioCannedMessages(radioId, messages);
+    setSaving(false);
+    setMsg(r.ok ? 'Saved to radio.' : `Save failed: ${r.error}`);
+    setTimeout(() => setMsg(null), 3000);
+  };
+
+  // Combined byte length — firmware caps the pipe-joined string at ~200 bytes.
+  const usedBytes = messages.join('|').length;
+
+  return (
+    <div className="pt-3 border-t border-brand-line">
+      <div className="flex items-center justify-between mb-2">
+        <h5 className="text-[11px] font-bold uppercase tracking-widest text-brand-ink">Canned Messages</h5>
+        <button
+          onClick={refresh}
+          disabled={refreshing}
+          className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest text-brand-muted hover:text-brand-ink hover:bg-brand-line/40 px-2 py-1 rounded disabled:opacity-40"
+        >
+          <RefreshCw size={10} className={refreshing ? 'animate-spin' : ''} /> Refresh
+        </button>
+      </div>
+      {!loaded && (
+        <div className="text-[11px] text-brand-muted mb-2">
+          No canned-message readback yet. Click Refresh once the radio is connected.
+        </div>
+      )}
+      <p className="text-[10px] text-brand-muted mb-2">
+        Preset broadcasts the operator can one-click send from the Messages view. Also drive the radio's
+        hardware input (rotary encoder / buttons) if fitted. Combined length is capped at ~200 bytes by the firmware.
+      </p>
+      <div className="space-y-1 mb-2">
+        {messages.length === 0 ? (
+          <div className="text-[11px] text-brand-muted italic">No canned messages set.</div>
+        ) : messages.map((m, i) => (
+          <div key={i} className="flex items-center gap-2 bg-brand-line/20 border border-brand-line rounded px-2 py-1">
+            <span className="text-xs text-brand-ink flex-1 truncate">{m}</span>
+            <button
+              onClick={() => removeAt(i)}
+              className="text-red-400 hover:text-red-300 p-0.5 rounded"
+              title="Remove"
+            >
+              <Trash2 size={11} />
+            </button>
+          </div>
+        ))}
+      </div>
+      <div className="flex items-center gap-2 mb-2">
+        <input
+          type="text"
+          value={draft}
+          onChange={e => setDraft(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') addDraft(); }}
+          placeholder="Add a preset message…"
+          maxLength={60}
+          className="flex-1 bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs text-brand-ink"
+        />
+        <button
+          onClick={addDraft}
+          disabled={!draft.trim()}
+          className="bg-brand-line hover:bg-brand-line/70 disabled:opacity-40 border border-brand-line text-brand-ink text-[10px] font-bold uppercase tracking-widest rounded px-3 py-1"
+        >
+          <Plus size={11} className="inline" /> Add
+        </button>
+      </div>
+      <div className="flex items-center gap-3">
+        <button
+          onClick={save}
+          disabled={saving}
+          className="bg-amber-500/10 hover:bg-amber-500/20 disabled:opacity-40 border border-amber-500/40 text-amber-300 text-[10px] font-bold uppercase tracking-widest rounded px-3 py-1.5"
+        >
+          {saving ? 'Writing…' : 'Write Canned Messages to Radio'}
+        </button>
+        <span className={cn('text-[10px] mono-text', usedBytes > 200 ? 'text-red-400' : 'text-brand-muted')}>
+          {usedBytes}/200 bytes
+        </span>
+        {msg && <span className="text-[11px] text-brand-muted">{msg}</span>}
+      </div>
     </div>
   );
 }

@@ -321,23 +321,48 @@ If removed:
 
 These items were explicitly scoped out of Beta 1 to keep the multi-radio core focused. Each is its own focused work session.
 
-### Architecture cleanup (carried from Phase 1)
-- **`RadioAdapter` formal extraction** — the interface in [radioAdapter.ts](server/radioAdapter.ts) exists but `MeshtasticSerialBridge` doesn't formally `implements` it. Fold this in when BLE transport lands (likely the trigger for needing the abstraction).
+> **Status key:** ✅ done · 🔲 open · ⏸ parked · 🚧 blocked on hardware
 
-### GPU image (carried from Phase 1.5)
-- **Multi-arch `Dockerfile.gpu`** with `nvcr.io/nvidia/l4t-ml` (Jetson arm64), `nvidia/cuda` (x86_64), and SBSA-arm64 variants installing RAPIDS so the sidecar can actually use cuML / cuGraph / cuPy in production
-- **CI matrix** smoke-testing the sidecar image for arm64-l4t, arm64-sbsa, x86_64-cuda
+### ✅ Closed in the Beta 2 WIP commit (`57e1a0f`, 2026-05-27)
 
-### Phase 5 — accelerated visualizations (deferred slice)
-- **Traceroute path analysis** — `/api/gpu/route-stability` (cuGraph in the sidecar; pure-Python fallback). Surfaces common path segments + per-pair route-stability scores. New "Route Stability" panel.
-- **Position trace playback UI** — the backend RDP simplifier shipped in Beta 1; the playback animation with a slider on the Node Detail panel + map polyline overlay is Beta 2.
+Critical Beta 1 bugs that meant LoRa readback never actually worked, plus a wave of multi-radio polish and board-capability surfacing:
 
-### Phase 5 — leftover 1.0 items (deferred slice)
-- **Outage detection / "radio went silent" alerts** — event-based, per-radio. Fires when a previously-heard node misses its expected reporting interval.
-- **Backup / restore** — encrypted export of `bbs-config.json` + `radios` table + channel PSKs. Read at config time to bootstrap a fresh install.
-- **Per-channel uplink / downlink editing** in ChannelsModal (currently read-only for some channel flags)
-- **Remaining Settings → Modules** — Power, Serial, Canned Messages, Ambient Lighting, Paxcounter (carried over from 1.0 ROADMAP)
-- **PKI / ECDH** — still parked. Documented in 1.0 ROADMAP; will revisit when an upstream client library stabilizes.
+- ✅ **LoRa readback bugs** — `CFG_LORA` enum was 6 (Bluetooth) not 5 (LoRa); `FromRadio.config`/`moduleConfig` (fields 5/9) weren't parsed; secondary readback fired before identity was known; per-radio LoRa endpoints routed to the singleton instead of the target bridge. All fixed.
+- ✅ **Make Primary** — hot-swap which radio holds the singleton bridge (replaced the no-op "Set Default")
+- ✅ **Radios → top-level nav** — moved out of Settings into its own page
+- ✅ **Per-message `radioId`** + smart reply routing + per-message radio chip
+- ✅ **MQTT awareness** — RF/MQTT filter chips, stats card RF/MQTT split, per-channel `MQTT ↑↓` badge
+- ✅ **Per-channel uplink/downlink editing** — was already editable in 1.x; the MQTT badge made the state glanceable
+- ✅ **Settings → Modules: Power** — full editor (sleep / battery shutdown / wake)
+- ✅ **Network config readback** (WiFi/Eth/NTP) — read-only display (bonus, wasn't originally scoped)
+- ✅ **Radio Health line** — firmware / reboots / battery / voltage per radio (bonus)
+- ✅ **Detect Identity / Test Connection** live-state fallback when the port is already held
+
+### 🔲 Still open — feature work
+
+- 🔲 **Canned Messages module** — admin builder + parser + Settings card + a dashboard quick-send palette. Lets operators preload short broadcasts and one-click send.
+- 🔲 **Position-trace playback UI** — the backend RDP simplifier shipped in Beta 1 (`/api/gpu/trace-simplify`); this is the slider + map polyline overlay on the Node Detail panel.
+- 🔲 **Outage detection / "radio went silent" alerts** — event-based, per-radio. Fires when a previously-heard node misses its expected reporting interval.
+- 🔲 **Backup / restore** — encrypted export of `bbs-config.json` + `radios` table + channel PSKs. Read at config time to bootstrap a fresh install.
+- 🚧 **Detection Sensor event timeline** — blocked on wiring a physical GPIO sensor; firmware triggers arrive as plain text broadcasts, so the timeline design needs a real signal to match against.
+- 🔲 **Traceroute route-stability analysis** — `/api/gpu/route-stability` (cuGraph in the sidecar; pure-Python fallback). Common path segments + per-pair stability scores + a "Route Stability" panel.
+
+### 🔲 Still open — remaining Settings → Modules
+
+Each mirrors the Power module pattern (admin builder + parser + readback + UI card):
+
+- 🔲 **Serial** — UART-based external device integration
+- 🔲 **Ambient Lighting** — WS2812 LED control (boards with the strip)
+- 🔲 **Paxcounter** — BLE/WiFi device counting (foot-traffic estimation)
+
+### 🔲 Still open — infrastructure / cleanup
+
+- 🔲 **`RadioAdapter` formal extraction** — the interface in [radioAdapter.ts](server/radioAdapter.ts) exists but `MeshtasticSerialBridge` doesn't formally `implements` it. Fold this in when BLE transport lands.
+- 🔲 **Multi-arch `Dockerfile.gpu`** with `nvcr.io/nvidia/l4t-ml` (Jetson arm64), `nvidia/cuda` (x86_64), and SBSA-arm64 variants installing RAPIDS so the sidecar can actually use cuML / cuGraph / cuPy in production. Plus a **CI matrix** smoke-testing the image per arch.
+
+### ⏸ Parked
+
+- ⏸ **PKI / ECDH** for true DM encryption — Curve25519 client-side impl is non-trivial + firmware behavior is inconsistent. Revisit when a stable upstream client library exists.
 
 ### Phase 6 — AI + sidecar expansion (target 2.0 GA, after Beta 2 stabilizes)
 Unchanged from original plan. AI evaluation + decision point (keep / evolve / remove), anomaly detection, AGX Orin + GB10 deployment guides.

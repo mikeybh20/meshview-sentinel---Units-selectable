@@ -577,6 +577,9 @@ export class MeshtasticSerialBridge extends EventEmitter {
   private localNetworkConfig: NetworkConfigSnapshot | null = null;
   /** v2.0 Beta 2: authoritative Power config (sleep, battery shutdown). */
   private localPowerConfig: PowerConfigSnapshot | null = null;
+  /** v2.0 Beta 2: device's canned-message list (the pipe-delimited preset
+   *  broadcasts the Canned Messages module exposes). null = never read. */
+  private cannedMessages: string[] | null = null;
   /**
    * v2.0 multi-radio: this bridge's radio_id (4-char short_name). Set by
    * BridgeManager after auto-registration completes. Stamped onto every
@@ -3880,6 +3883,42 @@ export class MeshtasticSerialBridge extends EventEmitter {
 
   getLocalNetworkConfig(): NetworkConfigSnapshot | null { return this.localNetworkConfig; }
   getLocalPowerConfig(): PowerConfigSnapshot | null { return this.localPowerConfig; }
+  getCannedMessages(): string[] | null { return this.cannedMessages; }
+
+  /**
+   * v2.0 Beta 2: ask the radio for its Canned Messages list. The device
+   * stores them as a single pipe-delimited string; reply arrives as
+   * AdminMessage.get_canned_message_module_messages_response (field 6, string)
+   * on PORT_ADMIN_APP.
+   */
+  async requestCannedMessages(): Promise<void> {
+    if (!this.isLinkOpen()) return;
+    if (!this.localNodeNum) return;
+    // AdminMessage { get_canned_message_module_messages_request: true (bool, field 5) }
+    const adminPayload = this.encodeTagBool(5, true);
+    this.sendAdminMessage(adminPayload);
+    console.log('[MeshtasticSerial] Requested canned messages readback');
+  }
+
+  /**
+   * v2.0 Beta 2: write the canned-message list. Joined with '|' — the
+   * delimiter the firmware uses. Empty list clears them.
+   */
+  async setCannedMessages(messages: string[]): Promise<void> {
+    if (!this.isLinkOpen()) throw new Error('Radio not connected');
+    if (!this.localNodeNum) throw new Error('Local node not yet identified — try again in a moment');
+    // Firmware caps the combined string at ~200 bytes; trim defensively.
+    const joined = messages.map(m => m.replace(/\|/g, ' ').trim()).filter(Boolean).join('|').slice(0, 200);
+    // AdminMessage { set_canned_message_module_messages: string (field 36) }
+    const adminPayload = this.encodeTagLen(36, Buffer.from(joined, 'utf-8'));
+    this.sendAdminMessage(adminPayload);
+    await new Promise(r => setTimeout(r, 80));
+    this.sendAdminMessage(this.buildAdminCommit());
+    this.cannedMessages = joined ? joined.split('|') : [];
+    this.emit('cannedMessagesUpdate', this.cannedMessages);
+    console.log(`[MeshtasticSerial] Canned messages write: ${this.cannedMessages.length} message(s)`);
+    setTimeout(() => { this.requestCannedMessages().catch(() => {}); }, 200);
+  }
 
   /** v2.0 Beta 2: ask the local radio for its NetworkConfig (WiFi/Eth). */
   async requestNetworkConfig(): Promise<void> {
@@ -4843,6 +4882,13 @@ export class MeshtasticSerialBridge extends EventEmitter {
         } else if (fieldNumber === 8) {
           // v2.0: get_config_response — parse the Config oneof for LoRa
           this.parseConfigResponse(sub);
+        } else if (fieldNumber === 6) {
+          // v2.0 Beta 2: get_canned_message_module_messages_response (string,
+          // pipe-delimited). Empty string = no canned messages configured.
+          const str = sub.toString('utf-8');
+          this.cannedMessages = str ? str.split('|') : [];
+          console.log(`[MeshtasticSerial] Canned messages readback: ${this.cannedMessages.length} message(s)`);
+          this.emit('cannedMessagesUpdate', this.cannedMessages);
         }
       } else if (wireType === 5) {
         offset += 4;

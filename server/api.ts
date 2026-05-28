@@ -687,6 +687,35 @@ app.put('/api/mesh/radios/:radioId/power', async (req, res) => {
   }
 });
 
+// --- v2.0 Beta 2: Canned Messages (per radio) ---
+app.get('/api/mesh/radios/:radioId/canned-messages', (req, res) => {
+  const ctx = bridgeManager.get(req.params.radioId);
+  if (!ctx) return res.status(404).json({ error: 'radio not found or not connected' });
+  return res.json({ messages: ctx.bridge.getCannedMessages() });
+});
+
+app.post('/api/mesh/radios/:radioId/canned-messages/refresh', async (req, res) => {
+  const ctx = bridgeManager.get(req.params.radioId);
+  if (!ctx) return res.status(404).json({ error: 'radio not found or not connected' });
+  if (!ctx.bridge.connected) return res.status(503).json({ error: `radio "${req.params.radioId}" is not connected` });
+  try { await ctx.bridge.requestCannedMessages(); return res.json({ ok: true }); }
+  catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/mesh/radios/:radioId/canned-messages', async (req, res) => {
+  const ctx = bridgeManager.get(req.params.radioId);
+  if (!ctx) return res.status(404).json({ error: 'radio not found or not connected' });
+  if (!ctx.bridge.connected) return res.status(503).json({ error: `radio "${req.params.radioId}" is not connected` });
+  const messages = req.body?.messages;
+  if (!Array.isArray(messages)) return res.status(400).json({ error: 'Body must be { messages: string[] }' });
+  try {
+    await ctx.bridge.setCannedMessages(messages.map(String));
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 app.put('/api/mesh/radios/:radioId/lora', async (req, res) => {
   const { radioId } = req.params;
   const ctx = bridgeManager.get(radioId);

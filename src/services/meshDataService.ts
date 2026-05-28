@@ -689,6 +689,40 @@ export class MeshDataService {
     }
   }
 
+  // v2.0 Beta 2: Canned Messages (per radio). The device stores a
+  // pipe-delimited preset list; we read/write it as a string[].
+  async getRadioCannedMessages(radioId: string): Promise<{ messages: string[] | null } | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/canned-messages`);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  }
+  async refreshRadioCannedMessages(radioId: string): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/canned-messages/refresh`, { method: 'POST' });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'request failed' };
+    }
+  }
+  async setRadioCannedMessages(radioId: string, messages: string[]): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/canned-messages`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'request failed' };
+    }
+  }
+
   // v2.0 Beta 2: Power config (sleep / battery shutdown).
   async getRadioPower(radioId: string): Promise<{ live: {
     isPowerSaving: boolean; onBatteryShutdownAfterSecs: number;

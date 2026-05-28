@@ -20,7 +20,7 @@ import {
   Clock,
   History,
 } from 'lucide-react';
-import { Map, Marker } from "pigeon-maps";
+import { Map, Marker, GeoJson } from "pigeon-maps";
 
 import { Node, Message, WidgetConfig, UnitSystem, Group } from '../../types';
 import { cn } from '../../lib/utils';
@@ -580,6 +580,8 @@ function PositionLog({ nodeId }: { nodeId: string }) {
     alt: number | null;
     source: 'manual' | 'gps' | null;
   }> | null>(null);
+  // v2.0 Beta 2: table vs map-playback view toggle.
+  const [view, setView] = React.useState<'table' | 'playback'>('table');
 
   React.useEffect(() => {
     let cancelled = false;
@@ -600,21 +602,180 @@ function PositionLog({ nodeId }: { nodeId: string }) {
     return <div className="text-[10px] text-brand-muted italic">No position history recorded yet.</div>;
   }
   return (
-    <div className="space-y-0.5 max-h-48 overflow-y-auto text-[10px] mono-text">
-      <div className="grid grid-cols-[auto_1fr_1fr_auto] gap-2 px-1 pb-1 text-brand-muted uppercase tracking-widest text-[9px] border-b border-brand-line/40">
-        <span>When</span>
-        <span>Lat</span>
-        <span>Lng</span>
-        <span className="text-right">Src</span>
+    <div className="space-y-2">
+      {/* View toggle. Playback only makes sense with ≥2 points. */}
+      <div className="flex items-center gap-1">
+        <button
+          onClick={() => setView('table')}
+          className={cn(
+            'text-[9px] font-bold uppercase tracking-widest px-2 py-0.5 rounded border transition-colors',
+            view === 'table' ? 'bg-brand-accent/15 border-brand-accent/50 text-brand-accent'
+                             : 'border-brand-line text-brand-muted hover:text-brand-ink'
+          )}
+        >
+          Table
+        </button>
+        <button
+          onClick={() => setView('playback')}
+          disabled={rows.length < 2}
+          className={cn(
+            'text-[9px] font-bold uppercase tracking-widest px-2 py-0.5 rounded border transition-colors disabled:opacity-40',
+            view === 'playback' ? 'bg-brand-accent/15 border-brand-accent/50 text-brand-accent'
+                                : 'border-brand-line text-brand-muted hover:text-brand-ink'
+          )}
+          title={rows.length < 2 ? 'Need at least 2 positions to play back a trace' : 'Animate the movement trail'}
+        >
+          Playback
+        </button>
       </div>
-      {rows.map(r => (
-        <div key={r.id} className="grid grid-cols-[auto_1fr_1fr_auto] gap-2 px-1 py-0.5 hover:bg-brand-line/20 rounded">
-          <span className="text-brand-muted">{relativeTimeLong(r.timestamp)}</span>
-          <span className="text-brand-ink truncate">{r.lat.toFixed(5)}</span>
-          <span className="text-brand-ink truncate">{r.lng.toFixed(5)}</span>
-          <span className="text-brand-muted text-right uppercase">{r.source || '—'}</span>
+
+      {view === 'table' ? (
+        <div className="space-y-0.5 max-h-48 overflow-y-auto text-[10px] mono-text">
+          <div className="grid grid-cols-[auto_1fr_1fr_auto] gap-2 px-1 pb-1 text-brand-muted uppercase tracking-widest text-[9px] border-b border-brand-line/40">
+            <span>When</span>
+            <span>Lat</span>
+            <span>Lng</span>
+            <span className="text-right">Src</span>
+          </div>
+          {rows.map(r => (
+            <div key={r.id} className="grid grid-cols-[auto_1fr_1fr_auto] gap-2 px-1 py-0.5 hover:bg-brand-line/20 rounded">
+              <span className="text-brand-muted">{relativeTimeLong(r.timestamp)}</span>
+              <span className="text-brand-ink truncate">{r.lat.toFixed(5)}</span>
+              <span className="text-brand-ink truncate">{r.lng.toFixed(5)}</span>
+              <span className="text-brand-muted text-right uppercase">{r.source || '—'}</span>
+            </div>
+          ))}
         </div>
-      ))}
+      ) : (
+        <PositionPlayback nodeId={nodeId} rawCount={rows.length} />
+      )}
+    </div>
+  );
+}
+
+/**
+ * v2.0 Beta 2 — Position-trace playback.
+ *
+ * Pulls the Ramer-Douglas-Peucker-simplified trace from the GPU sidecar
+ * (CPU-fallback transparent) so a 100-point raw log collapses to the
+ * handful of points that actually define the path. Renders them on a
+ * pigeon-maps canvas with a GeoJson polyline + a scrubber/play control
+ * that animates a marker along the route.
+ */
+function PositionPlayback({ nodeId, rawCount }: { nodeId: string; rawCount: number }) {
+  const [points, setPoints] = React.useState<Array<{ timestamp: number; lat: number; lng: number }> | null>(null);
+  const [idx, setIdx] = React.useState(0);
+  const [playing, setPlaying] = React.useState(false);
+  const [tolerance, setTolerance] = React.useState(10);
+
+  const load = React.useCallback(() => {
+    setPoints(null);
+    setIdx(0);
+    setPlaying(false);
+    meshDataService.simplifyPositionTrace({ node_id: nodeId, simplify_tolerance_m: tolerance, limit: 1000 })
+      .then(r => { if (r) setPoints(r.points.map(p => ({ timestamp: p.timestamp, lat: p.lat, lng: p.lng }))); });
+  }, [nodeId, tolerance]);
+
+  React.useEffect(() => { load(); }, [load]);
+
+  // Auto-advance the scrubber while playing.
+  React.useEffect(() => {
+    if (!playing || !points || points.length === 0) return;
+    const t = setInterval(() => {
+      setIdx(prev => {
+        if (prev >= points.length - 1) { setPlaying(false); return prev; }
+        return prev + 1;
+      });
+    }, 600);
+    return () => clearInterval(t);
+  }, [playing, points]);
+
+  if (points === null) {
+    return <div className="text-[10px] text-brand-muted flex items-center gap-2"><Loader2 size={11} className="animate-spin" /> Simplifying trace…</div>;
+  }
+  if (points.length < 2) {
+    return <div className="text-[10px] text-brand-muted italic">Trace too short to play back at this tolerance.</div>;
+  }
+
+  const lats = points.map(p => p.lat);
+  const lngs = points.map(p => p.lng);
+  const center: [number, number] = [
+    (Math.min(...lats) + Math.max(...lats)) / 2,
+    (Math.min(...lngs) + Math.max(...lngs)) / 2,
+  ];
+  const span = Math.max(Math.max(...lats) - Math.min(...lats), Math.max(...lngs) - Math.min(...lngs));
+  const zoom = span < 0.005 ? 15 : span < 0.02 ? 13 : span < 0.1 ? 11 : span < 0.5 ? 9 : 7;
+
+  // GeoJson LineString through the path so far (up to the scrub index).
+  const traveled = points.slice(0, idx + 1);
+  const lineData = {
+    type: 'FeatureCollection' as const,
+    features: [{
+      type: 'Feature' as const,
+      geometry: { type: 'LineString' as const, coordinates: traveled.map(p => [p.lng, p.lat]) },
+      properties: {},
+    }],
+  };
+  const cur = points[idx];
+
+  return (
+    <div className="space-y-2">
+      <div className="relative h-56 rounded overflow-hidden border border-brand-line">
+        <Map center={center} zoom={zoom} attributionPrefix={false}>
+          <GeoJson
+            data={lineData}
+            styleCallback={() => ({ stroke: 'var(--color-brand-accent)', strokeWidth: 3, fill: 'none' })}
+          />
+          {/* Start + end markers for orientation */}
+          <Marker anchor={[points[0].lat, points[0].lng]} width={16} color="#10b981" />
+          <Marker anchor={[points[points.length - 1].lat, points[points.length - 1].lng]} width={16} color="#ef4444" />
+          {/* Current scrub position */}
+          <Marker anchor={[cur.lat, cur.lng]} width={26} color="var(--color-brand-accent)" />
+        </Map>
+      </div>
+
+      <div className="flex items-center gap-2">
+        <button
+          onClick={() => {
+            if (idx >= points.length - 1) setIdx(0);
+            setPlaying(p => !p);
+          }}
+          className="text-[10px] font-bold uppercase tracking-widest bg-brand-accent/10 border border-brand-accent/40 text-brand-accent px-2.5 py-1 rounded hover:bg-brand-accent/20"
+        >
+          {playing ? '⏸ Pause' : '▶ Play'}
+        </button>
+        <input
+          type="range"
+          min={0}
+          max={points.length - 1}
+          value={idx}
+          onChange={e => { setPlaying(false); setIdx(Number(e.target.value)); }}
+          className="flex-1"
+        />
+        <span className="text-[9px] mono-text text-brand-muted w-16 text-right">
+          {idx + 1}/{points.length}
+        </span>
+      </div>
+
+      <div className="flex items-center justify-between text-[9px] text-brand-muted">
+        <span className="mono-text">{new Date(cur.timestamp).toLocaleString()}</span>
+        <label className="flex items-center gap-1">
+          tolerance
+          <select
+            value={tolerance}
+            onChange={e => setTolerance(Number(e.target.value))}
+            className="bg-brand-bg border border-brand-line rounded px-1 py-0.5 text-[9px]"
+          >
+            <option value={2}>2m (detail)</option>
+            <option value={10}>10m</option>
+            <option value={50}>50m</option>
+            <option value={200}>200m (coarse)</option>
+          </select>
+        </label>
+        <span title="Points kept after Ramer-Douglas-Peucker simplification vs raw samples">
+          {points.length} / {rawCount} pts
+        </span>
+      </div>
     </div>
   );
 }
