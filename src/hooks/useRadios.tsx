@@ -17,6 +17,12 @@ const API_BASE = import.meta.env.VITE_API_URL || '';
 export interface RadioConnState {
   connected: boolean;
   transport: string | null;
+  /** v2.0 Beta 2: radio health fields, surfaced in the Radios view. */
+  firmwareVersion?: string | null;
+  rebootCount?: number | null;
+  battery?: number | null;
+  voltage?: number | null;
+  localNodeId?: string | null;
 }
 
 interface RadiosState {

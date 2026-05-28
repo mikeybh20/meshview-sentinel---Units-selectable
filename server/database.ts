@@ -1077,7 +1077,7 @@ export class MeshDatabase {
     const rows = this.db.prepare(`
       SELECT id, from_id, to_id, channel, text, timestamp, hop_limit,
              rx_snr, rx_rssi, hops_json, status, error_code, is_own,
-             packet_id, reply_to, is_reaction, delivery_ms
+             packet_id, reply_to, is_reaction, delivery_ms, radio_id
       FROM messages
       ORDER BY timestamp DESC
       LIMIT ?
@@ -1087,7 +1087,7 @@ export class MeshDatabase {
       rx_snr: number | null; rx_rssi: number | null; hops_json: string | null;
       status: string | null; error_code: number | null; is_own: number;
       packet_id: number | null; reply_to: number | null; is_reaction: number;
-      delivery_ms: number | null;
+      delivery_ms: number | null; radio_id: string | null;
     }>;
 
     return rows.reverse().map(r => ({
@@ -1108,6 +1108,7 @@ export class MeshDatabase {
       replyTo: r.reply_to ?? undefined,
       isReaction: r.is_reaction ? true : undefined,
       deliveryMs: r.delivery_ms ?? undefined,
+      radioId: r.radio_id ?? undefined,
     }) as MeshMessage);
   }
 
@@ -1807,8 +1808,15 @@ export class MeshDatabase {
     });
   }
 
+  /**
+   * Delete the radios row. v2.0 bugfix: the DB layer no longer enforces an
+   * `is_default = 0` guard — that conflated "operator-preferred default"
+   * (this column) with "currently held by the singleton bridge" (a runtime
+   * concept). The API layer at /api/mesh/radios/:id checks the singleton
+   * via BridgeManager before calling this.
+   */
   deleteRadio(radioId: string): boolean {
-    const r = this.db.prepare(`DELETE FROM radios WHERE radio_id = ? AND is_default = 0`).run(radioId);
+    const r = this.db.prepare(`DELETE FROM radios WHERE radio_id = ?`).run(radioId);
     return r.changes > 0;
   }
 

@@ -121,6 +121,14 @@ export interface MeshMessage {
    * observed an ACK or for inbound messages.
    */
   deliveryMs?: number;
+  /**
+   * v2.0 multi-radio: the radio that received (or sent) this message —
+   * the 4-char short_name of the bridge whose physical channel this lived
+   * on. Lets the UI badge each message with its source mesh and route
+   * replies back through the same bridge instead of cross-mesh defaulting
+   * to the primary.
+   */
+  radioId?: string | null;
 }
 
 /** Context retained per outbound message so the auto-retry path can rebuild
@@ -376,6 +384,43 @@ export interface StoreForwardLocalConfig {
 }
 
 /**
+ * v2.0 Beta 2: subset of Meshtastic's NetworkConfig (Config.network, field 4).
+ * Surfaced read-only in the Radios view as a "Network: WiFi on (SSID)" line +
+ * a "captive UI" link when the radio is on the LAN.
+ *
+ * Field numbers (config.proto NetworkConfig):
+ *   1=wifi_enabled, 3=wifi_ssid, 4=wifi_psk, 5=ntp_server, 6=eth_enabled,
+ *   ... (ipv4_config and friends are skipped — they're rarely set by hobbyists)
+ */
+export interface NetworkConfigSnapshot {
+  wifiEnabled: boolean;
+  wifiSsid: string;
+  ethEnabled: boolean;
+  ntpServer: string;
+  lastReadAt: number;
+}
+
+/**
+ * v2.0 Beta 2: subset of Meshtastic's PowerConfig (Config.power, field 3).
+ * Critical for field deployments — controls how aggressively the radio
+ * goes to sleep between LoRa wakeups.
+ *
+ * Field numbers (config.proto PowerConfig):
+ *   1=is_power_saving, 2=on_battery_shutdown_after_secs, 3=adc_multiplier_override,
+ *   4=wait_bluetooth_secs, 5=sds_secs (super deep sleep),
+ *   6=ls_secs (light sleep), 7=min_wake_secs, 8=device_battery_ina_address
+ */
+export interface PowerConfigSnapshot {
+  isPowerSaving: boolean;
+  onBatteryShutdownAfterSecs: number;
+  waitBluetoothSecs: number;
+  sdsSecs: number;
+  lsSecs: number;
+  minWakeSecs: number;
+  lastReadAt: number;
+}
+
+/**
  * v2.0: subset of Meshtastic's LoRaConfig that we surface in the Settings →
  * Radios editor. Other LoRaConfig fields (bandwidth, spread_factor, etc.) are
  * preserved opaquely on readback so save round-trips don't lose them.
@@ -528,6 +573,10 @@ export class MeshtasticSerialBridge extends EventEmitter {
   private localModuleConfig: LocalModuleConfigSnapshot = {};
   /** v2.0: authoritative LoRa config (region / preset / frequency slot / hops / tx). */
   private localLoraConfig: LoRaConfigSnapshot | null = null;
+  /** v2.0 Beta 2: authoritative Network config (WiFi/Ethernet). */
+  private localNetworkConfig: NetworkConfigSnapshot | null = null;
+  /** v2.0 Beta 2: authoritative Power config (sleep, battery shutdown). */
+  private localPowerConfig: PowerConfigSnapshot | null = null;
   /**
    * v2.0 multi-radio: this bridge's radio_id (4-char short_name). Set by
    * BridgeManager after auto-registration completes. Stamped onto every
@@ -1116,6 +1165,9 @@ export class MeshtasticSerialBridge extends EventEmitter {
       packetId,
       replyTo: opts.replyTo || undefined,
       isReaction: opts.isReaction || undefined,
+      // v2.0 multi-radio: stamp the radio this message went out on so the
+      // UI can tag it and so replies can route back through this bridge.
+      radioId: this.radioId,
     };
     this.messages.push(msg);
     if (this.messages.length > 500) this.messages = this.messages.slice(-500);
@@ -1440,17 +1492,30 @@ export class MeshtasticSerialBridge extends EventEmitter {
 
         // FromRadio field numbers (meshtastic mesh.proto):
         //   2 = packet (MeshPacket), 3 = my_info (MyNodeInfo),
-        //   4 = node_info (NodeInfo), 7 = config_complete_id,
-        //   8 = metadata (DeviceMetadata, newer firmware),
+        //   4 = node_info (NodeInfo), 5 = config (Config — self-admin response),
+        //   7 = config_complete_id, 8 = metadata (DeviceMetadata),
+        //   9 = moduleConfig (ModuleConfig — self-admin response),
         //   10 = channel (Channel), 11 = queue_status (QueueStatus)
+        //
+        // v2.0 bugfix: newer Meshtastic firmware (4.x+) delivers self-admin
+        // config readback responses as top-level FromRadio.config / .moduleConfig
+        // rather than wrapping them in a MeshPacket on ADMIN_APP. Without
+        // this branch the LoRa readback request silently disappears — the
+        // radio answers, we just drop the reply. Falls through to the
+        // existing parseConfigResponse / parseModuleConfigResponse so the
+        // ADMIN_APP-wrapped path (older firmware) keeps working too.
         if (fieldNumber === 2) {
           this.handleMeshPacket(subBuf);
         } else if (fieldNumber === 3) {
           this.handleMyInfo(subBuf);
         } else if (fieldNumber === 4) {
           this.handleNodeInfo(subBuf);
+        } else if (fieldNumber === 5) {
+          this.parseConfigResponse(subBuf);
         } else if (fieldNumber === 8) {
           this.handleDeviceMetadata(subBuf);
+        } else if (fieldNumber === 9) {
+          this.parseModuleConfigResponse(subBuf);
         } else if (fieldNumber === 10) {
           this.handleChannel(subBuf);
         } else if (fieldNumber === 11) {
@@ -3171,6 +3236,9 @@ export class MeshtasticSerialBridge extends EventEmitter {
       packetId: incomingPacketId || undefined,
       replyTo: replyId || undefined,
       isReaction: isReaction || undefined,
+      // v2.0 multi-radio: stamp the radio that received this message so the
+      // UI can show "via WRTJ" / "via 3bec" and route replies correctly.
+      radioId: this.radioId,
     };
     this.messages.push(msg);
     if (this.messages.length > 500) {
@@ -3800,8 +3868,146 @@ export class MeshtasticSerialBridge extends EventEmitter {
   }
 
   // ---- v2.0 LoRa config (Region / Modem Preset / Frequency Slot / Hops / Tx)
-  // admin.proto ConfigType enum: LORA_CONFIG = 6
-  private static readonly CFG_LORA = 6;
+  // admin.proto AdminMessageConfigType enum: DEVICE=0, POSITION=1, POWER=2,
+  // NETWORK=3, DISPLAY=4, LORA=5, BLUETOOTH=6, SECURITY=7. Beta 1 shipped
+  // with this set to 6 (BLUETOOTH) — Sentinel was politely asking the radio
+  // for its Bluetooth config, the parser then ignored the response because
+  // Config.bluetooth is field 7 and we only look for field 6 (Config.lora),
+  // so the readback silently never landed. Fixed in Beta 2.
+  private static readonly CFG_LORA = 5;
+  private static readonly CFG_NETWORK = 3;
+  private static readonly CFG_POWER = 2;
+
+  getLocalNetworkConfig(): NetworkConfigSnapshot | null { return this.localNetworkConfig; }
+  getLocalPowerConfig(): PowerConfigSnapshot | null { return this.localPowerConfig; }
+
+  /** v2.0 Beta 2: ask the local radio for its NetworkConfig (WiFi/Eth). */
+  async requestNetworkConfig(): Promise<void> {
+    if (!this.isLinkOpen()) return;
+    if (!this.localNodeNum) return;
+    const adminPayload = this.encodeTagVarint(7, MeshtasticSerialBridge.CFG_NETWORK);
+    this.sendAdminMessage(adminPayload);
+    console.log('[MeshtasticSerial] Requested Network config readback');
+  }
+
+  /** v2.0 Beta 2: ask the local radio for its PowerConfig (sleep, battery). */
+  async requestPowerConfig(): Promise<void> {
+    if (!this.isLinkOpen()) return;
+    if (!this.localNodeNum) return;
+    const adminPayload = this.encodeTagVarint(7, MeshtasticSerialBridge.CFG_POWER);
+    this.sendAdminMessage(adminPayload);
+    console.log('[MeshtasticSerial] Requested Power config readback');
+  }
+
+  /**
+   * v2.0 Beta 2: write a new PowerConfig. We only surface the operator-relevant
+   * fields; firmware preserves untouched fields in set_config so we don't lose
+   * anything we don't model. Same shape pattern as setLoraConfig.
+   */
+  async setPowerConfig(opts: {
+    isPowerSaving?: boolean;
+    onBatteryShutdownAfterSecs?: number;
+    waitBluetoothSecs?: number;
+    sdsSecs?: number;
+    lsSecs?: number;
+    minWakeSecs?: number;
+  }): Promise<void> {
+    if (!this.isLinkOpen()) throw new Error('Radio not connected');
+    if (!this.localNodeNum) throw new Error('Local node not yet identified — try again in a moment');
+
+    const baseline = this.localPowerConfig;
+    const merged = {
+      isPowerSaving:               opts.isPowerSaving               ?? baseline?.isPowerSaving               ?? false,
+      onBatteryShutdownAfterSecs:  opts.onBatteryShutdownAfterSecs  ?? baseline?.onBatteryShutdownAfterSecs  ?? 0,
+      waitBluetoothSecs:           opts.waitBluetoothSecs           ?? baseline?.waitBluetoothSecs           ?? 60,
+      sdsSecs:                     opts.sdsSecs                     ?? baseline?.sdsSecs                     ?? 0,
+      lsSecs:                      opts.lsSecs                      ?? baseline?.lsSecs                      ?? 300,
+      minWakeSecs:                 opts.minWakeSecs                 ?? baseline?.minWakeSecs                 ?? 10,
+    };
+
+    const powerPayload = Buffer.concat([
+      this.encodeTagBool(1,   merged.isPowerSaving),
+      this.encodeTagVarint(2, Math.max(0, Math.floor(merged.onBatteryShutdownAfterSecs))),
+      this.encodeTagVarint(4, Math.max(0, Math.floor(merged.waitBluetoothSecs))),
+      this.encodeTagVarint(5, Math.max(0, Math.floor(merged.sdsSecs))),
+      this.encodeTagVarint(6, Math.max(0, Math.floor(merged.lsSecs))),
+      this.encodeTagVarint(7, Math.max(0, Math.floor(merged.minWakeSecs))),
+    ]);
+    const configMsg = this.encodeTagLen(3, powerPayload);   // Config.power (field 3)
+    const adminPayload = this.encodeTagLen(33, configMsg);   // AdminMessage.set_config
+
+    this.sendAdminMessage(adminPayload);
+    await new Promise(r => setTimeout(r, 80));
+    this.sendAdminMessage(this.buildAdminCommit());
+
+    console.log(`[MeshtasticSerial] Power config write: powerSaving=${merged.isPowerSaving} batShutdownSecs=${merged.onBatteryShutdownAfterSecs} sds=${merged.sdsSecs}s ls=${merged.lsSecs}s minWake=${merged.minWakeSecs}s`);
+
+    this.localPowerConfig = { ...merged, lastReadAt: Date.now() };
+    this.emit('powerConfigUpdate', this.localPowerConfig);
+    setTimeout(() => { this.requestPowerConfig().catch(() => {}); }, 200);
+  }
+
+  private parseNetworkConfigSub(buf: Buffer): NetworkConfigSnapshot {
+    let offset = 0;
+    let wifiEnabled = false;
+    let wifiSsid = '';
+    let ethEnabled = false;
+    let ntpServer = '';
+    while (offset < buf.length) {
+      const tag = buf[offset++];
+      const fieldNumber = tag >> 3;
+      const wireType = tag & 0x07;
+      if (wireType === 0) {
+        const { value, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (fieldNumber === 1) wifiEnabled = value !== 0;
+        else if (fieldNumber === 6) ethEnabled = value !== 0;
+      } else if (wireType === 2) {
+        const { value: len, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (offset + len > buf.length) break;
+        const s = buf.subarray(offset, offset + len).toString('utf-8');
+        offset += len;
+        if (fieldNumber === 3) wifiSsid = s;
+        else if (fieldNumber === 5) ntpServer = s;
+      } else if (wireType === 5) { offset += 4; }
+      else if (wireType === 1) { offset += 8; }
+      else break;
+    }
+    return { wifiEnabled, wifiSsid, ethEnabled, ntpServer, lastReadAt: Date.now() };
+  }
+
+  private parsePowerConfigSub(buf: Buffer): PowerConfigSnapshot {
+    let offset = 0;
+    let isPowerSaving = false;
+    let onBatteryShutdownAfterSecs = 0;
+    let waitBluetoothSecs = 60;
+    let sdsSecs = 0;
+    let lsSecs = 300;
+    let minWakeSecs = 10;
+    while (offset < buf.length) {
+      const tag = buf[offset++];
+      const fieldNumber = tag >> 3;
+      const wireType = tag & 0x07;
+      if (wireType === 0) {
+        const { value, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (fieldNumber === 1) isPowerSaving = value !== 0;
+        else if (fieldNumber === 2) onBatteryShutdownAfterSecs = value;
+        else if (fieldNumber === 4) waitBluetoothSecs = value;
+        else if (fieldNumber === 5) sdsSecs = value;
+        else if (fieldNumber === 6) lsSecs = value;
+        else if (fieldNumber === 7) minWakeSecs = value;
+      } else if (wireType === 2) {
+        const { value: len, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        offset += len;
+      } else if (wireType === 5) { offset += 4; }
+      else if (wireType === 1) { offset += 8; }
+      else break;
+    }
+    return { isPowerSaving, onBatteryShutdownAfterSecs, waitBluetoothSecs, sdsSecs, lsSecs, minWakeSecs, lastReadAt: Date.now() };
+  }
 
   /** Snapshot accessor for the most-recently-read LoRa config (or null if never read). */
   getLocalLoraConfig(): LoRaConfigSnapshot | null {
@@ -4665,6 +4871,18 @@ export class MeshtasticSerialBridge extends EventEmitter {
           this.localLoraConfig = snap;
           console.log(`[MeshtasticSerial] LoRa config readback: region=${snap.region} preset=${snap.modemPreset} slot=${snap.frequencySlot} hops=${snap.hopLimit} tx=${snap.txEnabled} usePreset=${snap.usePreset}`);
           this.emit('loraConfigUpdate', snap);
+        } else if (fieldNumber === 4) {
+          // Config.network — v2.0 Beta 2
+          const snap = this.parseNetworkConfigSub(sub);
+          this.localNetworkConfig = snap;
+          console.log(`[MeshtasticSerial] Network config readback: wifi=${snap.wifiEnabled}${snap.wifiSsid ? `/${snap.wifiSsid}` : ''} eth=${snap.ethEnabled} ntp=${snap.ntpServer || '-'}`);
+          this.emit('networkConfigUpdate', snap);
+        } else if (fieldNumber === 3) {
+          // Config.power — v2.0 Beta 2
+          const snap = this.parsePowerConfigSub(sub);
+          this.localPowerConfig = snap;
+          console.log(`[MeshtasticSerial] Power config readback: powerSaving=${snap.isPowerSaving} batShutdownSecs=${snap.onBatteryShutdownAfterSecs} sds=${snap.sdsSecs}s ls=${snap.lsSecs}s minWake=${snap.minWakeSecs}s`);
+          this.emit('powerConfigUpdate', snap);
         }
       } else if (wireType === 0) {
         const { bytesRead } = this.readVarint(buf, offset);

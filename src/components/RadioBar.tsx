@@ -15,21 +15,42 @@ import React from 'react';
 import { Star } from 'lucide-react';
 import { useRadios } from '../hooks/useRadios';
 import { cn } from '../lib/utils';
+import type { Node } from '../types';
 
 interface RadioBarProps {
   /** Live radio-connected state from the bridge (default radio only in Phase 3a). */
   defaultConnected: boolean;
-  /** Total node count, used as the "n nodes" badge until per-radio counts land. */
-  totalNodes: number;
+  /** v2.0 Beta 2: full nodes list. Per-radio counts derive from each node's
+   *  heardByRadios so every pill shows its own scope, including disconnected
+   *  secondaries (their historical heard-by set is what made the row useful). */
+  nodes: Node[];
+  /** v2.0 Beta 2: when true, omit the outer border/background so the bar
+   *  can sit inside a shared wrapper alongside the ViaFilter. */
+  embedded?: boolean;
 }
 
-export function RadioBar({ defaultConnected, totalNodes }: RadioBarProps) {
+export function RadioBar({ defaultConnected, nodes, embedded }: RadioBarProps) {
   const { radios, defaultRadioId, connectionStates, selectedRadioId, setSelectedRadioId } = useRadios();
+  // Pre-compute per-radio heard-by counts so each pill renders its own
+  // tally without re-scanning nodes inside the map callback.
+  const countByRadio = React.useMemo<Record<string, number>>(() => {
+    const out: Record<string, number> = {};
+    for (const r of radios) out[r.radio_id] = 0;
+    for (const n of nodes) {
+      for (const rid of n.heardByRadios ?? []) {
+        if (out[rid] !== undefined) out[rid] += 1;
+      }
+    }
+    return out;
+  }, [radios, nodes]);
 
   if (radios.length === 0) return null;
 
   return (
-    <div className="border-b border-brand-line bg-brand-bg/50 px-3 sm:px-6 py-1.5 flex items-center gap-2 overflow-x-auto">
+    <div className={embedded
+      ? "flex items-center gap-2 overflow-x-auto"
+      : "border-b border-brand-line bg-brand-bg/50 px-3 sm:px-6 py-1.5 flex items-center gap-2 overflow-x-auto"
+    }>
       <button
         onClick={() => setSelectedRadioId(null)}
         className={cn(
@@ -83,11 +104,13 @@ export function RadioBar({ defaultConnected, totalNodes }: RadioBarProps) {
             <span className="opacity-70 normal-case font-normal">
               {r.region ?? '?'} · {r.modem_preset ?? '?'} · slot {r.frequency_slot ?? '?'}
             </span>
-            {isDefault && (
-              <span className="opacity-70 normal-case font-normal">
-                · {totalNodes} nodes
-              </span>
-            )}
+            {/* v2.0 Beta 2: per-radio node count from heardByRadios. Renders
+                for every radio (including disconnected secondaries) so the
+                pill tells you "this radio has heard N peers" — primary is
+                no longer the only one with a tally. */}
+            <span className="opacity-70 normal-case font-normal">
+              · {countByRadio[r.radio_id] ?? 0} nodes
+            </span>
             <span className={connected ? 'text-emerald-400' : 'text-red-400'}>
               {connected ? '✓' : '✗'}
             </span>

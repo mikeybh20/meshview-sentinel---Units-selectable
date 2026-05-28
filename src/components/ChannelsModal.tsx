@@ -92,6 +92,47 @@ function PositionPrecisionPicker({
   );
 }
 
+/**
+ * v2.0 Beta 2 — Per-channel MQTT bridge state badge.
+ *
+ * Four visual states map to the four (uplink, downlink) combinations.
+ * `↑↓` = full bridge (this channel publishes our traffic to the broker
+ * AND ingests bridged traffic from it). `↑` = uplink only — we publish
+ * but don't ingest. `↓` = downlink only — we ingest but don't publish.
+ * `off` = pure RF — neither direction crosses the broker.
+ *
+ * This is the truthful per-channel picture. The old global "MQTT: ACTIVE"
+ * pill in the header tells you the firmware module is on; this tells
+ * you which channels it actually bridges.
+ */
+function ChannelMqttBadge({ up, down }: { up: boolean; down: boolean }) {
+  const tone =
+    up && down ? 'text-brand-accent border-brand-accent/40 bg-brand-accent/10' :
+    up || down ? 'text-amber-300 border-amber-500/40 bg-amber-500/10' :
+                 'text-brand-muted border-brand-line bg-transparent';
+  const arrows =
+    up && down ? '↑↓' :
+    up         ? '↑' :
+    down       ? '↓' :
+                 'off';
+  const title =
+    up && down ? 'MQTT bridge: both directions. This channel\'s traffic is published to the broker and broker-side traffic is injected back in.' :
+    up         ? 'MQTT uplink only: this channel\'s traffic is published to the broker, but broker-side traffic is NOT injected back in.' :
+    down       ? 'MQTT downlink only: broker-side traffic is injected, but this channel\'s traffic is NOT published.' :
+                 'MQTT off: this channel is RF-only. Nothing crosses the broker either way.';
+  return (
+    <span
+      className={cn(
+        "text-[9px] font-bold uppercase tracking-widest mono-text px-1.5 py-0.5 rounded border",
+        tone
+      )}
+      title={title}
+    >
+      MQTT {arrows}
+    </span>
+  );
+}
+
 export function ChannelsModal({ onClose }: ChannelsModalProps) {
   const { radios, defaultRadioId, connectionStates } = useRadios();
   // v2.0 Phase 4: which radio's channel set is being edited. Defaults to the
@@ -256,6 +297,13 @@ export function ChannelsModal({ onClose }: ChannelsModalProps) {
                     <option value="SECONDARY">Secondary</option>
                     <option value="DISABLED">Disabled</option>
                   </select>
+                  {/* v2.0 Beta 2: per-channel MQTT bridge badge. Reflects
+                      uplink/downlink state — the actual gates the firmware
+                      uses to decide whether traffic on this channel slot
+                      crosses the broker. Sits at-a-glance next to the
+                      role so operators can see "this channel goes public"
+                      without expanding the edit form. */}
+                  <ChannelMqttBadge up={ch.uplinkEnabled} down={ch.downlinkEnabled} />
                 </div>
                 <button
                   onClick={() => handleRemove(ch.index)}

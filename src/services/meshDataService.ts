@@ -554,7 +554,35 @@ export class MeshDataService {
     }
   }
 
-  async getRadioConnections(): Promise<{ states: Record<string, { connected: boolean; transport: string | null }>; defaultRadioId: string | null } | null> {
+  /**
+   * v2.0 Beta 2: hot-swap which radio holds the singleton bridge. The current
+   * singleton is disconnected and the target's transport is re-opened as the
+   * singleton. The previous singleton is left disconnected — caller can
+   * re-attach it as a secondary via connectRadio() afterward.
+   */
+  async promoteRadioToSingleton(radioId: string): Promise<{ ok: boolean; previousSingleton?: string; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/promote-to-singleton`, { method: 'POST' });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true, previousSingleton: body.previousSingleton };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'request failed' };
+    }
+  }
+
+  async getRadioConnections(): Promise<{
+    states: Record<string, {
+      connected: boolean;
+      transport: string | null;
+      firmwareVersion: string | null;
+      rebootCount: number | null;
+      battery: number | null;
+      voltage: number | null;
+      localNodeId: string | null;
+    }>;
+    defaultRadioId: string | null;
+  } | null> {
     try {
       const res = await fetch(`${API_BASE}/api/mesh/radios/connections`);
       if (!res.ok) return null;
@@ -596,7 +624,13 @@ export class MeshDataService {
     target: string;
     timeout_ms?: number;
   }): Promise<
-    | { ok: true; identity?: { shortName: string; longName: string; nodeId: string }; lora?: { region: number; modemPreset: number; frequencySlot: number; hopLimit: number } }
+    | { ok: true;
+        identity?: { shortName: string; longName: string; nodeId: string };
+        lora?: { region: number; modemPreset: number; frequencySlot: number; hopLimit: number };
+        /** v2.0 bugfix: set when the target is already held by a connected radio.
+         *  The identity/lora fields reflect the live state from that bridge. */
+        alreadyConnectedAs?: string;
+      }
     | { ok: false; error: string }
   > {
     try {
@@ -625,6 +659,70 @@ export class MeshDataService {
     try {
       const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/lora/refresh`, {
         method: 'POST',
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'request failed' };
+    }
+  }
+
+  // v2.0 Beta 2: Network config (WiFi/Ethernet) — read-only in the UI for now.
+  async getRadioNetwork(radioId: string): Promise<{ live: {
+    wifiEnabled: boolean; wifiSsid: string; ethEnabled: boolean; ntpServer: string;
+  } | null } | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/network`);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  }
+  async refreshRadioNetwork(radioId: string): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/network/refresh`, { method: 'POST' });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'request failed' };
+    }
+  }
+
+  // v2.0 Beta 2: Power config (sleep / battery shutdown).
+  async getRadioPower(radioId: string): Promise<{ live: {
+    isPowerSaving: boolean; onBatteryShutdownAfterSecs: number;
+    waitBluetoothSecs: number; sdsSecs: number; lsSecs: number; minWakeSecs: number;
+  } | null } | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/power`);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  }
+  async refreshRadioPower(radioId: string): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/power/refresh`, { method: 'POST' });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'request failed' };
+    }
+  }
+  async setRadioPower(radioId: string, patch: Partial<{
+    isPowerSaving: boolean;
+    onBatteryShutdownAfterSecs: number;
+    waitBluetoothSecs: number;
+    sdsSecs: number;
+    lsSecs: number;
+    minWakeSecs: number;
+  }>): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/power`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };

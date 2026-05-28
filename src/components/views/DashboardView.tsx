@@ -1052,7 +1052,7 @@ interface DashboardViewProps {
   setConfiguringNodeId: (id: string) => void;
   setIsEditingDashboard: (v: boolean) => void;
   dashboardWidgets: WidgetConfig[];
-  stats: { total: number; online: number; offline: number; favorites: number };
+  stats: { total: number; online: number; offline: number; favorites: number; lora: number; mqtt: number; unknownVia: number };
   unitSystem: UnitSystem;
   onToggleFavorite: (nodeId: string, favorite: boolean) => void;
   groups: Group[];
@@ -1224,8 +1224,23 @@ export function DashboardView({
                 // Favorites). The Environment card was retired — average
                 // temperature across the mesh wasn't actionable and the live
                 // env data already surfaces on the Node Info panel per node.
+                //
+                // v2.0 Beta 2: the "Nodes Online" subtitle now splits the
+                // count into RF vs MQTT-bridged so the operator sees, at a
+                // glance, how many peers are actually reachable over the air
+                // vs. just observed through the broker. Default public
+                // LongFast installs typically show ~10 RF · 200+ MQTT.
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                  <StatCard label="Nodes Online" value={`${stats.offline + stats.online}`} subValue={`${stats.online} Active`} icon={<Wifi size={20} className="text-brand-accent"/>} />
+                  <StatCard
+                    label="Nodes Online"
+                    value={`${stats.offline + stats.online}`}
+                    subValue={
+                      stats.mqtt > 0
+                        ? `${stats.lora} RF · ${stats.mqtt} MQTT`
+                        : `${stats.online} Active`
+                    }
+                    icon={<Wifi size={20} className="text-brand-accent"/>}
+                  />
                   <StatCard label="Total Messages" value={`${messages.length}`} subValue="Last hour" icon={<MessageSquare size={20} className="text-blue-400"/>} />
                   <StatCard label="Favorites" value={`${stats.favorites}`} subValue="Prioritized" icon={<Star size={20} className="text-yellow-400"/>} />
                 </div>

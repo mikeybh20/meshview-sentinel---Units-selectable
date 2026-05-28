@@ -473,8 +473,13 @@ app.delete('/api/mesh/radios/:radioId', (req, res) => {
   const db = meshDb();
   const existing = db.getRadio(radioId);
   if (!existing) return res.status(404).json({ error: 'radio not found' });
-  if (existing.is_default) {
-    return res.status(409).json({ error: 'cannot delete the default radio — set another default first' });
+  // v2.0 bugfix: gate deletion on the LIVE singleton, not the DB column —
+  // the DB column reflects operator preference and might point at a radio
+  // that isn't currently connected (which is fine to delete). What we
+  // really can't delete is whichever radio is currently held by the
+  // auto-discovered singleton bridge.
+  if (radioId === bridgeManager.getDefaultRadioId()) {
+    return res.status(409).json({ error: 'cannot delete the currently auto-connected singleton radio' });
   }
   const ok = db.deleteRadio(radioId);
   if (!ok) return res.status(500).json({ error: 'delete failed' });
@@ -506,6 +511,13 @@ app.post('/api/mesh/radios/:radioId/disconnect', async (req, res) => {
   return res.json({ ok: true });
 });
 
+// v2.0 Beta 2: hot-swap the singleton. See BridgeManager.promoteToSingleton.
+app.post('/api/mesh/radios/:radioId/promote-to-singleton', async (req, res) => {
+  const result = await bridgeManager.promoteToSingleton(req.params.radioId);
+  if (!result.ok) return res.status(409).json({ error: (result as { ok: false; error: string }).error });
+  return res.json(result);
+});
+
 app.get('/api/mesh/radios/connections', (_req, res) => {
   return res.json({
     states: bridgeManager.connectionStates(),
@@ -529,6 +541,61 @@ app.post('/api/mesh/radios/test', async (req, res) => {
   if (!target) return res.status(400).json({ error: 'target is required' });
   const timeoutMs = Number.isFinite(body.timeout_ms) ? Math.max(500, Math.min(15000, Math.floor(body.timeout_ms))) : 5000;
 
+  // v2.0 bugfix: serial ports are exclusive — if the requested target is
+  // already held by a connected radio (default or secondary), a fresh open
+  // attempt fails with "Resource temporarily unavailable, cannot lock port".
+  // Detect that case and return the LIVE state from the already-connected
+  // bridge instead, so the caller sees the radio's real identity + LoRa
+  // config without the doomed reopen.
+  const conflictingCtx = bridgeManager.list().find(c => c.meta.target === target && c.bridge.connected);
+  if (conflictingCtx) {
+    const live = conflictingCtx.bridge.getLocalLoraConfig();
+    const localId = conflictingCtx.bridge.getLocalNodeId();
+    const localNode = localId ? conflictingCtx.bridge.getNodes().find(n => n.id === localId) : undefined;
+    if (localNode) {
+      return res.json({
+        ok: true,
+        identity: {
+          shortName: localNode.shortName ?? conflictingCtx.radioId,
+          longName:  localNode.name ?? '',
+          nodeId:    localId ?? '',
+        },
+        lora: live ? {
+          region:        live.region,
+          modemPreset:   live.modemPreset,
+          frequencySlot: live.frequencySlot,
+          hopLimit:      live.hopLimit,
+        } : undefined,
+        alreadyConnectedAs: conflictingCtx.radioId,
+      });
+    }
+  }
+  // Same for the default radio (which isn't in bridgeManager.list() the
+  // same way — its bridge IS the singleton meshBridge).
+  const defaultCtx = bridgeManager.getDefault();
+  if (defaultCtx && defaultCtx.bridge.connected && defaultCtx.meta.target === target) {
+    const live = defaultCtx.bridge.getLocalLoraConfig();
+    const localId = defaultCtx.bridge.getLocalNodeId();
+    const localNode = localId ? defaultCtx.bridge.getNodes().find(n => n.id === localId) : undefined;
+    if (localNode) {
+      return res.json({
+        ok: true,
+        identity: {
+          shortName: localNode.shortName ?? defaultCtx.radioId,
+          longName:  localNode.name ?? '',
+          nodeId:    localId ?? '',
+        },
+        lora: live ? {
+          region:        live.region,
+          modemPreset:   live.modemPreset,
+          frequencySlot: live.frequencySlot,
+          hopLimit:      live.hopLimit,
+        } : undefined,
+        alreadyConnectedAs: defaultCtx.radioId,
+      });
+    }
+  }
+
   const r = await testTransportConnection({ transport: transport as 'serial' | 'tcp', target, timeoutMs });
   if (!r.ok) return res.status(502).json({ error: (r as { ok: false; error: string }).error });
   return res.json(r);
@@ -537,18 +604,23 @@ app.post('/api/mesh/radios/test', async (req, res) => {
 // --- LoRa config read + write (firmware admin) ---
 // GET returns the most-recently-read LoRa config from the radio + the cached
 // radios.row values. POST writes new values via admin.set_config and triggers
-// a fresh readback. Only valid for the default radio in Phase 2 — Phase 3+
-// will scope this per radio_id when secondary bridges land.
+// a fresh readback.
+//
+// v2.0 bugfix: previously these endpoints all read/wrote against the default
+// bridge regardless of `:radioId`. For multi-radio operators that meant the
+// NOVA radio's LoRa editor would display MBNT's slot. Now we resolve the
+// per-radio bridge via bridgeManager.get(radioId) and route there.
 app.get('/api/mesh/radios/:radioId/lora', (req, res) => {
   const { radioId } = req.params;
   const row = meshDb().getRadio(radioId);
   if (!row) return res.status(404).json({ error: 'radio not found' });
 
   const ctx = bridgeManager.get(radioId);
-  const live = ctx ? meshBridge.getLocalLoraConfig() : null;
+  // Each bridge holds its OWN LoRa snapshot — read from the matching one.
+  const live = ctx ? ctx.bridge.getLocalLoraConfig() : null;
   return res.json({
     radio: row,
-    live, // null until first readback completes
+    live, // null until first readback completes for this specific radio
   });
 });
 
@@ -556,10 +628,59 @@ app.post('/api/mesh/radios/:radioId/lora/refresh', async (req, res) => {
   const { radioId } = req.params;
   const ctx = bridgeManager.get(radioId);
   if (!ctx) return res.status(404).json({ error: 'radio not found or not connected' });
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  if (!ctx.bridge.connected) return res.status(503).json({ error: `radio "${radioId}" is not connected` });
 
   try {
-    await meshBridge.requestLoraConfig();
+    await ctx.bridge.requestLoraConfig();
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// --- v2.0 Beta 2: Network + Power config admin (per radio) ---
+app.get('/api/mesh/radios/:radioId/network', (req, res) => {
+  const ctx = bridgeManager.get(req.params.radioId);
+  if (!ctx) return res.status(404).json({ error: 'radio not found or not connected' });
+  return res.json({ live: ctx.bridge.getLocalNetworkConfig() });
+});
+
+app.post('/api/mesh/radios/:radioId/network/refresh', async (req, res) => {
+  const ctx = bridgeManager.get(req.params.radioId);
+  if (!ctx) return res.status(404).json({ error: 'radio not found or not connected' });
+  if (!ctx.bridge.connected) return res.status(503).json({ error: `radio "${req.params.radioId}" is not connected` });
+  try { await ctx.bridge.requestNetworkConfig(); return res.json({ ok: true }); }
+  catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/mesh/radios/:radioId/power', (req, res) => {
+  const ctx = bridgeManager.get(req.params.radioId);
+  if (!ctx) return res.status(404).json({ error: 'radio not found or not connected' });
+  return res.json({ live: ctx.bridge.getLocalPowerConfig() });
+});
+
+app.post('/api/mesh/radios/:radioId/power/refresh', async (req, res) => {
+  const ctx = bridgeManager.get(req.params.radioId);
+  if (!ctx) return res.status(404).json({ error: 'radio not found or not connected' });
+  if (!ctx.bridge.connected) return res.status(503).json({ error: `radio "${req.params.radioId}" is not connected` });
+  try { await ctx.bridge.requestPowerConfig(); return res.json({ ok: true }); }
+  catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/mesh/radios/:radioId/power', async (req, res) => {
+  const ctx = bridgeManager.get(req.params.radioId);
+  if (!ctx) return res.status(404).json({ error: 'radio not found or not connected' });
+  if (!ctx.bridge.connected) return res.status(503).json({ error: `radio "${req.params.radioId}" is not connected` });
+  const body = req.body ?? {};
+  try {
+    await ctx.bridge.setPowerConfig({
+      isPowerSaving:              typeof body.isPowerSaving === 'boolean'              ? body.isPowerSaving              : undefined,
+      onBatteryShutdownAfterSecs: typeof body.onBatteryShutdownAfterSecs === 'number'  ? body.onBatteryShutdownAfterSecs : undefined,
+      waitBluetoothSecs:          typeof body.waitBluetoothSecs === 'number'           ? body.waitBluetoothSecs          : undefined,
+      sdsSecs:                    typeof body.sdsSecs === 'number'                     ? body.sdsSecs                    : undefined,
+      lsSecs:                     typeof body.lsSecs === 'number'                      ? body.lsSecs                     : undefined,
+      minWakeSecs:                typeof body.minWakeSecs === 'number'                 ? body.minWakeSecs                : undefined,
+    });
     return res.json({ ok: true });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
@@ -569,20 +690,12 @@ app.post('/api/mesh/radios/:radioId/lora/refresh', async (req, res) => {
 app.put('/api/mesh/radios/:radioId/lora', async (req, res) => {
   const { radioId } = req.params;
   const ctx = bridgeManager.get(radioId);
-  if (!ctx) return res.status(404).json({ error: 'radio not found' });
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
-
-  // Only the default radio is wired in Phase 2 — Phase 3+ will route
-  // per-radio admin via the corresponding RadioContext bridge.
-  if (radioId !== bridgeManager.getDefaultRadioId()) {
-    return res.status(501).json({
-      error: 'Writing LoRa config to non-default radios lands in Phase 3 (multi-bridge support)',
-    });
-  }
+  if (!ctx) return res.status(404).json({ error: 'radio not found or not connected' });
+  if (!ctx.bridge.connected) return res.status(503).json({ error: `radio "${radioId}" is not connected` });
 
   const body = req.body ?? {};
   try {
-    await meshBridge.setLoraConfig({
+    await ctx.bridge.setLoraConfig({
       region:        typeof body.region === 'number'        ? body.region        : undefined,
       modemPreset:   typeof body.modemPreset === 'number'   ? body.modemPreset   : undefined,
       usePreset:     typeof body.usePreset === 'boolean'    ? body.usePreset     : undefined,

@@ -41,6 +41,8 @@ import { ImportModal } from './components/ImportModal';
 import { DashboardDesigner } from './components/DashboardDesigner';
 import { RadioBar } from './components/RadioBar';
 import { RefreshSplitButton } from './components/RefreshSplitButton';
+import { RadiosView } from './components/views/RadiosView';
+import { ViaFilter, ViaFilterValue } from './components/ViaFilter';
 import { useRadios } from './hooks/useRadios';
 // RecipeView moved into SettingsModal as the "Install Guide" tab; the standalone
 // dashboard page was removed per operator request to keep the main nav focused
@@ -62,7 +64,7 @@ export default function App() {
   const [nodes, setNodes] = React.useState<Node[]>([]);
   const [messages, setMessages] = React.useState<Message[]>([]);
   const [events, setEvents] = React.useState<RadioEvent[]>([]);
-  const [activeTab, setActiveTab] = React.useState<'dashboard' | 'map' | 'messages' | 'logs' | 'matrix' | 'topology' | 'mail'>('dashboard');
+  const [activeTab, setActiveTab] = React.useState<'dashboard' | 'map' | 'messages' | 'logs' | 'matrix' | 'topology' | 'mail' | 'radios'>('dashboard');
   const [selectedNodeId, setSelectedNodeId] = React.useState<string | null>(null);
   const [configuringNodeId, setConfiguringNodeId] = React.useState<string | null>(null);
   const [showExportModal, setShowExportModal] = React.useState(false);
@@ -159,7 +161,15 @@ export default function App() {
   const [ackStatuses, setAckStatuses] = React.useState<Record<string, { status: string; errorCode: number }>>({});
   
   // v2.0 multi-radio: the active per-radio filter from the RadioBar (null = "all").
-  const { selectedRadioId } = useRadios();
+  const { selectedRadioId, defaultRadioId } = useRadios();
+  // v2.0 Beta 2: orthogonal transport filter (RF vs MQTT-bridged). Persisted
+  // to localStorage so the operator's preference survives reloads.
+  const [selectedVia, setSelectedVia] = React.useState<ViaFilterValue>(() => {
+    try { return (localStorage.getItem('mesh.selectedVia') as ViaFilterValue) || 'all'; } catch { return 'all'; }
+  });
+  React.useEffect(() => {
+    try { localStorage.setItem('mesh.selectedVia', selectedVia); } catch {}
+  }, [selectedVia]);
 
   // Grouping State — groups are persisted server-side; we mirror them here.
   const [groups, setGroups] = React.useState<Group[]>([]);
@@ -350,7 +360,7 @@ export default function App() {
 
   const handleSendMessage = async (
     overrideText?: string,
-    opts?: { replyTo?: number; isReaction?: boolean },
+    opts?: { replyTo?: number; isReaction?: boolean; radioId?: string | null },
   ) => {
     const text = overrideText ?? draftMessage;
     if (!text.trim()) return;
@@ -358,11 +368,16 @@ export default function App() {
       const channelIndex = activeChannel?.index ?? 0;
       const to = activeChannel ? '!ffffffff' : activeChatId;
       if (!overrideText) setDraftMessage('');
-      // v2.0 Phase 4: route through the currently-selected radio if any.
-      // null = "All Radios" filter → send through the default radio.
+      // v2.0 Beta 2: routing precedence —
+      //   1) Explicit opts.radioId wins (reply paths pass the original
+      //      message's radioId here so the reply lands in the same mesh)
+      //   2) Otherwise the RadioBar's selectedRadioId scopes the send
+      //   3) Otherwise the primary (server falls back to default)
+      const routeRadio = opts?.radioId !== undefined ? opts.radioId : selectedRadioId;
       await meshDataService.sendMessage(text, to, channelIndex, {
-        ...opts,
-        radioId: selectedRadioId,
+        replyTo: opts?.replyTo,
+        isReaction: opts?.isReaction,
+        radioId: routeRadio,
       });
     } else {
       setDraftMessage('');
@@ -460,6 +475,13 @@ export default function App() {
       result = result.filter(n => n.heardByRadios?.includes(selectedRadioId));
     }
 
+    // v2.0 Beta 2: transport filter (RF vs MQTT-bridged).
+    if (selectedVia === 'lora') {
+      result = result.filter(n => n.lastVia === 'lora');
+    } else if (selectedVia === 'mqtt') {
+      result = result.filter(n => n.lastVia === 'mqtt');
+    }
+
     if (selectedGroupId === 'favorites') {
       result = result.filter(n => n.favorite);
     } else if (selectedGroupId !== 'all') {
@@ -470,12 +492,29 @@ export default function App() {
       n.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
       n.id.toLowerCase().includes(searchQuery.toLowerCase())
     );
-  }, [nodes, searchQuery, selectedGroupId, selectedRadioId]);
+  }, [nodes, searchQuery, selectedGroupId, selectedRadioId, selectedVia]);
+
+  // v2.0 Beta 2: counts for the ViaFilter chip labels. Scoped to the
+  // active radio so the numbers match what the user is actually looking at.
+  const viaCounts = React.useMemo(() => {
+    const scope = selectedRadioId
+      ? nodes.filter(n => n.heardByRadios?.includes(selectedRadioId))
+      : nodes;
+    return {
+      all:  scope.length,
+      lora: scope.filter(n => n.lastVia === 'lora').length,
+      mqtt: scope.filter(n => n.lastVia === 'mqtt').length,
+    };
+  }, [nodes, selectedRadioId]);
 
   // v2.0 Phase 4: when a per-radio filter is active, scope stats to nodes
   // that this radio has actually heard so the cards reflect the meshes the
   // operator is currently looking at. With no filter, totals span every
   // connected mesh.
+  //
+  // v2.0 Beta 2: also split by transport (RF vs MQTT-bridged) so the
+  // "Nodes Online" card stops conflating local mesh peers with the public
+  // MQTT firehose. `lora` = packets arriving over RF; `mqtt` = bridged.
   const stats = React.useMemo(() => {
     const scope = selectedRadioId
       ? nodes.filter(n => n.heardByRadios?.includes(selectedRadioId))
@@ -485,6 +524,13 @@ export default function App() {
       online: scope.filter(n => n.online).length,
       offline: scope.filter(n => !n.online).length,
       favorites: scope.filter(n => n.favorite).length,
+      lora: scope.filter(n => n.lastVia === 'lora').length,
+      mqtt: scope.filter(n => n.lastVia === 'mqtt').length,
+      // The rest — nodes we've seen but whose last packet didn't carry a
+      // recognizable transport flag (e.g. legacy 1.x data, or nodes hydrated
+      // from DB before they re-broadcast). Surface separately so the card
+      // doesn't lie about the count.
+      unknownVia: scope.filter(n => !n.lastVia).length,
     };
   }, [nodes, selectedRadioId]);
 
@@ -592,11 +638,20 @@ export default function App() {
             icon={<Signal size={20} />}
             label="Comm Matrix"
           />
-          <NavItem 
-            active={activeTab === 'topology'} 
+          <NavItem
+            active={activeTab === 'topology'}
             onClick={() => setActiveTab('topology')}
             icon={<Activity size={20} />}
             label="Topology"
+          />
+          {/* v2.0 Beta 2: Radios promoted out of Settings into top-level nav
+              so multi-radio operators have a first-class home for connect /
+              disconnect / LoRa config without burrowing into Settings. */}
+          <NavItem
+            active={activeTab === 'radios'}
+            onClick={() => setActiveTab('radios')}
+            icon={<Radio size={20} />}
+            label="Radios"
           />
           {/* Recipe / Installation Guide moved to Settings → Install Guide. */}
           
@@ -605,8 +660,8 @@ export default function App() {
                 between live and simulator now lives in Settings → Mode so
                 operators can't accidentally flip into demo data mid-session. */}
             <button
-              onClick={() => setShowSettings(true)}
-              title="Open Settings → Mode to switch between Live and Simulator"
+              onClick={() => setActiveTab('radios')}
+              title="Open the Radios panel — primary radio identity + transport"
               className={cn(
                 "w-full h-10 flex items-center justify-center md:justify-start gap-3 px-3 rounded-lg transition-all group cursor-pointer",
                 dataSource === 'live'
@@ -621,9 +676,19 @@ export default function App() {
               <div className="hidden md:flex flex-col items-start overflow-hidden flex-1">
                 <span className="text-[10px] font-bold uppercase tracking-widest leading-none">
                   {dataSource === 'live'
-                    ? (radioConnected && transport?.mode === 'tcp' ? 'TCP RADIO'
-                      : radioConnected && transport?.mode === 'serial' ? 'SERIAL RADIO'
-                      : 'LIVE RADIO')
+                    ? (radioConnected
+                        // v2.0 Beta 2: surface the singleton's radio_id alongside
+                        // the transport type so this badge matches the star in
+                        // the Radios panel. e.g. "SERIAL · WRTJ" or "TCP · MBNT".
+                        ? (() => {
+                            const transportLabel = transport?.mode === 'tcp' ? 'TCP'
+                              : transport?.mode === 'serial' ? 'SERIAL'
+                              : 'RADIO';
+                            return defaultRadioId
+                              ? `${transportLabel} · ${defaultRadioId}`
+                              : `${transportLabel} RADIO`;
+                          })()
+                        : 'LIVE RADIO')
                     : 'SIMULATOR'}
                 </span>
                 <span className={cn(
@@ -802,8 +867,24 @@ export default function App() {
           </div>
         </header>
 
-        {/* v2.0 multi-radio: radio filter bar (hidden when no radios configured) */}
-        <RadioBar defaultConnected={radioConnected} totalNodes={nodes.length} />
+        {/* v2.0 multi-radio: radio filter bar + transport filter chips.
+            Both hide when there's nothing to filter against (no radios
+            configured, no MQTT traffic in scope). When both are visible
+            they share a single horizontal row; the RadioBar handles its
+            own left-aligned layout, the ViaFilter sits on the right. */}
+        {(() => {
+          const showRadioBar = true; // RadioBar handles its own visibility check
+          return (
+            <div className="border-b border-brand-line bg-brand-bg/50 px-3 sm:px-6 py-1.5 flex items-center justify-between gap-3 overflow-x-auto">
+              {showRadioBar && (
+                <div className="flex items-center gap-2 flex-shrink-0">
+                  <RadioBar defaultConnected={radioConnected} nodes={nodes} embedded />
+                </div>
+              )}
+              <ViaFilter value={selectedVia} onChange={setSelectedVia} counts={viaCounts} />
+            </div>
+          );
+        })()}
 
         {/* View Layout */}
         <div className="flex-1 relative overflow-hidden">
@@ -1034,8 +1115,20 @@ export default function App() {
               </motion.div>
             )}
 
+            {activeTab === 'radios' && (
+              <motion.div
+                key="radios"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                className="h-full"
+              >
+                <RadiosView />
+              </motion.div>
+            )}
+
             {activeTab === 'topology' && (
-              <motion.div 
+              <motion.div
                 key="topology"
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}

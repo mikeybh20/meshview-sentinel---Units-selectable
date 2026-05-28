@@ -10,6 +10,7 @@ import { ChannelItem } from '../ui/ChannelItem';
 import { HopNode } from '../ui/HopNode';
 import { meshDataService } from '../../services/meshDataService';
 import { parseMentions } from '../../lib/mentions';
+import { useRadios } from '../../hooks/useRadios';
 
 interface MessagesViewProps {
   nodes: Node[];
@@ -25,7 +26,7 @@ interface MessagesViewProps {
   setActiveTab: (tab: 'map') => void;
   draftMessage: string;
   setDraftMessage: (msg: string) => void;
-  handleSendMessage: (overrideText?: string, opts?: { replyTo?: number; isReaction?: boolean }) => void;
+  handleSendMessage: (overrideText?: string, opts?: { replyTo?: number; isReaction?: boolean; radioId?: string | null }) => void;
   onManageChannels: () => void;
   localNodeId: string | null;
   blockedNodeIds: Set<string>;
@@ -219,6 +220,15 @@ export function MessagesView({
   const messageRefs = React.useRef<Map<string, HTMLDivElement>>(new Map());
   const [highlightId, setHighlightId] = React.useState<string | null>(null);
 
+  // v2.0 multi-radio: look up the per-radio color for the message chip.
+  const { radios } = useRadios();
+  const radioColors = React.useMemo<Record<string, string>>(() => {
+    const m: Record<string, string> = {};
+    for (const r of radios) if (r.color_hex) m[r.radio_id] = r.color_hex;
+    return m;
+  }, [radios]);
+  const showRadioChips = radios.length > 1;
+
   // Auto-scroll to bottom when new messages arrive (suppressed briefly while a
   // search-result highlight is anchoring on a specific older message).
   React.useEffect(() => {
@@ -276,7 +286,13 @@ export function MessagesView({
 
   const handleReact = (parent: Message, emoji: string) => {
     if (typeof parent.packetId !== 'number') return;
-    handleSendMessage(emoji, { replyTo: parent.packetId, isReaction: true });
+    // v2.0 multi-radio: reactions go out via the radio that received the
+    // parent message so they land in the same mesh.
+    handleSendMessage(emoji, {
+      replyTo: parent.packetId,
+      isReaction: true,
+      radioId: parent.radioId ?? undefined,
+    });
     setReactPickerForId(null);
   };
 
@@ -330,7 +346,14 @@ export function MessagesView({
 
   const handleSendWithReply = () => {
     if (replyingTo && typeof replyingTo.packetId === 'number') {
-      handleSendMessage(undefined, { replyTo: replyingTo.packetId });
+      // v2.0 multi-radio: route the reply through the radio that received
+      // the original. Otherwise a reply on (e.g.) WRTJ's LongFast would
+      // go out on 3BEC's LongFast — a totally different mesh — and the
+      // sender would never see it.
+      handleSendMessage(undefined, {
+        replyTo: replyingTo.packetId,
+        radioId: replyingTo.radioId ?? undefined,
+      });
     } else {
       handleSendMessage();
     }
@@ -572,6 +595,23 @@ export function MessagesView({
                       {isOwn ? 'You' : senderName}
                     </span>
                     <span className="text-[10px] mono-text text-brand-muted">{new Date(m.timestamp).toLocaleTimeString()}</span>
+                    {/* v2.0 multi-radio: tag the message with the radio that
+                        received (or sent) it, so messages from different
+                        meshes don't blend into one ambiguous stream. Hidden
+                        when only one radio is registered (no ambiguity). */}
+                    {showRadioChips && m.radioId && (
+                      <span
+                        title={isOwn ? `Sent via ${m.radioId}` : `Received via ${m.radioId}`}
+                        className="text-[8px] font-bold mono-text px-1 py-px rounded border"
+                        style={{
+                          color: radioColors[m.radioId] ?? '#888',
+                          borderColor: `${radioColors[m.radioId] ?? '#888'}55`,
+                          background: `${radioColors[m.radioId] ?? '#888'}15`,
+                        }}
+                      >
+                        {isOwn ? '→ ' : '← '}{m.radioId}
+                      </span>
+                    )}
                     {isNew && (
                       <span
                         className="text-[8px] mono-text uppercase font-bold tracking-widest text-brand-warning bg-brand-warning/10 border border-brand-warning/30 rounded px-1 py-px"

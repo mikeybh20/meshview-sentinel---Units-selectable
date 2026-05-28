@@ -32,6 +32,7 @@ const FORWARDED_EVENTS = [
   'channelUpdate', 'waypointsChanged', 'traceUpdate',
   'neighborInfoUpdate', 'storeForwardUpdate',
   'localModuleConfigUpdate', 'loraConfigUpdate',
+  'networkConfigUpdate', 'powerConfigUpdate',
   'ackUpdate', 'bbsMail', 'bbsSubscriber',
 ] as const;
 
@@ -226,6 +227,15 @@ class BridgeManager extends EventEmitter {
     this.defaultRadioId = shortName;
     this.defaultRegistered = true;
 
+    // v2.0 bugfix: ensure the DB's is_default reflects the auto-connected
+    // radio. Without this, hot-swapping radios leaves the DB column pinned
+    // to the original default, causing spawnSecondary to refuse legitimate
+    // Connect requests on the previously-default radio.
+    if (!row.is_default) {
+      meshDb().setDefaultRadio(shortName);
+      ctx.meta = { ...ctx.meta, is_default: 1 };
+    }
+
     // Tell the bridge its radio_id so every upserted node carries this
     // bridge as a "heard by" entry. Backfills existing nodes too.
     bridge.setRadioId(shortName);
@@ -240,6 +250,10 @@ class BridgeManager extends EventEmitter {
     bridge.requestLoraConfig().catch(err => {
       console.warn('[BridgeManager] initial LoRa readback failed:', err?.message ?? err);
     });
+    // v2.0 Beta 2: also ask for Network + Power configs so the Radios view
+    // has them on first paint without the operator clicking Refresh.
+    bridge.requestNetworkConfig().catch(() => {});
+    bridge.requestPowerConfig().catch(() => {});
   }
 
   private guessTarget(bridge: MeshtasticSerialBridge): string {
@@ -271,7 +285,15 @@ class BridgeManager extends EventEmitter {
   async spawnSecondary(radioId: string): Promise<{ ok: true } | { ok: false; error: string }> {
     const row = meshDb().getRadio(radioId);
     if (!row) return { ok: false, error: `radio "${radioId}" not found` };
-    if (row.is_default) return { ok: false, error: 'cannot spawn the default radio (it auto-connects via the singleton bridge)' };
+    // v2.0 bugfix: gate on the LIVE default (the radio currently held by the
+    // singleton bridge) rather than the DB column. They diverge when an
+    // operator hot-swaps radios — the DB row's is_default sticks to whichever
+    // radio was first to auto-discover historically, but the runtime default
+    // is whichever radio claimed the singleton this boot. Blocking on the DB
+    // column would refuse to connect a radio that's actually free to use.
+    if (radioId === this.defaultRadioId) {
+      return { ok: false, error: `"${radioId}" is the currently auto-connected default radio (held by the singleton bridge)` };
+    }
     if (this.contexts.has(radioId)) return { ok: false, error: `radio "${radioId}" is already connected` };
     if (row.transport === 'ble') return { ok: false, error: 'BLE transport not yet implemented' };
 
@@ -294,22 +316,104 @@ class BridgeManager extends EventEmitter {
     this.attachBbs(ctx);
 
     // Wire LoRa-readback so the secondary's row gets stamped with its
-    // firmware's authoritative state when it arrives.
+    // firmware's authoritative state when it arrives. Logs the apply step
+    // for parity with the default radio's applyLoraReadback() path.
     bridge.on('loraConfigUpdate', (snap) => {
       const region        = REGION_LABELS[snap.region]       ?? null;
       const modem_preset  = MODEM_PRESET_LABELS[snap.modemPreset] ?? null;
+      // No-op if nothing changed (avoid pointless DB writes + log spam).
+      if (
+        ctx.meta.region === region &&
+        ctx.meta.modem_preset === modem_preset &&
+        ctx.meta.frequency_slot === snap.frequencySlot &&
+        ctx.meta.num_hops === snap.hopLimit
+      ) return;
       ctx.updateMeta({ region, modem_preset, frequency_slot: snap.frequencySlot, num_hops: snap.hopLimit });
       meshDb().upsertRadio(ctx.meta);
+      console.log(`[BridgeManager] radio ${radioId} meta updated from LoRa readback: region=${region} preset=${modem_preset} slot=${snap.frequencySlot} hops=${snap.hopLimit}`);
     });
 
-    // Kick the readback now so the radio's reported config replaces any
-    // stale UI hints.
-    bridge.requestLoraConfig().catch(err => {
-      console.warn(`[BridgeManager] LoRa readback failed for ${radioId}:`, err?.message ?? err);
-    });
+    // v2.0 bugfix: don't fire requestLoraConfig() immediately — at this
+    // point the transport is open but the radio hasn't yet sent its local
+    // NodeInfo, so bridge.localNodeNum is still 0 and requestLoraConfig
+    // silently returns without sending. Defer until the first nodeUpdate
+    // where identity is known; deregister the listener after the first
+    // successful trigger so we don't request on every node update.
+    const fireOnIdentityKnown = () => {
+      if (!bridge.getLocalNodeId()) return;
+      bridge.off('nodeUpdate', fireOnIdentityKnown);
+      bridge.requestLoraConfig().catch(err => {
+        console.warn(`[BridgeManager] LoRa readback failed for ${radioId}:`, err?.message ?? err);
+      });
+      // v2.0 Beta 2: same Network + Power readbacks as the default radio path.
+      bridge.requestNetworkConfig().catch(() => {});
+      bridge.requestPowerConfig().catch(() => {});
+    };
+    bridge.on('nodeUpdate', fireOnIdentityKnown);
 
     console.log(`[BridgeManager] secondary radio ${radioId} connected via ${row.transport}:${row.target}`);
     return { ok: true };
+  }
+
+  /**
+   * v2.0 Beta 2: hot-swap which radio is the singleton bridge. Disconnects
+   * the current singleton, releases the target radio's secondary bridge (if
+   * connected as a secondary), and reconnects meshBridge to the target's
+   * transport. The new radio's NodeInfo will fire tryAutoRegisterDefault on
+   * arrival and promote it to the runtime default. The previous singleton
+   * is left disconnected; the operator can click Connect on its row to
+   * re-attach it as a secondary.
+   *
+   * Replaces the old "Set Default" which only flipped a DB column without
+   * actually affecting which radio held the singleton bridge.
+   */
+  async promoteToSingleton(radioId: string): Promise<{ ok: true; previousSingleton?: string } | { ok: false; error: string }> {
+    const row = meshDb().getRadio(radioId);
+    if (!row) return { ok: false, error: `radio "${radioId}" not found` };
+    if (radioId === this.defaultRadioId) return { ok: true };
+    if (row.transport === 'ble') return { ok: false, error: 'BLE transport not supported' };
+
+    const previousSingleton = this.defaultRadioId;
+
+    // 1. If the target is currently connected as a secondary, tear that
+    //    bridge down so its serial port (or TCP socket) is free for the
+    //    singleton's connect call to grab.
+    if (this.contexts.has(radioId) && radioId !== previousSingleton) {
+      const ctx = this.contexts.get(radioId)!;
+      try { await ctx.bridge.disconnect(); } catch { /* best-effort */ }
+      this.detachForwarders(radioId);
+      this.contexts.delete(radioId);
+    }
+
+    // 2. Disconnect the current singleton (frees its serial port too, in
+    //    case promotion is happening in the opposite direction next).
+    try { await meshBridge.disconnect(); } catch { /* best-effort */ }
+    if (previousSingleton) {
+      // Remove the old singleton's context entry so the radios list and
+      // /api/mesh/radios/connections both stop reporting it as connected
+      // until the operator chooses to re-spawn it as a secondary.
+      this.contexts.delete(previousSingleton);
+    }
+
+    // 3. Reset the singleton-registration latches so tryAutoRegisterDefault
+    //    fires fresh for the new radio's NodeInfo arrival.
+    this.defaultRadioId = null;
+    this.defaultRegistered = false;
+
+    // 4. Reconnect the singleton bridge to the new target.
+    try {
+      if (row.transport === 'tcp') {
+        const { host, port } = parseTcpTarget(row.target);
+        await meshBridge.connectTcp(host, port);
+      } else {
+        await meshBridge.connect(row.target);
+      }
+    } catch (err: any) {
+      return { ok: false, error: err?.message ?? 'singleton reconnect failed' };
+    }
+
+    console.log(`[BridgeManager] promoted ${radioId} to singleton; previous = ${previousSingleton ?? '<none>'}`);
+    return { ok: true, previousSingleton: previousSingleton ?? undefined };
   }
 
   async disconnectRadio(radioId: string): Promise<{ ok: true } | { ok: false; error: string }> {
@@ -327,13 +431,45 @@ class BridgeManager extends EventEmitter {
     return { ok: true };
   }
 
-  /** Per-radio connection state, for the UI. Default radio always present even before its identity arrives. */
-  connectionStates(): Record<string, { connected: boolean; transport: 'serial' | 'tcp' | 'ble' | null }> {
-    const out: Record<string, { connected: boolean; transport: 'serial' | 'tcp' | 'ble' | null }> = {};
+  /**
+   * Per-radio connection state, for the UI. Default radio always present
+   * even before its identity arrives. v2.0 Beta 2: includes radio health
+   * fields (firmware, reboot count, battery, voltage) so the Radios view
+   * can render a compact health summary per row without a separate fetch.
+   */
+  connectionStates(): Record<string, {
+    connected: boolean;
+    transport: 'serial' | 'tcp' | 'ble' | null;
+    firmwareVersion: string | null;
+    rebootCount: number | null;
+    battery: number | null;
+    voltage: number | null;
+    localNodeId: string | null;
+  }> {
+    const out: Record<string, {
+      connected: boolean;
+      transport: 'serial' | 'tcp' | 'ble' | null;
+      firmwareVersion: string | null;
+      rebootCount: number | null;
+      battery: number | null;
+      voltage: number | null;
+      localNodeId: string | null;
+    }> = {};
     for (const ctx of this.contexts.values()) {
+      // Pull battery/voltage off the local node's latest telemetry. Both
+      // Heltec V3 and V4 report these via the firmware's battery_level
+      // pin (GPIO 37 on V3, similar on V4). Boards without monitoring
+      // return null.
+      const localId = ctx.bridge.getLocalNodeId();
+      const localNode = localId ? ctx.bridge.getNodes().find(n => n.id === localId) : undefined;
       out[ctx.radioId] = {
-        connected: ctx.bridge.connected,
-        transport: (ctx.meta.transport as 'serial' | 'tcp' | 'ble') ?? null,
+        connected:       ctx.bridge.connected,
+        transport:       (ctx.meta.transport as 'serial' | 'tcp' | 'ble') ?? null,
+        firmwareVersion: ctx.bridge.getLocalFirmwareVersion(),
+        rebootCount:     ctx.bridge.getLocalRebootCount(),
+        battery:         localNode?.telemetry?.battery ?? null,
+        voltage:         localNode?.telemetry?.voltage ?? null,
+        localNodeId:     localId,
       };
     }
     return out;

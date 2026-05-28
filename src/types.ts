@@ -152,6 +152,13 @@ export interface Message {
    * and messages where no ACK was ever observed.
    */
   deliveryMs?: number;
+  /**
+   * v2.0 multi-radio: the 4-char short_name of the radio that received (or
+   * sent) this message. Used to badge each message with its source mesh and
+   * to route replies back through the originating bridge instead of
+   * defaulting to the primary.
+   */
+  radioId?: string | null;
 }
 
 export interface RadioEvent {
