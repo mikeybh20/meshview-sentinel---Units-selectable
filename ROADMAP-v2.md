@@ -342,11 +342,11 @@ Critical Beta 1 bugs that meant LoRa readback never actually worked, plus a wave
 - ✅ **Outage detection / "radio went silent" alerts** — favorites emit a dedicated `OUTAGE` event on going silent + on recovery; browser notification + Event Log highlight ([meshtasticSerial.ts](server/meshtasticSerial.ts) `markStaleNodesOffline`, [useMeshNotifications.ts](src/hooks/useMeshNotifications.ts))
 - ✅ **Backup / restore** — passphrase-sealed AES-256-GCM export of the radios registry + channels (PSKs) + BBS config ([backup.ts](server/backup.ts), `/api/mesh/backup` + `/api/mesh/restore`, Settings → Data)
 - ✅ **Settings → Modules: Serial / Ambient Lighting / Paxcounter** — full editors mirroring the Power/Audio pattern (admin builder + parser + readback + UI card)
+- ✅ **Traceroute route-stability analysis** — `/api/gpu/route-stability` (cuGraph seam in the sidecar; pure-Python + TS fallback). Per-target stability scores + path variants + backbone segments, surfaced as a floating "Route Stability" panel in the Topology view ([app.py](gpu/app.py) `_route_stability_cpu`, [gpuClient.ts](server/gpuClient.ts) `routeStability`, [TopologyView.tsx](src/components/TopologyView.tsx) `RouteStabilityPanel`)
 
 ### 🔲 Still open — feature work
 
 - 🚧 **Detection Sensor event timeline** — blocked on wiring a physical GPIO sensor; firmware triggers arrive as plain text broadcasts, so the timeline design needs a real signal to match against.
-- 🔲 **Traceroute route-stability analysis** — `/api/gpu/route-stability` (cuGraph in the sidecar; pure-Python fallback). Common path segments + per-pair stability scores + a "Route Stability" panel.
 - 🔲 **Settings → Modules: Remote Hardware** — the last unshipped module (GPIO remote control).
 
 ### 🔲 Still open — infrastructure / cleanup

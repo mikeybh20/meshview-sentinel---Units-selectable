@@ -19,7 +19,7 @@ import { WeatherAlertPoller } from './weatherAlertPoller.js';
 import { bridgeManager, testTransportConnection } from './bridgeManager.js';
 // v2.0 GPU sidecar boot probe. Logs sidecar reachability + detected GPU
 // at startup so the operator immediately knows their acceleration tier.
-import { probeGpuOnBoot, health as gpuHealth, clusterDbscan, buildTopology, buildHeatmap, simplifyTrace } from './gpuClient.js';
+import { probeGpuOnBoot, health as gpuHealth, clusterDbscan, buildTopology, buildHeatmap, simplifyTrace, routeStability } from './gpuClient.js';
 import { sealBackup, openBackup } from './backup.js';
 probeGpuOnBoot();
 
@@ -955,6 +955,34 @@ app.post('/api/gpu/topology', async (req, res) => {
     return res.json(result);
   } catch (err: any) {
     return res.status(500).json({ error: err.message || 'topology build failed' });
+  }
+});
+
+// --- v2.0 Beta 2: traceroute route-stability analysis. ---
+// Groups the persisted traceroute history by target and scores how consistent
+// the chosen path is over time, plus tallies the most-used directed links
+// (mesh "backbone"). Powers the Route Stability panel in the Topology view.
+//
+// Traceroutes aren't tagged with the radio that issued them (the shared
+// trace_results table has no radio_id), so we attribute origin to the primary
+// radio's local node — the common case is a single radio running traces. The
+// full path we reconstruct is [origin, ...relays, target]; `route` holds only
+// the intermediate relays (empty = direct hop).
+app.post('/api/gpu/route-stability', async (_req, res) => {
+  const origin = meshBridge.getLocalNodeId();
+  const traces = meshBridge.getTraces()
+    .filter(t => t.status === 'response')
+    .map(t => {
+      const relays = (t.route ?? []).map(h => h.nodeId);
+      const path = (origin ? [origin, ...relays, t.targetId] : [...relays, t.targetId]);
+      return { target: t.targetId, origin, completed_at: t.completedAt ?? null, path };
+    });
+
+  try {
+    const result = await routeStability({ traces });
+    return res.json(result);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'route-stability build failed' });
   }
 });
 

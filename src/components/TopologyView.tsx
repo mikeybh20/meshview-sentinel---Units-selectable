@@ -1,10 +1,11 @@
 import React from 'react';
 import * as d3 from 'd3';
-import { Node as MeshNode, NeighborInfoSnapshot, NeighborInfoModuleConfig, Group } from '../types';
+import { Node as MeshNode, NeighborInfoSnapshot, NeighborInfoModuleConfig, Group, RouteStabilityResponse } from '../types';
 import { cn } from '../lib/utils';
-import { Search, Maximize2 } from 'lucide-react';
+import { Search, Maximize2, Waypoints, X, RefreshCw, Loader2, ChevronRight } from 'lucide-react';
 import { hexToRgba } from '../lib/color';
 import { roleLabel, hardwareLabel } from '../lib/meshEnums';
+import { meshDataService } from '../services/meshDataService';
 
 /** localStorage key prefix for persisting drag positions per node id. */
 const TOPOLOGY_LAYOUT_STORAGE_KEY = 'mesh.topologyLayout';
@@ -69,6 +70,196 @@ interface TopologyViewProps {
   /** Configure the NeighborInfo module on the local radio. Returns success/error. */
   onConfigureNeighborInfo?: (opts: { enabled: boolean; intervalSecs?: number }) => Promise<{ ok: boolean; error?: string }>;
   onNodeSelect: (id: string) => void;
+}
+
+/**
+ * Beta 2: floating Route Stability overlay for the Topology view. Self-contained
+ * — manages its own open/fetch state and pulls /api/gpu/route-stability on open.
+ * Groups traceroute history per target, scoring how consistent the chosen path
+ * is over time, and surfaces the most-used directed links (mesh backbone).
+ */
+function RouteStabilityPanel({ nodes }: { nodes: MeshNode[] }) {
+  const [open, setOpen] = React.useState(false);
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+  const [data, setData] = React.useState<RouteStabilityResponse | null>(null);
+  const [expanded, setExpanded] = React.useState<string | null>(null);
+
+  const nameOf = React.useCallback((id: string) => {
+    const n = nodes.find(x => x.id === id);
+    return n?.shortName || n?.name || id;
+  }, [nodes]);
+
+  const load = React.useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    const res = await meshDataService.getRouteStability();
+    setLoading(false);
+    if (!res) { setError('Could not load route stability (server or sidecar unreachable).'); return; }
+    setData(res);
+  }, []);
+
+  React.useEffect(() => { if (open && !data && !loading) load(); }, [open, data, loading, load]);
+
+  const stabilityColor = (s: number) =>
+    s >= 0.8 ? 'text-brand-accent' : s >= 0.5 ? 'text-brand-warning' : 'text-brand-error';
+  const stabilityBar = (s: number) =>
+    s >= 0.8 ? 'bg-brand-accent' : s >= 0.5 ? 'bg-brand-warning' : 'bg-brand-error';
+
+  const fmtTime = (ms: number | null) =>
+    ms ? new Date(ms).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '—';
+
+  const PathChips = ({ path }: { path: string[] }) => (
+    <div className="flex items-center flex-wrap gap-1">
+      {path.map((id, i) => (
+        <React.Fragment key={`${id}-${i}`}>
+          {i > 0 && <ChevronRight size={9} className="text-brand-muted shrink-0" />}
+          <span className="text-[9px] mono-text px-1 py-0.5 rounded bg-brand-line border border-brand-line text-brand-ink">
+            {nameOf(id)}
+          </span>
+        </React.Fragment>
+      ))}
+    </div>
+  );
+
+  if (!open) {
+    return (
+      <button
+        onClick={() => setOpen(true)}
+        title="Analyze traceroute route stability over time"
+        className="absolute top-4 left-4 z-10 flex items-center gap-1.5 bg-brand-bg/80 backdrop-blur-md border border-brand-line hover:border-brand-accent text-brand-muted hover:text-brand-accent rounded-lg px-3 py-2 text-[10px] mono-text uppercase font-bold tracking-widest transition-colors"
+      >
+        <Waypoints size={13} />
+        Route Stability
+      </button>
+    );
+  }
+
+  const totalTraces = data?.pairs.reduce((sum, p) => sum + p.total, 0) ?? 0;
+
+  return (
+    <div className="absolute top-4 left-4 z-20 w-[340px] max-h-[calc(100%-2rem)] flex flex-col technical-panel bg-brand-bg/95 backdrop-blur-md shadow-lg">
+      <div className="flex items-center justify-between gap-2 px-3 py-2 border-b border-brand-line shrink-0">
+        <div className="flex items-center gap-1.5">
+          <Waypoints size={13} className="text-brand-accent" />
+          <h4 className="text-[10px] font-bold uppercase tracking-widest text-brand-ink">Route Stability</h4>
+          {data && (
+            <span className="text-[8px] mono-text px-1 py-0.5 rounded border border-brand-line text-brand-muted uppercase">
+              {data.backend === 'cugraph' ? 'GPU' : data.backend === 'cpu' ? 'Sidecar' : 'Local'}
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-1">
+          <button
+            onClick={load}
+            disabled={loading}
+            title="Reload"
+            className="text-brand-muted hover:text-brand-ink p-1 rounded transition-colors disabled:opacity-50"
+          >
+            <RefreshCw size={11} className={loading ? 'animate-spin' : ''} />
+          </button>
+          <button onClick={() => setOpen(false)} title="Close" className="text-brand-muted hover:text-brand-ink p-1 rounded transition-colors">
+            <X size={12} />
+          </button>
+        </div>
+      </div>
+
+      <div className="overflow-y-auto p-2 space-y-2">
+        {loading && (
+          <div className="flex items-center justify-center gap-2 py-6 text-brand-muted text-[11px]">
+            <Loader2 size={13} className="animate-spin" /> Analyzing trace history…
+          </div>
+        )}
+
+        {!loading && error && (
+          <div className="text-[11px] text-brand-error bg-brand-error/10 border border-brand-error/20 rounded px-2 py-1.5">{error}</div>
+        )}
+
+        {!loading && !error && data && data.pairs.length === 0 && (
+          <div className="text-[11px] text-brand-muted italic leading-relaxed px-1 py-4 text-center">
+            No completed traceroutes yet. Run a traceroute from the Map or Messages view (the hop-trace button) to start building route history.
+          </div>
+        )}
+
+        {!loading && !error && data && data.pairs.length > 0 && (
+          <>
+            <p className="text-[9px] mono-text text-brand-muted uppercase px-1">
+              {data.pairs.length} target{data.pairs.length === 1 ? '' : 's'} · {totalTraces} trace{totalTraces === 1 ? '' : 's'}
+            </p>
+
+            {data.pairs.map(p => {
+              const pct = Math.round(p.stability * 100);
+              const isOpen = expanded === p.target;
+              return (
+                <div key={p.target} className="bg-brand-line/30 border border-brand-line rounded p-2 space-y-1.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-bold text-brand-ink truncate">{nameOf(p.target)}</span>
+                    <span className={cn('text-[10px] mono-text font-bold shrink-0', stabilityColor(p.stability))}>{pct}% stable</span>
+                  </div>
+
+                  <div className="h-1 rounded-full bg-brand-line overflow-hidden">
+                    <div className={cn('h-full rounded-full', stabilityBar(p.stability))} style={{ width: `${pct}%` }} />
+                  </div>
+
+                  <div className="flex items-center gap-2 text-[9px] mono-text text-brand-muted">
+                    <span>{p.total} trace{p.total === 1 ? '' : 's'}</span>
+                    <span>·</span>
+                    <span>{p.distinct_paths} path{p.distinct_paths === 1 ? '' : 's'}</span>
+                    <span>·</span>
+                    <span>~{p.avg_hops.toFixed(1)} hops</span>
+                  </div>
+
+                  <PathChips path={p.dominant_path} />
+
+                  {p.distinct_paths > 1 && (
+                    <button
+                      onClick={() => setExpanded(isOpen ? null : p.target)}
+                      className="flex items-center gap-1 text-[9px] mono-text uppercase text-brand-muted hover:text-brand-accent transition-colors"
+                    >
+                      <ChevronRight size={9} className={cn('transition-transform', isOpen && 'rotate-90')} />
+                      {isOpen ? 'Hide' : 'Show'} {p.distinct_paths} variants
+                    </button>
+                  )}
+
+                  {isOpen && (
+                    <div className="space-y-1.5 pl-2 border-l border-brand-line">
+                      {p.variants.map((v, i) => (
+                        <div key={i} className="space-y-1">
+                          <div className="flex items-center gap-2 text-[9px] mono-text text-brand-muted">
+                            <span className="text-brand-ink font-bold">×{v.count}</span>
+                            <span>last {fmtTime(v.last_seen)}</span>
+                          </div>
+                          <PathChips path={v.nodes} />
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+
+            {data.segments.length > 0 && (
+              <div className="pt-1">
+                <h5 className="text-[9px] font-bold uppercase tracking-widest text-brand-muted px-1 mb-1">Backbone Segments</h5>
+                <div className="space-y-0.5">
+                  {data.segments.map((s, i) => (
+                    <div key={i} className="flex items-center justify-between gap-2 px-1.5 py-1 rounded hover:bg-brand-line/40">
+                      <div className="flex items-center gap-1 min-w-0">
+                        <span className="text-[9px] mono-text text-brand-ink truncate">{nameOf(s.a)}</span>
+                        <ChevronRight size={9} className="text-brand-muted shrink-0" />
+                        <span className="text-[9px] mono-text text-brand-ink truncate">{nameOf(s.b)}</span>
+                      </div>
+                      <span className="text-[9px] mono-text text-brand-accent shrink-0">×{s.count}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
 }
 
 export function TopologyView({
@@ -569,6 +760,9 @@ export function TopologyView({
   return (
     <div className="w-full h-full relative overflow-hidden bg-brand-bg/20 rounded-xl border border-brand-line">
       <svg ref={svgRef} className="w-full h-full" />
+
+      {/* Beta 2: traceroute route-stability analysis overlay */}
+      <RouteStabilityPanel nodes={nodes} />
 
       {/* Hover tooltip — follows cursor when hovering a topology node */}
       {hoveredNodeId && hoverPos && (() => {

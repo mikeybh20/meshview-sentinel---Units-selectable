@@ -897,6 +897,19 @@ export class MeshDataService {
     } catch { return null; }
   }
 
+  /**
+   * v2.0 Beta 2: fetch the route-stability analysis over persisted traceroute
+   * history (grouped per target + backbone segments). Server reconstructs the
+   * full paths; the GPU sidecar (or TS fallback) does the grouping.
+   */
+  async getRouteStability(): Promise<import('../types').RouteStabilityResponse | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/gpu/route-stability`, { method: 'POST' });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  }
+
   /** Subscribe to channel list updates (replays the last known list immediately). */
   onChannels(callback: (channels: Channel[]) => void) {
     this.channelListeners.push(callback);

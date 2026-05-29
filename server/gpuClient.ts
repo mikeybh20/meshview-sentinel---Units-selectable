@@ -566,6 +566,146 @@ export function buildTopologyCpu(req: TopologyRequest): TopologyResponse {
 }
 
 // ---------------------------------------------------------------------
+// Beta 2: traceroute route-stability analysis.
+// ---------------------------------------------------------------------
+
+export interface RouteStabilityTraceIn {
+  target: string;
+  origin?: string | null;
+  completed_at?: number | null;
+  /** Full ordered node path origin..target inclusive. */
+  path: string[];
+}
+
+export interface RouteStabilityVariant {
+  nodes: string[];
+  count: number;
+  last_seen: number | null;
+}
+
+export interface RouteStabilityPair {
+  target: string;
+  origin: string | null;
+  total: number;
+  distinct_paths: number;
+  dominant_path: string[];
+  dominant_count: number;
+  stability: number;
+  avg_hops: number;
+  first_seen: number | null;
+  last_seen: number | null;
+  variants: RouteStabilityVariant[];
+}
+
+export interface RouteStabilitySegment {
+  a: string;
+  b: string;
+  count: number;
+  targets: string[];
+}
+
+export interface RouteStabilityRequest {
+  traces: RouteStabilityTraceIn[];
+  max_segments?: number;
+}
+
+export interface RouteStabilityResponse {
+  pairs: RouteStabilityPair[];
+  segments: RouteStabilitySegment[];
+  backend: 'cugraph' | 'cpu' | 'cpu_ts';
+}
+
+export async function routeStability(req: RouteStabilityRequest): Promise<RouteStabilityResponse> {
+  if (req.traces.length === 0) {
+    return { pairs: [], segments: [], backend: 'cpu_ts' };
+  }
+  const remote = await callSidecar<RouteStabilityRequest, RouteStabilityResponse>('/route/stability', req);
+  if (remote) return remote;
+  return routeStabilityCpu(req);
+}
+
+// ---- CPU fallback in TS (mirrors the Python implementation) ----
+
+export function routeStabilityCpu(req: RouteStabilityRequest): RouteStabilityResponse {
+  const maxSegments = Math.max(1, req.max_segments ?? 30);
+  const byTarget = new Map<string, RouteStabilityTraceIn[]>();
+  for (const t of req.traces) {
+    if (!t.target || !t.path || t.path.length === 0) continue;
+    if (!byTarget.has(t.target)) byTarget.set(t.target, []);
+    byTarget.get(t.target)!.push(t);
+  }
+
+  const segCount = new Map<string, number>();
+  const segTargets = new Map<string, Set<string>>();
+  const segKey = (a: string, b: string) => `${a} ${b}`;
+
+  const pairs: RouteStabilityPair[] = [];
+  for (const [target, traces] of byTarget) {
+    const total = traces.length;
+    const variantCount = new Map<string, number>();
+    const variantNodes = new Map<string, string[]>();
+    const variantLast = new Map<string, number | null>();
+    let hopSum = 0;
+    let firstSeen: number | null = null;
+    let lastSeen: number | null = null;
+    let origin: string | null = null;
+
+    for (const t of traces) {
+      origin = origin ?? t.origin ?? null;
+      const sig = t.path.join('>');
+      variantCount.set(sig, (variantCount.get(sig) ?? 0) + 1);
+      variantNodes.set(sig, t.path);
+      if (t.completed_at != null) {
+        const prev = variantLast.get(sig);
+        variantLast.set(sig, prev == null ? t.completed_at : Math.max(prev, t.completed_at));
+        firstSeen = firstSeen == null ? t.completed_at : Math.min(firstSeen, t.completed_at);
+        lastSeen = lastSeen == null ? t.completed_at : Math.max(lastSeen, t.completed_at);
+      }
+      hopSum += Math.max(0, t.path.length - 1);
+      for (let i = 0; i + 1 < t.path.length; i++) {
+        const a = t.path[i], b = t.path[i + 1];
+        if (a === b) continue;
+        const k = segKey(a, b);
+        segCount.set(k, (segCount.get(k) ?? 0) + 1);
+        if (!segTargets.has(k)) segTargets.set(k, new Set());
+        segTargets.get(k)!.add(target);
+      }
+    }
+
+    const variants: RouteStabilityVariant[] = Array.from(variantCount.entries())
+      .map(([sig, count]) => ({ nodes: variantNodes.get(sig)!, count, last_seen: variantLast.get(sig) ?? null }))
+      .sort((a, b) => (b.count - a.count) || ((b.last_seen ?? 0) - (a.last_seen ?? 0)));
+    const dominant = variants[0];
+
+    pairs.push({
+      target,
+      origin,
+      total,
+      distinct_paths: variants.length,
+      dominant_path: dominant.nodes,
+      dominant_count: dominant.count,
+      stability: total ? dominant.count / total : 0,
+      avg_hops: total ? hopSum / total : 0,
+      first_seen: firstSeen,
+      last_seen: lastSeen,
+      variants,
+    });
+  }
+
+  pairs.sort((a, b) => (b.total - a.total) || (a.stability - b.stability));
+
+  const segments: RouteStabilitySegment[] = Array.from(segCount.entries())
+    .map(([k, count]) => {
+      const [a, b] = k.split(' ');
+      return { a, b, count, targets: Array.from(segTargets.get(k) ?? []).sort() };
+    })
+    .sort((s1, s2) => (s2.count - s1.count) || s1.a.localeCompare(s2.a) || s1.b.localeCompare(s2.b))
+    .slice(0, maxSegments);
+
+  return { pairs, segments, backend: 'cpu_ts' };
+}
+
+// ---------------------------------------------------------------------
 // Boot probe — logs the sidecar status at startup so the operator knows
 // what acceleration tier they have. Non-blocking; sidecar may not be up
 // yet when this runs.

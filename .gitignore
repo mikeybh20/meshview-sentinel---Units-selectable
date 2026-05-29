@@ -10,3 +10,7 @@ coverage/
 # Persistent radio state (SQLite + AI config)
 data/
 
+# Python sidecar artifacts
+__pycache__/
+*.py[cod]
+

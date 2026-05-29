@@ -198,6 +198,41 @@ export interface TraceResult {
   errorMessage?: string;
 }
 
+// --- Beta 2: traceroute route-stability analysis (from /api/gpu/route-stability) ---
+export interface RouteStabilityVariant {
+  nodes: string[];
+  count: number;
+  last_seen: number | null;
+}
+
+export interface RouteStabilityPair {
+  target: string;
+  origin: string | null;
+  total: number;
+  distinct_paths: number;
+  dominant_path: string[];
+  dominant_count: number;
+  /** dominant_count / total, in [0,1]. 1 = the route never changed. */
+  stability: number;
+  avg_hops: number;
+  first_seen: number | null;
+  last_seen: number | null;
+  variants: RouteStabilityVariant[];
+}
+
+export interface RouteStabilitySegment {
+  a: string;
+  b: string;
+  count: number;
+  targets: string[];
+}
+
+export interface RouteStabilityResponse {
+  pairs: RouteStabilityPair[];
+  segments: RouteStabilitySegment[];
+  backend: 'cugraph' | 'cpu' | 'cpu_ts';
+}
+
 export interface NeighborObservation {
   nodeId: string;
   snr: number;

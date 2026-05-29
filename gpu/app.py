@@ -558,6 +558,122 @@ def trace_playback(req: TracePlaybackRequest) -> dict[str, Any]:
     }
 
 
+# ---- Beta 2: traceroute route-stability analysis -----------------------------
+
+class RouteStabilityTrace(BaseModel):
+    target: str
+    origin: str | None = None
+    completed_at: int | None = None
+    # Full ordered node path, origin..target inclusive, as the server reconstructed it.
+    path: list[str]
+
+
+class RouteStabilityRequest(BaseModel):
+    traces: list[RouteStabilityTrace]
+    max_segments: int = 30
+
+
+def _route_stability_cpu(req: RouteStabilityRequest) -> dict[str, Any]:
+    """Group traceroute history by target and score how consistent the chosen
+    path is over time. Also tallies the most-used directed links ("segments")
+    across every trace so the operator can see the mesh backbone.
+
+    stability = (count of the single most common path) / (total traces to that
+    target). 1.0 = the route never changed; lower = the mesh kept re-routing.
+    """
+    by_target: dict[str, list[RouteStabilityTrace]] = {}
+    for t in req.traces:
+        if not t.target or not t.path:
+            continue
+        by_target.setdefault(t.target, []).append(t)
+
+    seg_count: dict[tuple[str, str], int] = {}
+    seg_targets: dict[tuple[str, str], set[str]] = {}
+
+    pairs: list[dict[str, Any]] = []
+    for target, traces in by_target.items():
+        total = len(traces)
+        variant_count: dict[str, int] = {}
+        variant_nodes: dict[str, list[str]] = {}
+        variant_last: dict[str, int | None] = {}
+        hop_sum = 0
+        first_seen: int | None = None
+        last_seen: int | None = None
+        origin: str | None = None
+
+        for t in traces:
+            origin = origin or t.origin
+            sig = ">".join(t.path)
+            variant_count[sig] = variant_count.get(sig, 0) + 1
+            variant_nodes[sig] = t.path
+            if t.completed_at is not None:
+                prev = variant_last.get(sig)
+                variant_last[sig] = t.completed_at if prev is None else max(prev, t.completed_at)
+                first_seen = t.completed_at if first_seen is None else min(first_seen, t.completed_at)
+                last_seen = t.completed_at if last_seen is None else max(last_seen, t.completed_at)
+            hop_sum += max(0, len(t.path) - 1)
+            # Tally directed links for the backbone view.
+            for a, b in zip(t.path, t.path[1:]):
+                if a == b:
+                    continue
+                key = (a, b)
+                seg_count[key] = seg_count.get(key, 0) + 1
+                seg_targets.setdefault(key, set()).add(target)
+
+        variants = sorted(
+            (
+                {"nodes": variant_nodes[sig], "count": cnt, "last_seen": variant_last.get(sig)}
+                for sig, cnt in variant_count.items()
+            ),
+            key=lambda v: (-v["count"], -(v["last_seen"] or 0)),
+        )
+        dominant = variants[0]
+        pairs.append({
+            "target": target,
+            "origin": origin,
+            "total": total,
+            "distinct_paths": len(variants),
+            "dominant_path": dominant["nodes"],
+            "dominant_count": dominant["count"],
+            "stability": dominant["count"] / total if total else 0.0,
+            "avg_hops": hop_sum / total if total else 0.0,
+            "first_seen": first_seen,
+            "last_seen": last_seen,
+            "variants": variants,
+        })
+
+    # Most-traced first, then least-stable so churny routes surface near the top.
+    pairs.sort(key=lambda p: (-p["total"], p["stability"]))
+
+    segments = sorted(
+        (
+            {"a": a, "b": b, "count": cnt, "targets": sorted(seg_targets[(a, b)])}
+            for (a, b), cnt in seg_count.items()
+        ),
+        key=lambda s: (-s["count"], s["a"], s["b"]),
+    )[: max(1, req.max_segments)]
+
+    return {"pairs": pairs, "segments": segments, "backend": "cpu"}
+
+
+def _try_cugraph_route_stability(req: RouteStabilityRequest) -> dict[str, Any] | None:
+    """Future GPU path. Returns None until cuGraph is on the import path; the
+    CPU grouping is trivially fast for the trace volumes we keep (<=500)."""
+    try:
+        import cugraph  # type: ignore
+        import cudf  # type: ignore
+    except ImportError:
+        return None
+    _ = (cugraph, cudf)
+    return None
+
+
+@app.post("/route/stability")
+def route_stability(req: RouteStabilityRequest) -> dict[str, Any]:
+    gpu = _try_cugraph_route_stability(req)
+    return gpu if gpu is not None else _route_stability_cpu(req)
+
+
 # ---------------------------------------------------------------------
 # Local dev: `python app.py` boots uvicorn directly. Production uses
 # the CMD in Dockerfile.
