@@ -854,6 +854,10 @@ function RadioEditor({ row, onChanged }: { row: RadioRow; onChanged: () => void 
 
       <NetworkConfigSection radioId={row.radio_id} />
       <PowerConfigSection radioId={row.radio_id} />
+      <DeviceConfigSection radioId={row.radio_id} />
+      <PositionConfigSection radioId={row.radio_id} />
+      <DisplayConfigSection radioId={row.radio_id} />
+      <BluetoothConfigSection radioId={row.radio_id} />
       <CannedMessagesSection radioId={row.radio_id} />
     </div>
   );
@@ -1240,6 +1244,616 @@ function PowerConfigSection({ radioId }: { radioId: string }) {
           className="bg-amber-500/10 hover:bg-amber-500/20 disabled:opacity-40 border border-amber-500/40 text-amber-300 text-[10px] font-bold uppercase tracking-widest rounded px-3 py-1.5"
         >
           {saving ? 'Writing…' : 'Write Power Config to Radio'}
+        </button>
+        {msg && <span className="text-[11px] text-brand-muted">{msg}</span>}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// v2.0 Beta 3 — Apple-parity config editors (Device / Position / Display /
+// Bluetooth). Each mirrors PowerConfigSection's shape: live snapshot, refresh,
+// dirty form, save with confirm dialog. Field semantics referenced inline from
+// config.proto field numbers; firmware preserves unmodelled fields on round-trip.
+// ============================================================================
+
+const DEVICE_ROLE_OPTIONS = [
+  { value: 0, label: 'CLIENT — app-connected / standalone (default)' },
+  { value: 1, label: 'CLIENT_MUTE — does not forward packets' },
+  { value: 2, label: 'ROUTER — coverage extender (sleeps wifi/screen)' },
+  { value: 5, label: 'TRACKER — prioritizes position broadcasts' },
+  { value: 6, label: 'SENSOR — prioritizes telemetry broadcasts' },
+  { value: 7, label: 'TAK — ATAK-optimized, reduced routine broadcasts' },
+  { value: 8, label: 'CLIENT_HIDDEN — speak only when spoken to' },
+  { value: 9, label: 'LOST_AND_FOUND — auto position broadcasts for recovery' },
+  { value: 10, label: 'TAK_TRACKER — auto TAK PLI broadcasts' },
+  { value: 11, label: 'ROUTER_LATE — rebroadcasts after all other modes' },
+  { value: 12, label: 'CLIENT_BASE — favorites as ROUTER_LATE, others as CLIENT' },
+];
+const REBROADCAST_OPTIONS = [
+  { value: 0, label: 'ALL — rebroadcast any observed (default)' },
+  { value: 1, label: 'ALL_SKIP_DECODING — repeater-only, no decode' },
+  { value: 2, label: 'LOCAL_ONLY — local primary/secondary channels only' },
+  { value: 3, label: 'KNOWN_ONLY — only known-NodeDB sources' },
+  { value: 4, label: 'NONE — inhibit rebroadcast (SENSOR/TRACKER/TAK_TRACKER only)' },
+  { value: 5, label: 'CORE_PORTNUMS_ONLY — drop TAK/RangeTest/Pax/etc.' },
+];
+const BUZZER_MODE_OPTIONS = [
+  { value: 0, label: 'ALL — buttons + alerts (default)' },
+  { value: 1, label: 'DISABLED' },
+  { value: 2, label: 'NOTIFICATIONS_ONLY' },
+  { value: 3, label: 'SYSTEM_ONLY — buttons / boot / shutdown' },
+  { value: 4, label: 'DIRECT_MSG_ONLY' },
+];
+
+function DeviceConfigSection({ radioId }: { radioId: string }) {
+  const [live, setLive] = React.useState<{
+    role: number; rebroadcastMode: number; nodeInfoBroadcastSecs: number;
+    doubleTapAsButtonPress: boolean; disableTripleClick: boolean; tzdef: string;
+    ledHeartbeatDisabled: boolean; buzzerMode: number;
+  } | null>(null);
+  const [role, setRole] = React.useState(0);
+  const [rebroadcastMode, setRebroadcastMode] = React.useState(0);
+  const [nodeInfoSecs, setNodeInfoSecs] = React.useState(0);
+  const [doubleTap, setDoubleTap] = React.useState(false);
+  const [disableTriple, setDisableTriple] = React.useState(false);
+  const [tzdef, setTzdef] = React.useState('');
+  const [ledDisabled, setLedDisabled] = React.useState(false);
+  const [buzzerMode, setBuzzerMode] = React.useState(0);
+  const [saving, setSaving] = React.useState(false);
+  const [refreshing, setRefreshing] = React.useState(false);
+  const [msg, setMsg] = React.useState<string | null>(null);
+
+  const applyLive = (snap: NonNullable<typeof live>) => {
+    setLive(snap);
+    setRole(snap.role);
+    setRebroadcastMode(snap.rebroadcastMode);
+    setNodeInfoSecs(snap.nodeInfoBroadcastSecs);
+    setDoubleTap(snap.doubleTapAsButtonPress);
+    setDisableTriple(snap.disableTripleClick);
+    setTzdef(snap.tzdef);
+    setLedDisabled(snap.ledHeartbeatDisabled);
+    setBuzzerMode(snap.buzzerMode);
+  };
+
+  React.useEffect(() => {
+    let cancelled = false;
+    meshDataService.getRadioDevice(radioId).then(data => {
+      if (cancelled || !data || !data.live) return;
+      applyLive(data.live);
+    });
+    return () => { cancelled = true; };
+  }, [radioId]);
+
+  const refresh = async () => {
+    setRefreshing(true);
+    await meshDataService.refreshRadioDevice(radioId);
+    setTimeout(async () => {
+      const data = await meshDataService.getRadioDevice(radioId);
+      if (data?.live) applyLive(data.live);
+      setRefreshing(false);
+    }, 1200);
+  };
+
+  const save = async () => {
+    const roleLbl = DEVICE_ROLE_OPTIONS.find(o => o.value === role)?.label ?? role;
+    if (!confirm(`Write Device config to ${radioId}?\n\nRole: ${roleLbl}\nRebroadcast: ${rebroadcastMode}\nNodeInfo every: ${nodeInfoSecs}s (0=default 900s)\nTZ: ${tzdef || '(unset)'}\n\nRole changes affect how this radio participates in the mesh.`)) return;
+    setSaving(true);
+    setMsg(null);
+    const r = await meshDataService.setRadioDevice(radioId, {
+      role, rebroadcastMode, nodeInfoBroadcastSecs: nodeInfoSecs,
+      doubleTapAsButtonPress: doubleTap, disableTripleClick: disableTriple,
+      tzdef, ledHeartbeatDisabled: ledDisabled, buzzerMode,
+    });
+    setSaving(false);
+    if (r.ok) { setMsg('Write sent. Awaiting firmware readback…'); setTimeout(() => setMsg(null), 3000); }
+    else setMsg(`Write failed: ${r.error}`);
+  };
+
+  return (
+    <div className="pt-3 border-t border-brand-line">
+      <div className="flex items-center justify-between mb-2">
+        <h5 className="text-[11px] font-bold uppercase tracking-widest text-brand-ink">Device</h5>
+        <button onClick={refresh} disabled={refreshing}
+          className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest text-brand-muted hover:text-brand-ink hover:bg-brand-line/40 px-2 py-1 rounded disabled:opacity-40">
+          <RefreshCw size={10} className={refreshing ? 'animate-spin' : ''} /> Refresh
+        </button>
+      </div>
+      {!live && <div className="text-[11px] text-brand-muted mb-2">No Device config readback yet. Click Refresh once the radio is connected.</div>}
+      <div className="space-y-3">
+        <div>
+          <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Role</label>
+          <select value={role} onChange={e => setRole(Number(e.target.value))}
+            className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs text-brand-ink">
+            {DEVICE_ROLE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+          </select>
+        </div>
+        <div>
+          <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Rebroadcast mode</label>
+          <select value={rebroadcastMode} onChange={e => setRebroadcastMode(Number(e.target.value))}
+            className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs text-brand-ink">
+            {REBROADCAST_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+          </select>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">NodeInfo broadcast <span className="normal-case font-normal">(secs; 0=900s default)</span></label>
+            <input type="number" min={0} value={nodeInfoSecs} onChange={e => setNodeInfoSecs(Number(e.target.value))}
+              className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs mono-text text-brand-ink" />
+          </div>
+          <div>
+            <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Buzzer mode</label>
+            <select value={buzzerMode} onChange={e => setBuzzerMode(Number(e.target.value))}
+              className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs text-brand-ink">
+              {BUZZER_MODE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select>
+          </div>
+        </div>
+        <div>
+          <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">POSIX timezone <span className="normal-case font-normal">(e.g. EST5EDT,M3.2.0,M11.1.0)</span></label>
+          <input type="text" value={tzdef} onChange={e => setTzdef(e.target.value)} placeholder="(empty = unset)"
+            className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs mono-text text-brand-ink" />
+        </div>
+        <div className="grid grid-cols-3 gap-3 text-xs text-brand-ink">
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" checked={doubleTap} onChange={e => setDoubleTap(e.target.checked)} />
+            <span>Double-tap = button</span>
+          </label>
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" checked={disableTriple} onChange={e => setDisableTriple(e.target.checked)} />
+            <span>Disable triple-click GPS</span>
+          </label>
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" checked={ledDisabled} onChange={e => setLedDisabled(e.target.checked)} />
+            <span>Disable LED heartbeat</span>
+          </label>
+        </div>
+      </div>
+      <div className="flex items-center gap-3 mt-3">
+        <button onClick={save} disabled={saving || !live}
+          className="bg-amber-500/10 hover:bg-amber-500/20 disabled:opacity-40 border border-amber-500/40 text-amber-300 text-[10px] font-bold uppercase tracking-widest rounded px-3 py-1.5">
+          {saving ? 'Writing…' : 'Write Device Config to Radio'}
+        </button>
+        {msg && <span className="text-[11px] text-brand-muted">{msg}</span>}
+      </div>
+    </div>
+  );
+}
+
+const GPS_MODE_OPTIONS = [
+  { value: 0, label: 'DISABLED — GPS present but off' },
+  { value: 1, label: 'ENABLED' },
+  { value: 2, label: 'NOT_PRESENT — board has no GPS' },
+];
+// PositionFlags bitmask values from config.proto.
+const POSITION_FLAGS = [
+  { bit: 0x01, label: 'Altitude' },
+  { bit: 0x02, label: 'Altitude MSL' },
+  { bit: 0x04, label: 'Geoidal separation' },
+  { bit: 0x08, label: 'DOP' },
+  { bit: 0x10, label: 'HVDOP (split)' },
+  { bit: 0x20, label: 'Satellites in view' },
+  { bit: 0x40, label: 'Sequence number' },
+  { bit: 0x80, label: 'Timestamp' },
+  { bit: 0x100, label: 'Heading' },
+  { bit: 0x200, label: 'Speed' },
+];
+
+function PositionConfigSection({ radioId }: { radioId: string }) {
+  const [live, setLive] = React.useState<{
+    positionBroadcastSecs: number; smartEnabled: boolean; fixedPosition: boolean;
+    gpsUpdateIntervalSecs: number; positionFlags: number;
+    smartMinimumDistanceMeters: number; smartMinimumIntervalSecs: number; gpsMode: number;
+  } | null>(null);
+  const [bcastSecs, setBcastSecs] = React.useState(0);
+  const [smart, setSmart] = React.useState(true);
+  const [fixed, setFixed] = React.useState(false);
+  const [gpsSecs, setGpsSecs] = React.useState(0);
+  const [flags, setFlags] = React.useState(0);
+  const [smartMinDist, setSmartMinDist] = React.useState(0);
+  const [smartMinSecs, setSmartMinSecs] = React.useState(0);
+  const [gpsMode, setGpsMode] = React.useState(1);
+  const [saving, setSaving] = React.useState(false);
+  const [refreshing, setRefreshing] = React.useState(false);
+  const [msg, setMsg] = React.useState<string | null>(null);
+
+  const applyLive = (snap: NonNullable<typeof live>) => {
+    setLive(snap);
+    setBcastSecs(snap.positionBroadcastSecs);
+    setSmart(snap.smartEnabled);
+    setFixed(snap.fixedPosition);
+    setGpsSecs(snap.gpsUpdateIntervalSecs);
+    setFlags(snap.positionFlags);
+    setSmartMinDist(snap.smartMinimumDistanceMeters);
+    setSmartMinSecs(snap.smartMinimumIntervalSecs);
+    setGpsMode(snap.gpsMode);
+  };
+
+  React.useEffect(() => {
+    let cancelled = false;
+    meshDataService.getRadioPosition(radioId).then(data => {
+      if (cancelled || !data || !data.live) return;
+      applyLive(data.live);
+    });
+    return () => { cancelled = true; };
+  }, [radioId]);
+
+  const refresh = async () => {
+    setRefreshing(true);
+    await meshDataService.refreshRadioPosition(radioId);
+    setTimeout(async () => {
+      const data = await meshDataService.getRadioPosition(radioId);
+      if (data?.live) applyLive(data.live);
+      setRefreshing(false);
+    }, 1200);
+  };
+
+  const save = async () => {
+    if (!confirm(`Write Position config to ${radioId}?\n\nBroadcast: ${bcastSecs}s (0=900s default)\nSmart enabled: ${smart}\nFixed position: ${fixed}\nGPS mode: ${GPS_MODE_OPTIONS.find(o => o.value === gpsMode)?.label}\nFlags: 0x${flags.toString(16)}\n\nLat/lng/alt for fixed positions are set separately via the radio itself or a phone app.`)) return;
+    setSaving(true);
+    setMsg(null);
+    const r = await meshDataService.setRadioPosition(radioId, {
+      positionBroadcastSecs: bcastSecs, smartEnabled: smart, fixedPosition: fixed,
+      gpsUpdateIntervalSecs: gpsSecs, positionFlags: flags,
+      smartMinimumDistanceMeters: smartMinDist, smartMinimumIntervalSecs: smartMinSecs, gpsMode,
+    });
+    setSaving(false);
+    if (r.ok) { setMsg('Write sent. Awaiting firmware readback…'); setTimeout(() => setMsg(null), 3000); }
+    else setMsg(`Write failed: ${r.error}`);
+  };
+
+  const toggleFlag = (bit: number) => setFlags(f => f & bit ? f & ~bit : f | bit);
+
+  return (
+    <div className="pt-3 border-t border-brand-line">
+      <div className="flex items-center justify-between mb-2">
+        <h5 className="text-[11px] font-bold uppercase tracking-widest text-brand-ink">Position</h5>
+        <button onClick={refresh} disabled={refreshing}
+          className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest text-brand-muted hover:text-brand-ink hover:bg-brand-line/40 px-2 py-1 rounded disabled:opacity-40">
+          <RefreshCw size={10} className={refreshing ? 'animate-spin' : ''} /> Refresh
+        </button>
+      </div>
+      {!live && <div className="text-[11px] text-brand-muted mb-2">No Position config readback yet. Click Refresh once the radio is connected.</div>}
+      <div className="space-y-3">
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Position broadcast <span className="normal-case font-normal">(secs; 0=900s default)</span></label>
+            <input type="number" min={0} value={bcastSecs} onChange={e => setBcastSecs(Number(e.target.value))}
+              className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs mono-text text-brand-ink" />
+          </div>
+          <div>
+            <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">GPS update interval <span className="normal-case font-normal">(secs; 0=30s default)</span></label>
+            <input type="number" min={0} value={gpsSecs} onChange={e => setGpsSecs(Number(e.target.value))}
+              className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs mono-text text-brand-ink" />
+          </div>
+        </div>
+        <div>
+          <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">GPS mode</label>
+          <select value={gpsMode} onChange={e => setGpsMode(Number(e.target.value))}
+            className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs text-brand-ink">
+            {GPS_MODE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+          </select>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <label className="flex items-center gap-2 text-xs text-brand-ink cursor-pointer">
+            <input type="checkbox" checked={smart} onChange={e => setSmart(e.target.checked)} />
+            <span>Smart broadcast (default)</span>
+          </label>
+          <label className="flex items-center gap-2 text-xs text-brand-ink cursor-pointer">
+            <input type="checkbox" checked={fixed} onChange={e => setFixed(e.target.checked)} />
+            <span>Fixed position</span>
+          </label>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Smart min distance <span className="normal-case font-normal">(meters)</span></label>
+            <input type="number" min={0} value={smartMinDist} onChange={e => setSmartMinDist(Number(e.target.value))}
+              className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs mono-text text-brand-ink" />
+          </div>
+          <div>
+            <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Smart min interval <span className="normal-case font-normal">(secs)</span></label>
+            <input type="number" min={0} value={smartMinSecs} onChange={e => setSmartMinSecs(Number(e.target.value))}
+              className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs mono-text text-brand-ink" />
+          </div>
+        </div>
+        <div>
+          <div className="text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Position flags <span className="normal-case font-normal">(extra fields per packet — more = larger airtime)</span></div>
+          <div className="grid grid-cols-2 gap-x-3 gap-y-1">
+            {POSITION_FLAGS.map(f => (
+              <label key={f.bit} className="flex items-center gap-2 text-[11px] text-brand-ink cursor-pointer">
+                <input type="checkbox" checked={(flags & f.bit) !== 0} onChange={() => toggleFlag(f.bit)} />
+                <span>{f.label}</span>
+              </label>
+            ))}
+          </div>
+        </div>
+      </div>
+      <div className="flex items-center gap-3 mt-3">
+        <button onClick={save} disabled={saving || !live}
+          className="bg-amber-500/10 hover:bg-amber-500/20 disabled:opacity-40 border border-amber-500/40 text-amber-300 text-[10px] font-bold uppercase tracking-widest rounded px-3 py-1.5">
+          {saving ? 'Writing…' : 'Write Position Config to Radio'}
+        </button>
+        {msg && <span className="text-[11px] text-brand-muted">{msg}</span>}
+      </div>
+    </div>
+  );
+}
+
+const DISPLAY_UNITS_OPTIONS = [
+  { value: 0, label: 'Metric (default)' }, { value: 1, label: 'Imperial' },
+];
+const OLED_TYPE_OPTIONS = [
+  { value: 0, label: 'Auto-detect' }, { value: 1, label: 'SSD1306' },
+  { value: 2, label: 'SH1106' }, { value: 3, label: 'SH1107 (128×64)' },
+  { value: 4, label: 'SH1107 (128×128)' }, { value: 5, label: 'SH1107 rotated' },
+];
+const DISPLAY_MODE_OPTIONS = [
+  { value: 0, label: 'Default (128×64 OLED)' }, { value: 1, label: 'Two-color (bicolor OLED)' },
+  { value: 2, label: 'Inverted (TwoColor + inverted top bar)' }, { value: 3, label: 'Color (TFT — not implemented)' },
+];
+const COMPASS_ORIENTATION_OPTIONS = [
+  { value: 0, label: '0°' }, { value: 1, label: '90°' }, { value: 2, label: '180°' }, { value: 3, label: '270°' },
+  { value: 4, label: '0° inverted' }, { value: 5, label: '90° inverted' },
+  { value: 6, label: '180° inverted' }, { value: 7, label: '270° inverted' },
+];
+
+function DisplayConfigSection({ radioId }: { radioId: string }) {
+  const [live, setLive] = React.useState<{
+    screenOnSecs: number; autoScreenCarouselSecs: number; flipScreen: boolean;
+    units: number; oled: number; displayMode: number; headingBold: boolean;
+    wakeOnTapOrMotion: boolean; compassOrientation: number; use12hClock: boolean;
+    useLongNodeName: boolean; enableMessageBubbles: boolean;
+  } | null>(null);
+  const [screenOn, setScreenOn] = React.useState(0);
+  const [carousel, setCarousel] = React.useState(0);
+  const [flip, setFlip] = React.useState(false);
+  const [units, setUnits] = React.useState(0);
+  const [oled, setOled] = React.useState(0);
+  const [displayMode, setDisplayMode] = React.useState(0);
+  const [headingBold, setHeadingBold] = React.useState(false);
+  const [wakeOnTap, setWakeOnTap] = React.useState(false);
+  const [compass, setCompass] = React.useState(0);
+  const [use12h, setUse12h] = React.useState(false);
+  const [longName, setLongName] = React.useState(false);
+  const [bubbles, setBubbles] = React.useState(false);
+  const [saving, setSaving] = React.useState(false);
+  const [refreshing, setRefreshing] = React.useState(false);
+  const [msg, setMsg] = React.useState<string | null>(null);
+
+  const applyLive = (snap: NonNullable<typeof live>) => {
+    setLive(snap);
+    setScreenOn(snap.screenOnSecs);
+    setCarousel(snap.autoScreenCarouselSecs);
+    setFlip(snap.flipScreen);
+    setUnits(snap.units);
+    setOled(snap.oled);
+    setDisplayMode(snap.displayMode);
+    setHeadingBold(snap.headingBold);
+    setWakeOnTap(snap.wakeOnTapOrMotion);
+    setCompass(snap.compassOrientation);
+    setUse12h(snap.use12hClock);
+    setLongName(snap.useLongNodeName);
+    setBubbles(snap.enableMessageBubbles);
+  };
+
+  React.useEffect(() => {
+    let cancelled = false;
+    meshDataService.getRadioDisplay(radioId).then(data => {
+      if (cancelled || !data || !data.live) return;
+      applyLive(data.live);
+    });
+    return () => { cancelled = true; };
+  }, [radioId]);
+
+  const refresh = async () => {
+    setRefreshing(true);
+    await meshDataService.refreshRadioDisplay(radioId);
+    setTimeout(async () => {
+      const data = await meshDataService.getRadioDisplay(radioId);
+      if (data?.live) applyLive(data.live);
+      setRefreshing(false);
+    }, 1200);
+  };
+
+  const save = async () => {
+    if (!confirm(`Write Display config to ${radioId}?\n\nScreen on: ${screenOn}s (0=60s default)\nUnits: ${units === 0 ? 'Metric' : 'Imperial'}\nMode: ${DISPLAY_MODE_OPTIONS.find(o => o.value === displayMode)?.label}`)) return;
+    setSaving(true);
+    setMsg(null);
+    const r = await meshDataService.setRadioDisplay(radioId, {
+      screenOnSecs: screenOn, autoScreenCarouselSecs: carousel, flipScreen: flip,
+      units, oled, displayMode, headingBold, wakeOnTapOrMotion: wakeOnTap,
+      compassOrientation: compass, use12hClock: use12h, useLongNodeName: longName,
+      enableMessageBubbles: bubbles,
+    });
+    setSaving(false);
+    if (r.ok) { setMsg('Write sent. Awaiting firmware readback…'); setTimeout(() => setMsg(null), 3000); }
+    else setMsg(`Write failed: ${r.error}`);
+  };
+
+  return (
+    <div className="pt-3 border-t border-brand-line">
+      <div className="flex items-center justify-between mb-2">
+        <h5 className="text-[11px] font-bold uppercase tracking-widest text-brand-ink">Display</h5>
+        <button onClick={refresh} disabled={refreshing}
+          className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest text-brand-muted hover:text-brand-ink hover:bg-brand-line/40 px-2 py-1 rounded disabled:opacity-40">
+          <RefreshCw size={10} className={refreshing ? 'animate-spin' : ''} /> Refresh
+        </button>
+      </div>
+      {!live && <div className="text-[11px] text-brand-muted mb-2">No Display config readback yet. Click Refresh once the radio is connected.</div>}
+      <div className="space-y-3">
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Screen on <span className="normal-case font-normal">(secs; 0=60s default)</span></label>
+            <input type="number" min={0} value={screenOn} onChange={e => setScreenOn(Number(e.target.value))}
+              className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs mono-text text-brand-ink" />
+          </div>
+          <div>
+            <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Auto screen carousel <span className="normal-case font-normal">(secs; 0=off)</span></label>
+            <input type="number" min={0} value={carousel} onChange={e => setCarousel(Number(e.target.value))}
+              className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs mono-text text-brand-ink" />
+          </div>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Units</label>
+            <select value={units} onChange={e => setUnits(Number(e.target.value))}
+              className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs text-brand-ink">
+              {DISPLAY_UNITS_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">OLED type</label>
+            <select value={oled} onChange={e => setOled(Number(e.target.value))}
+              className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs text-brand-ink">
+              {OLED_TYPE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Display mode</label>
+            <select value={displayMode} onChange={e => setDisplayMode(Number(e.target.value))}
+              className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs text-brand-ink">
+              {DISPLAY_MODE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Compass orientation</label>
+            <select value={compass} onChange={e => setCompass(Number(e.target.value))}
+              className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs text-brand-ink">
+              {COMPASS_ORIENTATION_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select>
+          </div>
+        </div>
+        <div className="grid grid-cols-2 gap-3 text-xs text-brand-ink">
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" checked={flip} onChange={e => setFlip(e.target.checked)} />
+            <span>Flip screen vertically</span>
+          </label>
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" checked={headingBold} onChange={e => setHeadingBold(e.target.checked)} />
+            <span>Bold headings</span>
+          </label>
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" checked={wakeOnTap} onChange={e => setWakeOnTap(e.target.checked)} />
+            <span>Wake on tap / motion</span>
+          </label>
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" checked={use12h} onChange={e => setUse12h(e.target.checked)} />
+            <span>12-hour clock</span>
+          </label>
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" checked={longName} onChange={e => setLongName(e.target.checked)} />
+            <span>Long node names on screen</span>
+          </label>
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" checked={bubbles} onChange={e => setBubbles(e.target.checked)} />
+            <span>Message bubbles</span>
+          </label>
+        </div>
+      </div>
+      <div className="flex items-center gap-3 mt-3">
+        <button onClick={save} disabled={saving || !live}
+          className="bg-amber-500/10 hover:bg-amber-500/20 disabled:opacity-40 border border-amber-500/40 text-amber-300 text-[10px] font-bold uppercase tracking-widest rounded px-3 py-1.5">
+          {saving ? 'Writing…' : 'Write Display Config to Radio'}
+        </button>
+        {msg && <span className="text-[11px] text-brand-muted">{msg}</span>}
+      </div>
+    </div>
+  );
+}
+
+const PAIRING_MODE_OPTIONS = [
+  { value: 0, label: 'RANDOM_PIN — fresh PIN shown on screen each pair (default)' },
+  { value: 1, label: 'FIXED_PIN — operator-set 6-digit PIN' },
+  { value: 2, label: 'NO_PIN — pair without PIN (less secure)' },
+];
+
+function BluetoothConfigSection({ radioId }: { radioId: string }) {
+  const [live, setLive] = React.useState<{
+    enabled: boolean; mode: number; fixedPin: number;
+  } | null>(null);
+  const [enabled, setEnabled] = React.useState(false);
+  const [mode, setMode] = React.useState(0);
+  const [fixedPin, setFixedPin] = React.useState(0);
+  const [saving, setSaving] = React.useState(false);
+  const [refreshing, setRefreshing] = React.useState(false);
+  const [msg, setMsg] = React.useState<string | null>(null);
+
+  const applyLive = (snap: NonNullable<typeof live>) => {
+    setLive(snap);
+    setEnabled(snap.enabled);
+    setMode(snap.mode);
+    setFixedPin(snap.fixedPin);
+  };
+
+  React.useEffect(() => {
+    let cancelled = false;
+    meshDataService.getRadioBluetooth(radioId).then(data => {
+      if (cancelled || !data || !data.live) return;
+      applyLive(data.live);
+    });
+    return () => { cancelled = true; };
+  }, [radioId]);
+
+  const refresh = async () => {
+    setRefreshing(true);
+    await meshDataService.refreshRadioBluetooth(radioId);
+    setTimeout(async () => {
+      const data = await meshDataService.getRadioBluetooth(radioId);
+      if (data?.live) applyLive(data.live);
+      setRefreshing(false);
+    }, 1200);
+  };
+
+  const save = async () => {
+    if (mode === 1 && (fixedPin < 1 || fixedPin > 999999)) {
+      setMsg('Fixed PIN must be 1–6 digits.'); return;
+    }
+    if (!confirm(`Write Bluetooth config to ${radioId}?\n\nEnabled: ${enabled}\nMode: ${PAIRING_MODE_OPTIONS.find(o => o.value === mode)?.label}\nPIN: ${mode === 1 ? fixedPin.toString().padStart(6, '0') : '(unused)'}\n\nDisabling BT may break the phone-app connection until WiFi is enabled.`)) return;
+    setSaving(true);
+    setMsg(null);
+    const r = await meshDataService.setRadioBluetooth(radioId, { enabled, mode, fixedPin });
+    setSaving(false);
+    if (r.ok) { setMsg('Write sent. Awaiting firmware readback…'); setTimeout(() => setMsg(null), 3000); }
+    else setMsg(`Write failed: ${r.error}`);
+  };
+
+  return (
+    <div className="pt-3 border-t border-brand-line">
+      <div className="flex items-center justify-between mb-2">
+        <h5 className="text-[11px] font-bold uppercase tracking-widest text-brand-ink">Bluetooth</h5>
+        <button onClick={refresh} disabled={refreshing}
+          className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest text-brand-muted hover:text-brand-ink hover:bg-brand-line/40 px-2 py-1 rounded disabled:opacity-40">
+          <RefreshCw size={10} className={refreshing ? 'animate-spin' : ''} /> Refresh
+        </button>
+      </div>
+      {!live && <div className="text-[11px] text-brand-muted mb-2">No Bluetooth config readback yet. Click Refresh once the radio is connected.</div>}
+      <label className="flex items-center gap-2 text-xs text-brand-ink mb-3 cursor-pointer">
+        <input type="checkbox" checked={enabled} onChange={e => setEnabled(e.target.checked)} />
+        <span>Bluetooth enabled</span>
+        <span className="text-[10px] text-brand-muted normal-case font-normal">— disabled = WiFi-only operation</span>
+      </label>
+      <div className="space-y-3">
+        <div>
+          <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Pairing mode</label>
+          <select value={mode} onChange={e => setMode(Number(e.target.value))} disabled={!enabled}
+            className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs text-brand-ink disabled:opacity-50">
+            {PAIRING_MODE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+          </select>
+        </div>
+        {mode === 1 && (
+          <div>
+            <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Fixed PIN <span className="normal-case font-normal">(1–6 digits, e.g. 123456)</span></label>
+            <input type="number" min={1} max={999999} value={fixedPin}
+              onChange={e => setFixedPin(Number(e.target.value))} disabled={!enabled}
+              className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs mono-text text-brand-ink disabled:opacity-50" />
+          </div>
+        )}
+      </div>
+      <div className="flex items-center gap-3 mt-3">
+        <button onClick={save} disabled={saving || !live}
+          className="bg-amber-500/10 hover:bg-amber-500/20 disabled:opacity-40 border border-amber-500/40 text-amber-300 text-[10px] font-bold uppercase tracking-widest rounded px-3 py-1.5">
+          {saving ? 'Writing…' : 'Write Bluetooth Config to Radio'}
         </button>
         {msg && <span className="text-[11px] text-brand-muted">{msg}</span>}
       </div>

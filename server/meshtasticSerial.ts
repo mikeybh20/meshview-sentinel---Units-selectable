@@ -468,6 +468,108 @@ export interface PowerConfigSnapshot {
 }
 
 /**
+ * v2.0 Beta 3: subset of Meshtastic's DeviceConfig (Config.device, field 1).
+ * Operator-meaningful fields only — deprecated fields (serial_enabled=2,
+ * is_managed=9) and board-specific GPIO overrides (button_gpio=4,
+ * buzzer_gpio=5) are omitted; firmware preserves them on round-trip.
+ *
+ * Field numbers (config.proto DeviceConfig):
+ *   1=role, 6=rebroadcast_mode, 7=node_info_broadcast_secs,
+ *   8=double_tap_as_button_press, 10=disable_triple_click, 11=tzdef,
+ *   12=led_heartbeat_disabled, 13=buzzer_mode
+ */
+export interface DeviceConfigSnapshot {
+  /** Role enum: CLIENT=0, CLIENT_MUTE=1, ROUTER=2, TRACKER=5, SENSOR=6, TAK=7,
+   *  CLIENT_HIDDEN=8, LOST_AND_FOUND=9, TAK_TRACKER=10, ROUTER_LATE=11, CLIENT_BASE=12 */
+  role: number;
+  /** RebroadcastMode enum: ALL=0, ALL_SKIP_DECODING=1, LOCAL_ONLY=2, KNOWN_ONLY=3, NONE=4, CORE_PORTNUMS_ONLY=5 */
+  rebroadcastMode: number;
+  /** Seconds between NodeInfo broadcasts (0 = firmware default of 900s). */
+  nodeInfoBroadcastSecs: number;
+  doubleTapAsButtonPress: boolean;
+  disableTripleClick: boolean;
+  /** POSIX timezone string (e.g. "EST5EDT,M3.2.0,M11.1.0"). Empty = unset. */
+  tzdef: string;
+  ledHeartbeatDisabled: boolean;
+  /** BuzzerMode enum: ALL_ENABLED=0, DISABLED=1, NOTIFICATIONS_ONLY=2, SYSTEM_ONLY=3, DIRECT_MSG_ONLY=4 */
+  buzzerMode: number;
+  lastReadAt: number;
+}
+
+/**
+ * v2.0 Beta 3: subset of Meshtastic's PositionConfig (Config.position, field 2).
+ * Operator-meaningful fields only — deprecated fields (gps_enabled=4,
+ * gps_attempt_time=6) and GPIO overrides (rx_gpio=8, tx_gpio=9, gps_en_gpio=12)
+ * are preserved opaquely on round-trip.
+ *
+ * Field numbers (config.proto PositionConfig):
+ *   1=position_broadcast_secs, 2=position_broadcast_smart_enabled,
+ *   3=fixed_position, 5=gps_update_interval, 7=position_flags,
+ *   10=broadcast_smart_minimum_distance, 11=broadcast_smart_minimum_interval_secs,
+ *   13=gps_mode
+ */
+export interface PositionConfigSnapshot {
+  positionBroadcastSecs: number;
+  smartEnabled: boolean;
+  fixedPosition: boolean;
+  gpsUpdateIntervalSecs: number;
+  /** Bitmask of PositionFlags: ALTITUDE=0x01, ALTITUDE_MSL=0x02, GEOIDAL_SEPARATION=0x04,
+   *  DOP=0x08, HVDOP=0x10, SATINVIEW=0x20, SEQ_NO=0x40, TIMESTAMP=0x80, HEADING=0x100, SPEED=0x200 */
+  positionFlags: number;
+  smartMinimumDistanceMeters: number;
+  smartMinimumIntervalSecs: number;
+  /** GpsMode enum: DISABLED=0, ENABLED=1, NOT_PRESENT=2 */
+  gpsMode: number;
+  lastReadAt: number;
+}
+
+/**
+ * v2.0 Beta 3: subset of Meshtastic's DisplayConfig (Config.display, field 5).
+ * Operator-meaningful fields only — deprecated fields (gps_format=2,
+ * compass_north_top=4) are skipped.
+ *
+ * Field numbers (config.proto DisplayConfig):
+ *   1=screen_on_secs, 3=auto_screen_carousel_secs, 5=flip_screen, 6=units,
+ *   7=oled, 8=displaymode, 9=heading_bold, 10=wake_on_tap_or_motion,
+ *   11=compass_orientation, 12=use_12h_clock, 13=use_long_node_name,
+ *   14=enable_message_bubbles
+ */
+export interface DisplayConfigSnapshot {
+  screenOnSecs: number;
+  autoScreenCarouselSecs: number;
+  flipScreen: boolean;
+  /** DisplayUnits enum: METRIC=0, IMPERIAL=1 */
+  units: number;
+  /** OledType enum: AUTO=0, SSD1306=1, SH1106=2, SH1107=3, SH1107_128_128=4, SH1107_ROTATED=5 */
+  oled: number;
+  /** DisplayMode enum: DEFAULT=0, TWOCOLOR=1, INVERTED=2, COLOR=3 */
+  displayMode: number;
+  headingBold: boolean;
+  wakeOnTapOrMotion: boolean;
+  /** CompassOrientation enum: DEGREES_0=0..DEGREES_270_INVERTED=7 */
+  compassOrientation: number;
+  use12hClock: boolean;
+  useLongNodeName: boolean;
+  enableMessageBubbles: boolean;
+  lastReadAt: number;
+}
+
+/**
+ * v2.0 Beta 3: Meshtastic's BluetoothConfig (Config.bluetooth, field 7).
+ *
+ * Field numbers (config.proto BluetoothConfig):
+ *   1=enabled, 2=mode (PairingMode), 3=fixed_pin (uint32)
+ */
+export interface BluetoothConfigSnapshot {
+  enabled: boolean;
+  /** PairingMode enum: RANDOM_PIN=0, FIXED_PIN=1, NO_PIN=2 */
+  mode: number;
+  /** 6-digit fixed PIN when mode=FIXED_PIN; ignored otherwise. */
+  fixedPin: number;
+  lastReadAt: number;
+}
+
+/**
  * v2.0: subset of Meshtastic's LoRaConfig that we surface in the Settings →
  * Radios editor. Other LoRaConfig fields (bandwidth, spread_factor, etc.) are
  * preserved opaquely on readback so save round-trips don't lose them.
@@ -630,6 +732,10 @@ export class MeshtasticSerialBridge extends EventEmitter {
   private localNetworkConfig: NetworkConfigSnapshot | null = null;
   /** v2.0 Beta 2: authoritative Power config (sleep, battery shutdown). */
   private localPowerConfig: PowerConfigSnapshot | null = null;
+  private localDeviceConfig: DeviceConfigSnapshot | null = null;
+  private localPositionConfig: PositionConfigSnapshot | null = null;
+  private localDisplayConfig: DisplayConfigSnapshot | null = null;
+  private localBluetoothConfig: BluetoothConfigSnapshot | null = null;
   /** v2.0 Beta 2: device's canned-message list (the pipe-delimited preset
    *  broadcasts the Canned Messages module exposes). null = never read. */
   private cannedMessages: string[] | null = null;
@@ -3958,9 +4064,18 @@ export class MeshtasticSerialBridge extends EventEmitter {
   private static readonly CFG_LORA = 5;
   private static readonly CFG_NETWORK = 3;
   private static readonly CFG_POWER = 2;
+  // v2.0 Beta 3 — Apple-parity config section enums (admin.proto AdminMessageConfigType).
+  private static readonly CFG_DEVICE = 0;
+  private static readonly CFG_POSITION = 1;
+  private static readonly CFG_DISPLAY = 4;
+  private static readonly CFG_BLUETOOTH = 6;
 
   getLocalNetworkConfig(): NetworkConfigSnapshot | null { return this.localNetworkConfig; }
   getLocalPowerConfig(): PowerConfigSnapshot | null { return this.localPowerConfig; }
+  getLocalDeviceConfig(): DeviceConfigSnapshot | null { return this.localDeviceConfig; }
+  getLocalPositionConfig(): PositionConfigSnapshot | null { return this.localPositionConfig; }
+  getLocalDisplayConfig(): DisplayConfigSnapshot | null { return this.localDisplayConfig; }
+  getLocalBluetoothConfig(): BluetoothConfigSnapshot | null { return this.localBluetoothConfig; }
   getCannedMessages(): string[] | null { return this.cannedMessages; }
 
   /**
@@ -4124,6 +4239,368 @@ export class MeshtasticSerialBridge extends EventEmitter {
       else break;
     }
     return { isPowerSaving, onBatteryShutdownAfterSecs, waitBluetoothSecs, sdsSecs, lsSecs, minWakeSecs, lastReadAt: Date.now() };
+  }
+
+  // ============================================================================
+  // v2.0 Beta 3 — Device / Position / Display / Bluetooth config editors.
+  // Each follows the same pattern as Power: request reads, set writes via
+  // AdminMessage.set_config (field 33) wrapping the appropriate Config oneof
+  // variant. Unmodelled fields round-trip through firmware untouched.
+  // ============================================================================
+
+  // ---- DeviceConfig (Config.device, field 1) -------------------------------
+
+  async requestDeviceConfig(): Promise<void> {
+    if (!this.isLinkOpen()) return;
+    if (!this.localNodeNum) return;
+    const adminPayload = this.encodeTagVarint(7, MeshtasticSerialBridge.CFG_DEVICE);
+    this.sendAdminMessage(adminPayload);
+    console.log('[MeshtasticSerial] Requested Device config readback');
+  }
+
+  async setDeviceConfig(opts: {
+    role?: number;
+    rebroadcastMode?: number;
+    nodeInfoBroadcastSecs?: number;
+    doubleTapAsButtonPress?: boolean;
+    disableTripleClick?: boolean;
+    tzdef?: string;
+    ledHeartbeatDisabled?: boolean;
+    buzzerMode?: number;
+  }): Promise<void> {
+    if (!this.isLinkOpen()) throw new Error('Radio not connected');
+    if (!this.localNodeNum) throw new Error('Local node not yet identified — try again in a moment');
+
+    const baseline = this.localDeviceConfig;
+    const merged = {
+      role:                   opts.role                   ?? baseline?.role                   ?? 0,
+      rebroadcastMode:        opts.rebroadcastMode        ?? baseline?.rebroadcastMode        ?? 0,
+      nodeInfoBroadcastSecs:  opts.nodeInfoBroadcastSecs  ?? baseline?.nodeInfoBroadcastSecs  ?? 0,
+      doubleTapAsButtonPress: opts.doubleTapAsButtonPress ?? baseline?.doubleTapAsButtonPress ?? false,
+      disableTripleClick:     opts.disableTripleClick     ?? baseline?.disableTripleClick     ?? false,
+      tzdef:                  opts.tzdef                  ?? baseline?.tzdef                  ?? '',
+      ledHeartbeatDisabled:   opts.ledHeartbeatDisabled   ?? baseline?.ledHeartbeatDisabled   ?? false,
+      buzzerMode:             opts.buzzerMode             ?? baseline?.buzzerMode             ?? 0,
+    };
+
+    const parts: Buffer[] = [
+      this.encodeTagVarint(1,  Math.max(0, Math.floor(merged.role))),
+      this.encodeTagVarint(6,  Math.max(0, Math.floor(merged.rebroadcastMode))),
+      this.encodeTagVarint(7,  Math.max(0, Math.floor(merged.nodeInfoBroadcastSecs))),
+      this.encodeTagBool(8,    merged.doubleTapAsButtonPress),
+      this.encodeTagBool(10,   merged.disableTripleClick),
+    ];
+    if (merged.tzdef) parts.push(this.encodeTagLen(11, Buffer.from(merged.tzdef, 'utf-8')));
+    parts.push(this.encodeTagBool(12, merged.ledHeartbeatDisabled));
+    parts.push(this.encodeTagVarint(13, Math.max(0, Math.floor(merged.buzzerMode))));
+
+    const configMsg = this.encodeTagLen(1, Buffer.concat(parts));   // Config.device (field 1)
+    const adminPayload = this.encodeTagLen(33, configMsg);           // AdminMessage.set_config
+    this.sendAdminMessage(adminPayload);
+    await new Promise(r => setTimeout(r, 80));
+    this.sendAdminMessage(this.buildAdminCommit());
+
+    console.log(`[MeshtasticSerial] Device config write: role=${merged.role} rebroadcast=${merged.rebroadcastMode} nodeInfo=${merged.nodeInfoBroadcastSecs}s tz="${merged.tzdef}" buzzer=${merged.buzzerMode}`);
+    this.localDeviceConfig = { ...merged, lastReadAt: Date.now() };
+    this.emit('deviceConfigUpdate', this.localDeviceConfig);
+    setTimeout(() => { this.requestDeviceConfig().catch(() => {}); }, 200);
+  }
+
+  private parseDeviceConfigSub(buf: Buffer): DeviceConfigSnapshot {
+    let role = 0, rebroadcastMode = 0, nodeInfoBroadcastSecs = 0, buzzerMode = 0;
+    let doubleTapAsButtonPress = false, disableTripleClick = false, ledHeartbeatDisabled = false;
+    let tzdef = '';
+    let offset = 0;
+    while (offset < buf.length) {
+      const tag = buf[offset++];
+      const fieldNumber = tag >> 3;
+      const wireType = tag & 0x07;
+      if (wireType === 0) {
+        const { value, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (fieldNumber === 1) role = value;
+        else if (fieldNumber === 6) rebroadcastMode = value;
+        else if (fieldNumber === 7) nodeInfoBroadcastSecs = value;
+        else if (fieldNumber === 8) doubleTapAsButtonPress = value !== 0;
+        else if (fieldNumber === 10) disableTripleClick = value !== 0;
+        else if (fieldNumber === 12) ledHeartbeatDisabled = value !== 0;
+        else if (fieldNumber === 13) buzzerMode = value;
+      } else if (wireType === 2) {
+        const { value: len, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (offset + len > buf.length) break;
+        const s = buf.subarray(offset, offset + len).toString('utf-8');
+        offset += len;
+        if (fieldNumber === 11) tzdef = s;
+      } else if (wireType === 5) { offset += 4; }
+      else if (wireType === 1) { offset += 8; }
+      else break;
+    }
+    return { role, rebroadcastMode, nodeInfoBroadcastSecs, doubleTapAsButtonPress,
+             disableTripleClick, tzdef, ledHeartbeatDisabled, buzzerMode, lastReadAt: Date.now() };
+  }
+
+  // ---- PositionConfig (Config.position, field 2) ---------------------------
+
+  async requestPositionConfig(): Promise<void> {
+    if (!this.isLinkOpen()) return;
+    if (!this.localNodeNum) return;
+    const adminPayload = this.encodeTagVarint(7, MeshtasticSerialBridge.CFG_POSITION);
+    this.sendAdminMessage(adminPayload);
+    console.log('[MeshtasticSerial] Requested Position config readback');
+  }
+
+  async setPositionConfig(opts: {
+    positionBroadcastSecs?: number;
+    smartEnabled?: boolean;
+    fixedPosition?: boolean;
+    gpsUpdateIntervalSecs?: number;
+    positionFlags?: number;
+    smartMinimumDistanceMeters?: number;
+    smartMinimumIntervalSecs?: number;
+    gpsMode?: number;
+  }): Promise<void> {
+    if (!this.isLinkOpen()) throw new Error('Radio not connected');
+    if (!this.localNodeNum) throw new Error('Local node not yet identified — try again in a moment');
+
+    const baseline = this.localPositionConfig;
+    const merged = {
+      positionBroadcastSecs:      opts.positionBroadcastSecs      ?? baseline?.positionBroadcastSecs      ?? 0,
+      smartEnabled:               opts.smartEnabled               ?? baseline?.smartEnabled               ?? true,
+      fixedPosition:              opts.fixedPosition              ?? baseline?.fixedPosition              ?? false,
+      gpsUpdateIntervalSecs:      opts.gpsUpdateIntervalSecs      ?? baseline?.gpsUpdateIntervalSecs      ?? 0,
+      positionFlags:              opts.positionFlags              ?? baseline?.positionFlags              ?? 0,
+      smartMinimumDistanceMeters: opts.smartMinimumDistanceMeters ?? baseline?.smartMinimumDistanceMeters ?? 0,
+      smartMinimumIntervalSecs:   opts.smartMinimumIntervalSecs   ?? baseline?.smartMinimumIntervalSecs   ?? 0,
+      gpsMode:                    opts.gpsMode                    ?? baseline?.gpsMode                    ?? 1,
+    };
+
+    const positionPayload = Buffer.concat([
+      this.encodeTagVarint(1,  Math.max(0, Math.floor(merged.positionBroadcastSecs))),
+      this.encodeTagBool(2,    merged.smartEnabled),
+      this.encodeTagBool(3,    merged.fixedPosition),
+      this.encodeTagVarint(5,  Math.max(0, Math.floor(merged.gpsUpdateIntervalSecs))),
+      this.encodeTagVarint(7,  Math.max(0, Math.floor(merged.positionFlags))),
+      this.encodeTagVarint(10, Math.max(0, Math.floor(merged.smartMinimumDistanceMeters))),
+      this.encodeTagVarint(11, Math.max(0, Math.floor(merged.smartMinimumIntervalSecs))),
+      this.encodeTagVarint(13, Math.max(0, Math.floor(merged.gpsMode))),
+    ]);
+    const configMsg = this.encodeTagLen(2, positionPayload);   // Config.position (field 2)
+    const adminPayload = this.encodeTagLen(33, configMsg);
+    this.sendAdminMessage(adminPayload);
+    await new Promise(r => setTimeout(r, 80));
+    this.sendAdminMessage(this.buildAdminCommit());
+
+    console.log(`[MeshtasticSerial] Position config write: bcast=${merged.positionBroadcastSecs}s smart=${merged.smartEnabled} fixed=${merged.fixedPosition} gpsMode=${merged.gpsMode} flags=0x${merged.positionFlags.toString(16)}`);
+    this.localPositionConfig = { ...merged, lastReadAt: Date.now() };
+    this.emit('positionConfigUpdate', this.localPositionConfig);
+    setTimeout(() => { this.requestPositionConfig().catch(() => {}); }, 200);
+  }
+
+  private parsePositionConfigSub(buf: Buffer): PositionConfigSnapshot {
+    let positionBroadcastSecs = 0, gpsUpdateIntervalSecs = 0, positionFlags = 0;
+    let smartMinimumDistanceMeters = 0, smartMinimumIntervalSecs = 0, gpsMode = 1;
+    let smartEnabled = false, fixedPosition = false;
+    let offset = 0;
+    while (offset < buf.length) {
+      const tag = buf[offset++];
+      const fieldNumber = tag >> 3;
+      const wireType = tag & 0x07;
+      if (wireType === 0) {
+        const { value, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (fieldNumber === 1) positionBroadcastSecs = value;
+        else if (fieldNumber === 2) smartEnabled = value !== 0;
+        else if (fieldNumber === 3) fixedPosition = value !== 0;
+        else if (fieldNumber === 5) gpsUpdateIntervalSecs = value;
+        else if (fieldNumber === 7) positionFlags = value;
+        else if (fieldNumber === 10) smartMinimumDistanceMeters = value;
+        else if (fieldNumber === 11) smartMinimumIntervalSecs = value;
+        else if (fieldNumber === 13) gpsMode = value;
+      } else if (wireType === 2) {
+        const { value: len, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        offset += len;
+      } else if (wireType === 5) { offset += 4; }
+      else if (wireType === 1) { offset += 8; }
+      else break;
+    }
+    return { positionBroadcastSecs, smartEnabled, fixedPosition, gpsUpdateIntervalSecs,
+             positionFlags, smartMinimumDistanceMeters, smartMinimumIntervalSecs, gpsMode,
+             lastReadAt: Date.now() };
+  }
+
+  // ---- DisplayConfig (Config.display, field 5) -----------------------------
+
+  async requestDisplayConfig(): Promise<void> {
+    if (!this.isLinkOpen()) return;
+    if (!this.localNodeNum) return;
+    const adminPayload = this.encodeTagVarint(7, MeshtasticSerialBridge.CFG_DISPLAY);
+    this.sendAdminMessage(adminPayload);
+    console.log('[MeshtasticSerial] Requested Display config readback');
+  }
+
+  async setDisplayConfig(opts: {
+    screenOnSecs?: number;
+    autoScreenCarouselSecs?: number;
+    flipScreen?: boolean;
+    units?: number;
+    oled?: number;
+    displayMode?: number;
+    headingBold?: boolean;
+    wakeOnTapOrMotion?: boolean;
+    compassOrientation?: number;
+    use12hClock?: boolean;
+    useLongNodeName?: boolean;
+    enableMessageBubbles?: boolean;
+  }): Promise<void> {
+    if (!this.isLinkOpen()) throw new Error('Radio not connected');
+    if (!this.localNodeNum) throw new Error('Local node not yet identified — try again in a moment');
+
+    const baseline = this.localDisplayConfig;
+    const merged = {
+      screenOnSecs:           opts.screenOnSecs           ?? baseline?.screenOnSecs           ?? 0,
+      autoScreenCarouselSecs: opts.autoScreenCarouselSecs ?? baseline?.autoScreenCarouselSecs ?? 0,
+      flipScreen:             opts.flipScreen             ?? baseline?.flipScreen             ?? false,
+      units:                  opts.units                  ?? baseline?.units                  ?? 0,
+      oled:                   opts.oled                   ?? baseline?.oled                   ?? 0,
+      displayMode:            opts.displayMode            ?? baseline?.displayMode            ?? 0,
+      headingBold:            opts.headingBold            ?? baseline?.headingBold            ?? false,
+      wakeOnTapOrMotion:      opts.wakeOnTapOrMotion      ?? baseline?.wakeOnTapOrMotion      ?? false,
+      compassOrientation:     opts.compassOrientation     ?? baseline?.compassOrientation     ?? 0,
+      use12hClock:            opts.use12hClock            ?? baseline?.use12hClock            ?? false,
+      useLongNodeName:        opts.useLongNodeName        ?? baseline?.useLongNodeName        ?? false,
+      enableMessageBubbles:   opts.enableMessageBubbles   ?? baseline?.enableMessageBubbles   ?? false,
+    };
+
+    const displayPayload = Buffer.concat([
+      this.encodeTagVarint(1,  Math.max(0, Math.floor(merged.screenOnSecs))),
+      this.encodeTagVarint(3,  Math.max(0, Math.floor(merged.autoScreenCarouselSecs))),
+      this.encodeTagBool(5,    merged.flipScreen),
+      this.encodeTagVarint(6,  Math.max(0, Math.floor(merged.units))),
+      this.encodeTagVarint(7,  Math.max(0, Math.floor(merged.oled))),
+      this.encodeTagVarint(8,  Math.max(0, Math.floor(merged.displayMode))),
+      this.encodeTagBool(9,    merged.headingBold),
+      this.encodeTagBool(10,   merged.wakeOnTapOrMotion),
+      this.encodeTagVarint(11, Math.max(0, Math.floor(merged.compassOrientation))),
+      this.encodeTagBool(12,   merged.use12hClock),
+      this.encodeTagBool(13,   merged.useLongNodeName),
+      this.encodeTagBool(14,   merged.enableMessageBubbles),
+    ]);
+    const configMsg = this.encodeTagLen(5, displayPayload);   // Config.display (field 5)
+    const adminPayload = this.encodeTagLen(33, configMsg);
+    this.sendAdminMessage(adminPayload);
+    await new Promise(r => setTimeout(r, 80));
+    this.sendAdminMessage(this.buildAdminCommit());
+
+    console.log(`[MeshtasticSerial] Display config write: screenOn=${merged.screenOnSecs}s carousel=${merged.autoScreenCarouselSecs}s units=${merged.units} oled=${merged.oled} mode=${merged.displayMode} 12h=${merged.use12hClock}`);
+    this.localDisplayConfig = { ...merged, lastReadAt: Date.now() };
+    this.emit('displayConfigUpdate', this.localDisplayConfig);
+    setTimeout(() => { this.requestDisplayConfig().catch(() => {}); }, 200);
+  }
+
+  private parseDisplayConfigSub(buf: Buffer): DisplayConfigSnapshot {
+    let screenOnSecs = 0, autoScreenCarouselSecs = 0, units = 0, oled = 0, displayMode = 0;
+    let compassOrientation = 0;
+    let flipScreen = false, headingBold = false, wakeOnTapOrMotion = false;
+    let use12hClock = false, useLongNodeName = false, enableMessageBubbles = false;
+    let offset = 0;
+    while (offset < buf.length) {
+      const tag = buf[offset++];
+      const fieldNumber = tag >> 3;
+      const wireType = tag & 0x07;
+      if (wireType === 0) {
+        const { value, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (fieldNumber === 1) screenOnSecs = value;
+        else if (fieldNumber === 3) autoScreenCarouselSecs = value;
+        else if (fieldNumber === 5) flipScreen = value !== 0;
+        else if (fieldNumber === 6) units = value;
+        else if (fieldNumber === 7) oled = value;
+        else if (fieldNumber === 8) displayMode = value;
+        else if (fieldNumber === 9) headingBold = value !== 0;
+        else if (fieldNumber === 10) wakeOnTapOrMotion = value !== 0;
+        else if (fieldNumber === 11) compassOrientation = value;
+        else if (fieldNumber === 12) use12hClock = value !== 0;
+        else if (fieldNumber === 13) useLongNodeName = value !== 0;
+        else if (fieldNumber === 14) enableMessageBubbles = value !== 0;
+      } else if (wireType === 2) {
+        const { value: len, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        offset += len;
+      } else if (wireType === 5) { offset += 4; }
+      else if (wireType === 1) { offset += 8; }
+      else break;
+    }
+    return { screenOnSecs, autoScreenCarouselSecs, flipScreen, units, oled, displayMode,
+             headingBold, wakeOnTapOrMotion, compassOrientation, use12hClock,
+             useLongNodeName, enableMessageBubbles, lastReadAt: Date.now() };
+  }
+
+  // ---- BluetoothConfig (Config.bluetooth, field 7) -------------------------
+
+  async requestBluetoothConfig(): Promise<void> {
+    if (!this.isLinkOpen()) return;
+    if (!this.localNodeNum) return;
+    const adminPayload = this.encodeTagVarint(7, MeshtasticSerialBridge.CFG_BLUETOOTH);
+    this.sendAdminMessage(adminPayload);
+    console.log('[MeshtasticSerial] Requested Bluetooth config readback');
+  }
+
+  async setBluetoothConfig(opts: {
+    enabled?: boolean;
+    mode?: number;
+    fixedPin?: number;
+  }): Promise<void> {
+    if (!this.isLinkOpen()) throw new Error('Radio not connected');
+    if (!this.localNodeNum) throw new Error('Local node not yet identified — try again in a moment');
+
+    const baseline = this.localBluetoothConfig;
+    const merged = {
+      enabled:  opts.enabled  ?? baseline?.enabled  ?? false,
+      mode:     opts.mode     ?? baseline?.mode     ?? 0,
+      fixedPin: opts.fixedPin ?? baseline?.fixedPin ?? 0,
+    };
+
+    const btPayload = Buffer.concat([
+      this.encodeTagBool(1,    merged.enabled),
+      this.encodeTagVarint(2,  Math.max(0, Math.floor(merged.mode))),
+      this.encodeTagVarint(3,  Math.max(0, Math.min(999999, Math.floor(merged.fixedPin)))),
+    ]);
+    const configMsg = this.encodeTagLen(7, btPayload);   // Config.bluetooth (field 7)
+    const adminPayload = this.encodeTagLen(33, configMsg);
+    this.sendAdminMessage(adminPayload);
+    await new Promise(r => setTimeout(r, 80));
+    this.sendAdminMessage(this.buildAdminCommit());
+
+    console.log(`[MeshtasticSerial] Bluetooth config write: enabled=${merged.enabled} mode=${merged.mode} pin=${merged.mode === 1 ? merged.fixedPin : '(unused)'}`);
+    this.localBluetoothConfig = { ...merged, lastReadAt: Date.now() };
+    this.emit('bluetoothConfigUpdate', this.localBluetoothConfig);
+    setTimeout(() => { this.requestBluetoothConfig().catch(() => {}); }, 200);
+  }
+
+  private parseBluetoothConfigSub(buf: Buffer): BluetoothConfigSnapshot {
+    let enabled = false, mode = 0, fixedPin = 0;
+    let offset = 0;
+    while (offset < buf.length) {
+      const tag = buf[offset++];
+      const fieldNumber = tag >> 3;
+      const wireType = tag & 0x07;
+      if (wireType === 0) {
+        const { value, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (fieldNumber === 1) enabled = value !== 0;
+        else if (fieldNumber === 2) mode = value;
+        else if (fieldNumber === 3) fixedPin = value;
+      } else if (wireType === 2) {
+        const { value: len, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        offset += len;
+      } else if (wireType === 5) { offset += 4; }
+      else if (wireType === 1) { offset += 8; }
+      else break;
+    }
+    return { enabled, mode, fixedPin, lastReadAt: Date.now() };
   }
 
   /** Snapshot accessor for the most-recently-read LoRa config (or null if never read). */
@@ -5149,6 +5626,30 @@ export class MeshtasticSerialBridge extends EventEmitter {
           this.localPowerConfig = snap;
           console.log(`[MeshtasticSerial] Power config readback: powerSaving=${snap.isPowerSaving} batShutdownSecs=${snap.onBatteryShutdownAfterSecs} sds=${snap.sdsSecs}s ls=${snap.lsSecs}s minWake=${snap.minWakeSecs}s`);
           this.emit('powerConfigUpdate', snap);
+        } else if (fieldNumber === 1) {
+          // Config.device — v2.0 Beta 3
+          const snap = this.parseDeviceConfigSub(sub);
+          this.localDeviceConfig = snap;
+          console.log(`[MeshtasticSerial] Device config readback: role=${snap.role} rebroadcast=${snap.rebroadcastMode} nodeInfo=${snap.nodeInfoBroadcastSecs}s buzzer=${snap.buzzerMode} tz="${snap.tzdef}"`);
+          this.emit('deviceConfigUpdate', snap);
+        } else if (fieldNumber === 2) {
+          // Config.position — v2.0 Beta 3
+          const snap = this.parsePositionConfigSub(sub);
+          this.localPositionConfig = snap;
+          console.log(`[MeshtasticSerial] Position config readback: bcast=${snap.positionBroadcastSecs}s smart=${snap.smartEnabled} fixed=${snap.fixedPosition} gpsMode=${snap.gpsMode} flags=0x${snap.positionFlags.toString(16)}`);
+          this.emit('positionConfigUpdate', snap);
+        } else if (fieldNumber === 5) {
+          // Config.display — v2.0 Beta 3
+          const snap = this.parseDisplayConfigSub(sub);
+          this.localDisplayConfig = snap;
+          console.log(`[MeshtasticSerial] Display config readback: screenOn=${snap.screenOnSecs}s units=${snap.units} oled=${snap.oled} mode=${snap.displayMode} 12h=${snap.use12hClock}`);
+          this.emit('displayConfigUpdate', snap);
+        } else if (fieldNumber === 7) {
+          // Config.bluetooth — v2.0 Beta 3
+          const snap = this.parseBluetoothConfigSub(sub);
+          this.localBluetoothConfig = snap;
+          console.log(`[MeshtasticSerial] Bluetooth config readback: enabled=${snap.enabled} mode=${snap.mode} pin=${snap.mode === 1 ? snap.fixedPin : '(unused)'}`);
+          this.emit('bluetoothConfigUpdate', snap);
         }
       } else if (wireType === 0) {
         const { bytesRead } = this.readVarint(buf, offset);

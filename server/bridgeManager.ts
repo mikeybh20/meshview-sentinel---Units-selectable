@@ -33,6 +33,7 @@ const FORWARDED_EVENTS = [
   'neighborInfoUpdate', 'storeForwardUpdate',
   'localModuleConfigUpdate', 'loraConfigUpdate',
   'networkConfigUpdate', 'powerConfigUpdate', 'cannedMessagesUpdate',
+  'deviceConfigUpdate', 'positionConfigUpdate', 'displayConfigUpdate', 'bluetoothConfigUpdate',
   'ackUpdate', 'bbsMail', 'bbsSubscriber',
 ] as const;
 
@@ -256,6 +257,11 @@ class BridgeManager extends EventEmitter {
     bridge.requestNetworkConfig().catch(() => {});
     bridge.requestPowerConfig().catch(() => {});
     bridge.requestCannedMessages().catch(() => {});
+    // v2.0 Beta 3: Device / Position / Display / Bluetooth config readback.
+    bridge.requestDeviceConfig().catch(() => {});
+    bridge.requestPositionConfig().catch(() => {});
+    bridge.requestDisplayConfig().catch(() => {});
+    bridge.requestBluetoothConfig().catch(() => {});
   }
 
   private guessTarget(bridge: MeshtasticSerialBridge): string {
@@ -352,6 +358,11 @@ class BridgeManager extends EventEmitter {
       bridge.requestNetworkConfig().catch(() => {});
       bridge.requestPowerConfig().catch(() => {});
       bridge.requestCannedMessages().catch(() => {});
+      // v2.0 Beta 3: Device / Position / Display / Bluetooth config readback.
+      bridge.requestDeviceConfig().catch(() => {});
+      bridge.requestPositionConfig().catch(() => {});
+      bridge.requestDisplayConfig().catch(() => {});
+      bridge.requestBluetoothConfig().catch(() => {});
     };
     bridge.on('nodeUpdate', fireOnIdentityKnown);
 

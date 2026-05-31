@@ -688,6 +688,145 @@ app.put('/api/mesh/radios/:radioId/power', async (req, res) => {
   }
 });
 
+// --- v2.0 Beta 3: Device config (per radio) ---
+app.get('/api/mesh/radios/:radioId/device', (req, res) => {
+  const ctx = bridgeManager.get(req.params.radioId);
+  if (!ctx) return res.status(404).json({ error: 'radio not found or not connected' });
+  return res.json({ live: ctx.bridge.getLocalDeviceConfig() });
+});
+
+app.post('/api/mesh/radios/:radioId/device/refresh', async (req, res) => {
+  const ctx = bridgeManager.get(req.params.radioId);
+  if (!ctx) return res.status(404).json({ error: 'radio not found or not connected' });
+  if (!ctx.bridge.connected) return res.status(503).json({ error: `radio "${req.params.radioId}" is not connected` });
+  try { await ctx.bridge.requestDeviceConfig(); return res.json({ ok: true }); }
+  catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/mesh/radios/:radioId/device', async (req, res) => {
+  const ctx = bridgeManager.get(req.params.radioId);
+  if (!ctx) return res.status(404).json({ error: 'radio not found or not connected' });
+  if (!ctx.bridge.connected) return res.status(503).json({ error: `radio "${req.params.radioId}" is not connected` });
+  const body = req.body ?? {};
+  try {
+    await ctx.bridge.setDeviceConfig({
+      role:                   typeof body.role === 'number'                   ? body.role                   : undefined,
+      rebroadcastMode:        typeof body.rebroadcastMode === 'number'        ? body.rebroadcastMode        : undefined,
+      nodeInfoBroadcastSecs:  typeof body.nodeInfoBroadcastSecs === 'number'  ? body.nodeInfoBroadcastSecs  : undefined,
+      doubleTapAsButtonPress: typeof body.doubleTapAsButtonPress === 'boolean' ? body.doubleTapAsButtonPress : undefined,
+      disableTripleClick:     typeof body.disableTripleClick === 'boolean'    ? body.disableTripleClick     : undefined,
+      tzdef:                  typeof body.tzdef === 'string'                  ? body.tzdef                  : undefined,
+      ledHeartbeatDisabled:   typeof body.ledHeartbeatDisabled === 'boolean'  ? body.ledHeartbeatDisabled   : undefined,
+      buzzerMode:             typeof body.buzzerMode === 'number'             ? body.buzzerMode             : undefined,
+    });
+    return res.json({ ok: true });
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
+// --- v2.0 Beta 3: Position config (per radio) ---
+app.get('/api/mesh/radios/:radioId/position', (req, res) => {
+  const ctx = bridgeManager.get(req.params.radioId);
+  if (!ctx) return res.status(404).json({ error: 'radio not found or not connected' });
+  return res.json({ live: ctx.bridge.getLocalPositionConfig() });
+});
+
+app.post('/api/mesh/radios/:radioId/position/refresh', async (req, res) => {
+  const ctx = bridgeManager.get(req.params.radioId);
+  if (!ctx) return res.status(404).json({ error: 'radio not found or not connected' });
+  if (!ctx.bridge.connected) return res.status(503).json({ error: `radio "${req.params.radioId}" is not connected` });
+  try { await ctx.bridge.requestPositionConfig(); return res.json({ ok: true }); }
+  catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/mesh/radios/:radioId/position', async (req, res) => {
+  const ctx = bridgeManager.get(req.params.radioId);
+  if (!ctx) return res.status(404).json({ error: 'radio not found or not connected' });
+  if (!ctx.bridge.connected) return res.status(503).json({ error: `radio "${req.params.radioId}" is not connected` });
+  const body = req.body ?? {};
+  try {
+    await ctx.bridge.setPositionConfig({
+      positionBroadcastSecs:      typeof body.positionBroadcastSecs === 'number'      ? body.positionBroadcastSecs      : undefined,
+      smartEnabled:               typeof body.smartEnabled === 'boolean'              ? body.smartEnabled               : undefined,
+      fixedPosition:              typeof body.fixedPosition === 'boolean'             ? body.fixedPosition              : undefined,
+      gpsUpdateIntervalSecs:      typeof body.gpsUpdateIntervalSecs === 'number'      ? body.gpsUpdateIntervalSecs      : undefined,
+      positionFlags:              typeof body.positionFlags === 'number'              ? body.positionFlags              : undefined,
+      smartMinimumDistanceMeters: typeof body.smartMinimumDistanceMeters === 'number' ? body.smartMinimumDistanceMeters : undefined,
+      smartMinimumIntervalSecs:   typeof body.smartMinimumIntervalSecs === 'number'   ? body.smartMinimumIntervalSecs   : undefined,
+      gpsMode:                    typeof body.gpsMode === 'number'                    ? body.gpsMode                    : undefined,
+    });
+    return res.json({ ok: true });
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
+// --- v2.0 Beta 3: Display config (per radio) ---
+app.get('/api/mesh/radios/:radioId/display', (req, res) => {
+  const ctx = bridgeManager.get(req.params.radioId);
+  if (!ctx) return res.status(404).json({ error: 'radio not found or not connected' });
+  return res.json({ live: ctx.bridge.getLocalDisplayConfig() });
+});
+
+app.post('/api/mesh/radios/:radioId/display/refresh', async (req, res) => {
+  const ctx = bridgeManager.get(req.params.radioId);
+  if (!ctx) return res.status(404).json({ error: 'radio not found or not connected' });
+  if (!ctx.bridge.connected) return res.status(503).json({ error: `radio "${req.params.radioId}" is not connected` });
+  try { await ctx.bridge.requestDisplayConfig(); return res.json({ ok: true }); }
+  catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/mesh/radios/:radioId/display', async (req, res) => {
+  const ctx = bridgeManager.get(req.params.radioId);
+  if (!ctx) return res.status(404).json({ error: 'radio not found or not connected' });
+  if (!ctx.bridge.connected) return res.status(503).json({ error: `radio "${req.params.radioId}" is not connected` });
+  const body = req.body ?? {};
+  try {
+    await ctx.bridge.setDisplayConfig({
+      screenOnSecs:           typeof body.screenOnSecs === 'number'            ? body.screenOnSecs           : undefined,
+      autoScreenCarouselSecs: typeof body.autoScreenCarouselSecs === 'number'  ? body.autoScreenCarouselSecs : undefined,
+      flipScreen:             typeof body.flipScreen === 'boolean'             ? body.flipScreen             : undefined,
+      units:                  typeof body.units === 'number'                   ? body.units                  : undefined,
+      oled:                   typeof body.oled === 'number'                    ? body.oled                   : undefined,
+      displayMode:            typeof body.displayMode === 'number'             ? body.displayMode            : undefined,
+      headingBold:            typeof body.headingBold === 'boolean'            ? body.headingBold            : undefined,
+      wakeOnTapOrMotion:      typeof body.wakeOnTapOrMotion === 'boolean'      ? body.wakeOnTapOrMotion      : undefined,
+      compassOrientation:     typeof body.compassOrientation === 'number'      ? body.compassOrientation     : undefined,
+      use12hClock:            typeof body.use12hClock === 'boolean'            ? body.use12hClock            : undefined,
+      useLongNodeName:        typeof body.useLongNodeName === 'boolean'        ? body.useLongNodeName        : undefined,
+      enableMessageBubbles:   typeof body.enableMessageBubbles === 'boolean'   ? body.enableMessageBubbles   : undefined,
+    });
+    return res.json({ ok: true });
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
+// --- v2.0 Beta 3: Bluetooth config (per radio) ---
+app.get('/api/mesh/radios/:radioId/bluetooth', (req, res) => {
+  const ctx = bridgeManager.get(req.params.radioId);
+  if (!ctx) return res.status(404).json({ error: 'radio not found or not connected' });
+  return res.json({ live: ctx.bridge.getLocalBluetoothConfig() });
+});
+
+app.post('/api/mesh/radios/:radioId/bluetooth/refresh', async (req, res) => {
+  const ctx = bridgeManager.get(req.params.radioId);
+  if (!ctx) return res.status(404).json({ error: 'radio not found or not connected' });
+  if (!ctx.bridge.connected) return res.status(503).json({ error: `radio "${req.params.radioId}" is not connected` });
+  try { await ctx.bridge.requestBluetoothConfig(); return res.json({ ok: true }); }
+  catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/mesh/radios/:radioId/bluetooth', async (req, res) => {
+  const ctx = bridgeManager.get(req.params.radioId);
+  if (!ctx) return res.status(404).json({ error: 'radio not found or not connected' });
+  if (!ctx.bridge.connected) return res.status(503).json({ error: `radio "${req.params.radioId}" is not connected` });
+  const body = req.body ?? {};
+  try {
+    await ctx.bridge.setBluetoothConfig({
+      enabled:  typeof body.enabled === 'boolean' ? body.enabled  : undefined,
+      mode:     typeof body.mode === 'number'     ? body.mode     : undefined,
+      fixedPin: typeof body.fixedPin === 'number' ? body.fixedPin : undefined,
+    });
+    return res.json({ ok: true });
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
 // --- v2.0 Beta 2: Canned Messages (per radio) ---
 app.get('/api/mesh/radios/:radioId/canned-messages', (req, res) => {
   const ctx = bridgeManager.get(req.params.radioId);

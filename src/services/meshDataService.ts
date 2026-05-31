@@ -789,6 +789,163 @@ export class MeshDataService {
   }
 
   // -------------------------------------------------------------------
+  // v2.0 Beta 3: per-radio Device / Position / Display / Bluetooth config.
+  // Each mirrors the Power triple: GET live snapshot, POST refresh, PUT write.
+  // -------------------------------------------------------------------
+
+  async getRadioDevice(radioId: string): Promise<{ live: {
+    role: number; rebroadcastMode: number; nodeInfoBroadcastSecs: number;
+    doubleTapAsButtonPress: boolean; disableTripleClick: boolean; tzdef: string;
+    ledHeartbeatDisabled: boolean; buzzerMode: number; lastReadAt: number;
+  } | null } | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/device`);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  }
+
+  async refreshRadioDevice(radioId: string): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/device/refresh`, { method: 'POST' });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) { return { ok: false, error: err?.message || 'request failed' }; }
+  }
+
+  async setRadioDevice(radioId: string, patch: Partial<{
+    role: number; rebroadcastMode: number; nodeInfoBroadcastSecs: number;
+    doubleTapAsButtonPress: boolean; disableTripleClick: boolean; tzdef: string;
+    ledHeartbeatDisabled: boolean; buzzerMode: number;
+  }>): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/device`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) { return { ok: false, error: err?.message || 'request failed' }; }
+  }
+
+  async getRadioPosition(radioId: string): Promise<{ live: {
+    positionBroadcastSecs: number; smartEnabled: boolean; fixedPosition: boolean;
+    gpsUpdateIntervalSecs: number; positionFlags: number;
+    smartMinimumDistanceMeters: number; smartMinimumIntervalSecs: number;
+    gpsMode: number; lastReadAt: number;
+  } | null } | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/position`);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  }
+
+  async refreshRadioPosition(radioId: string): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/position/refresh`, { method: 'POST' });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) { return { ok: false, error: err?.message || 'request failed' }; }
+  }
+
+  async setRadioPosition(radioId: string, patch: Partial<{
+    positionBroadcastSecs: number; smartEnabled: boolean; fixedPosition: boolean;
+    gpsUpdateIntervalSecs: number; positionFlags: number;
+    smartMinimumDistanceMeters: number; smartMinimumIntervalSecs: number;
+    gpsMode: number;
+  }>): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/position`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) { return { ok: false, error: err?.message || 'request failed' }; }
+  }
+
+  async getRadioDisplay(radioId: string): Promise<{ live: {
+    screenOnSecs: number; autoScreenCarouselSecs: number; flipScreen: boolean;
+    units: number; oled: number; displayMode: number; headingBold: boolean;
+    wakeOnTapOrMotion: boolean; compassOrientation: number; use12hClock: boolean;
+    useLongNodeName: boolean; enableMessageBubbles: boolean; lastReadAt: number;
+  } | null } | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/display`);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  }
+
+  async refreshRadioDisplay(radioId: string): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/display/refresh`, { method: 'POST' });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) { return { ok: false, error: err?.message || 'request failed' }; }
+  }
+
+  async setRadioDisplay(radioId: string, patch: Partial<{
+    screenOnSecs: number; autoScreenCarouselSecs: number; flipScreen: boolean;
+    units: number; oled: number; displayMode: number; headingBold: boolean;
+    wakeOnTapOrMotion: boolean; compassOrientation: number; use12hClock: boolean;
+    useLongNodeName: boolean; enableMessageBubbles: boolean;
+  }>): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/display`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) { return { ok: false, error: err?.message || 'request failed' }; }
+  }
+
+  async getRadioBluetooth(radioId: string): Promise<{ live: {
+    enabled: boolean; mode: number; fixedPin: number; lastReadAt: number;
+  } | null } | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/bluetooth`);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  }
+
+  async refreshRadioBluetooth(radioId: string): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/bluetooth/refresh`, { method: 'POST' });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) { return { ok: false, error: err?.message || 'request failed' }; }
+  }
+
+  async setRadioBluetooth(radioId: string, patch: Partial<{
+    enabled: boolean; mode: number; fixedPin: number;
+  }>): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/bluetooth`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) { return { ok: false, error: err?.message || 'request failed' }; }
+  }
+
+  // -------------------------------------------------------------------
   // v2.0 Phase 3 GPU clustering for map pins.
   // -------------------------------------------------------------------
 
