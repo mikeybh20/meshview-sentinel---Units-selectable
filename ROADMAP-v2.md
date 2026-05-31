@@ -347,7 +347,6 @@ Critical Beta 1 bugs that meant LoRa readback never actually worked, plus a wave
 ### 🔲 Still open — feature work
 
 - 🚧 **Detection Sensor event timeline** — blocked on wiring a physical GPIO sensor; firmware triggers arrive as plain text broadcasts, so the timeline design needs a real signal to match against.
-- 🔲 **Settings → Modules: Remote Hardware** — the last unshipped module (GPIO remote control).
 
 ### 🔲 Still open — infrastructure / cleanup
 
@@ -358,7 +357,85 @@ Critical Beta 1 bugs that meant LoRa readback never actually worked, plus a wave
 
 - ⏸ **PKI / ECDH** for true DM encryption — Curve25519 client-side impl is non-trivial + firmware behavior is inconsistent. Revisit when a stable upstream client library exists.
 
-### Phase 6 — AI + sidecar expansion (target 2.0 GA, after Beta 2 stabilizes)
+---
+
+## 2.0.0 Beta 3 — Official-client parity + operator features
+
+Comparative review of the official [Apple client](https://github.com/meshtastic/Meshtastic-Apple) (community parity baseline), [MeshDash](https://github.com/ruspea/MeshDash) (operations platform with rich plugin ecosystem), and [web-flasher](https://github.com/meshtastic/web-flasher) (in-browser firmware install) produced the following waves.
+
+### Design constraints carried into this milestone
+
+- **Auto-acting features ship as off-by-default Settings toggles, never as primary functions.** Any feature that DMs nodes, prunes nodes, broadcasts on a schedule, or auto-replies must default OFF and surface its toggle in Settings → Automations. (See [auto-acting features memory](../.claude/projects/-home-mbroadwater-Dev-meshview-sentinel/memory/feedback_opt_in_auto_features.md).)
+- **Plugin system deferred.** Optional integrations land as in-tree features gated by Settings toggles, not as the first plugin. Revisit only if explicitly raised. (See [plugin-system deferral memory](../.claude/projects/-home-mbroadwater-Dev-meshview-sentinel/memory/project_plugin_system_deferred.md).)
+
+> Effort labels: **S** ≤1 day · **M** 1–3 days · **L** >3 days.
+
+### 🔲 Wave 1 — Close the parity baseline
+
+The minimum to stop being "incomplete" against the Apple client's published feature list, which explicitly enumerates *"LoRa, channels, security, Bluetooth, device, display, network, position, power, and all module configs"*.
+
+- 🔲 **Device config editor** (M) — role / rebroadcast mode / NTP / node-info-broadcast interval / button GPIO. Mirrors the Power editor pattern.
+- 🔲 **Position config editor** (M) — smart-broadcast tuning, fixed-position lat/lng/alt, GPS update intervals, broadcast precision bits.
+- 🔲 **Display config editor** (M) — orientation, screen-on time, units, 12/24h, OLED type, auto-brightness.
+- 🔲 **Bluetooth config editor** (S) — mode (PIN/NoPIN) + saved fixed PIN.
+- 🔲 **Settings → Modules: Remote Hardware** (M) — the last unshipped module; GPIO remote control.
+- 🔲 **Channel share URL export/import** (S) — encode/decode the standard `https://meshtastic.org/e/#…` set-link so configs can move between Sentinel and the official clients.
+- 🔲 **Markdown formatting toolbar in message compose** (S) — bold / italic / code / link.
+- 🔲 **Node-list Compact density mode** (S) — toggle for large meshes (100+ nodes).
+
+### 🔲 Wave 2 — High-leverage operator features
+
+The features that materially change how Sentinel feels day-to-day.
+
+- 🔲 **Telemetry alert rules engine** (M) — threshold + cooldown rules over battery / SNR / voltage / temperature / channel-util. Generalizes OUTAGE. Off-by-default per rule.
+- 🔲 **Apprise / webhook notification fanout** (M) — Discord / Slack / Telegram / email via outbound webhooks. Off-by-default per destination.
+- 🔲 **Web Push notifications** (M) — service-worker + SSE bridge so alerts arrive when the dashboard tab is closed.
+- 🔲 **Cron-scheduled mesh broadcasts with retry** (M) — new scheduler over the existing send path. Off-by-default per schedule.
+- 🔲 **Auto-reply rule engine** (L) — regex + placeholder templates + hierarchical menu trees. Off-by-default per rule. Generalizes BBS triggers.
+- 🔲 **Generalized Web Telemetry ingress** (M) — generalize the `:weather` poller into "URL → extract block → broadcast." Off-by-default per source.
+- 🔲 **Local Mesh Discovery / preset-cycling RF audit** (M) — "Scan presets" in the LoRa editor briefly cycles modem presets with configurable dwell times, records what each preset hears. (Borrowed from Apple's Local Mesh Discovery.)
+- 🔲 **Active mesh ping with RTT** (S) — send + measure delta, render in Node Detail.
+- 🔲 **Raw packet inspector** (M) — UI over the existing logged-packet stream with a filter language; three-pane (list / decoded / raw JSON).
+- 🔲 **Node comparison view** (M) — overlay up to 4 nodes' telemetry charts on linked axes.
+- 🔲 **Network averages / fleet roll-up card** (S) — mesh-average battery / SNR / airtime, packets/min.
+
+### 🔲 Wave 3 — Map & RF intelligence
+
+- 🔲 **Offline map tile support** (M) — tile cache + service-worker passthrough; field-deployment essential.
+- 🔲 **GeoJSON overlay layer** (S) — drop arbitrary GeoJSON onto the map.
+- 🔲 **Polar grid overlay** (S) — azimuth lines + range rings centered on local node.
+- 🔲 **Geofencing with multi-shape zones + triggers** (M) — circle / polygon / corridor / node-relative; entry/exit events feed the alerting layer.
+- 🔲 **Network Intelligence metrics** (M) — Link Quality Score, Smart Hops, network Entropy. Fits the GPU-sidecar pattern (same shape as route stability).
+- 🔲 **Welcome-new-nodes auto-DM** (S) — Settings → Automations toggle; off by default. NODE_JOINED hook + templated DM.
+- 🔲 **Proximity pruner** (S) — Settings → Automations toggle; off by default. Recurring task with safe radius defaults.
+
+### 🔲 Wave 4 — Platform / architectural plays
+
+- 🔲 **TCP virtual-radio proxy** (L) — expose Sentinel's radios as a Meshtastic TCP server. Lets phones running the official app (and the Python CLI) connect *through* Sentinel to a radio over WiFi instead of BLE pairing. Likely the highest-leverage single feature for the multi-radio architecture.
+- 🔲 **Channel Vault** (M) — server-side PSK store, swap active channel sets via channel writes. Effectively unlocks unlimited channels beyond the firmware's 8 slots.
+- 🔲 **MQTT observer mode** (M) — run Sentinel with no radio; subscribe to a public broker filtered by region.
+- 🔲 **Remote access tiers** (L) — HMAC-signed, no-port-forward remote control. Will need external security review before shipping.
+- 🔲 **Firmware flasher integrated** (L) — embed `esptool.js` (ESP32) + UF2 (nRF52, RP2040). Single-tab install/update flow.
+- 🔲 **Built-in serial monitor** (S) — once the flasher is in, the monitor is near-free; raw console for debugging.
+- 🔲 **TAK / CoT relay** (M) — Cursor-on-Target broadcasts for SAR/tactical users; pairs with offline tiles.
+- 🔲 **PKI / TOFU + RF spoof detection** (M) — builds on the parked PKI work; behavioral profiling layer.
+- 🔲 **3D mesh visualizer** (M) — Three.js; novel angle vs. the existing D3 force-directed graph.
+
+### 🔲 Tier 5 — Bold and distinctive (only after the above)
+
+- 🔲 **Fox-hunt direction-finding panel** — pair a connected client + a phone heading sensor; gradient-walk an SNR field.
+- 🔲 **AI-powered in-app help / docs search** — bundled markdown docs + local model.
+- 🔲 **Markdown-to-mesh narrator** — publish a markdown doc as a paced sequence of mesh broadcasts.
+
+### 🚫 Explicitly out of scope (revisit only if raised)
+
+- Plugin system architecture (TS drop-folder or Python sidecar).
+- MeshCore protocol support (a separate radio protocol entirely).
+- CarPlay / Siri integration (Apple-platform-only).
+
+---
+
+### Phase 6 — AI + sidecar expansion (target 2.0 GA, after Beta 3 stabilizes)
 Unchanged from original plan. AI evaluation + decision point (keep / evolve / remove), anomaly detection, AGX Orin + GB10 deployment guides.
 
 ---
