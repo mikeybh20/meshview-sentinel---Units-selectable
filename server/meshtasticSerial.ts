@@ -1145,6 +1145,22 @@ export class MeshtasticSerialBridge extends EventEmitter {
       this.port.open((err) => {
         if (err) {
           console.error(`[MeshtasticSerial] Failed to open ${portPath}:`, err.message);
+          // v2.0 Beta 3 bugfix: defensively release the failed SerialPort.
+          //
+          // node-serialport's native layer can allocate the underlying fd
+          // before the flock()/TIOCEXCL step fails — when the lock returns
+          // EAGAIN ("Cannot lock port"), the open callback is invoked with
+          // an error but `this.port` is left in an indeterminate state. On
+          // the next retry, `connect()` calls `disconnect()`, which skips
+          // close() when `this.port.isOpen` reports false. Result: the fd
+          // leaks for the lifetime of the process.
+          //
+          // Fix: null `this.port` immediately and call close() unconditionally
+          // (it's a safe no-op when the port was never fully opened) so each
+          // retry starts from a clean slate.
+          const failedPort = this.port;
+          this.port = null;
+          try { failedPort?.close(() => { /* swallow */ }); } catch { /* idem */ }
           this.scheduleReconnect();
           reject(err);
           return;

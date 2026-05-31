@@ -305,6 +305,41 @@ class BridgeManager extends EventEmitter {
     if (this.contexts.has(radioId)) return { ok: false, error: `radio "${radioId}" is already connected` };
     if (row.transport === 'ble') return { ok: false, error: 'BLE transport not yet implemented' };
 
+    // v2.0 Beta 3 bugfix: target-collision detection.
+    //
+    // A pre-fix Connect call against a radio whose row points at the same
+    // physical port the singleton bridge already holds would spawn a second
+    // bridge here, fail open() with EAGAIN forever, and leave the operator
+    // staring at "Cannot lock port" with no path forward. This commonly
+    // happens after auto-discovery: SerialDiscovery picks whichever tty
+    // enumerates first (often /dev/ttyACM0), the singleton claims it, and
+    // the DB row for the OTHER registered radio also has that same target —
+    // either because both radios share a target slot historically, or
+    // because the operator hadn't updated targets after re-flashing /
+    // moving cables.
+    //
+    // Refuse early and tell the operator what to do instead. "Make Primary"
+    // is the hot-swap path — disconnects the current singleton and rebinds
+    // it to the requested radio's transport.
+    const singletonTarget = this.guessTarget(meshBridge);
+    if (meshBridge.connected && singletonTarget && singletonTarget === row.target) {
+      const held = this.defaultRadioId ?? 'the default radio';
+      return {
+        ok: false,
+        error: `target "${row.target}" is already held by "${held}" (the singleton bridge). Use Make Primary on "${radioId}" to hot-swap which radio owns this port.`,
+      };
+    }
+    for (const [otherId, otherCtx] of this.contexts) {
+      if (otherId === radioId) continue;
+      const otherTarget = this.guessTarget(otherCtx.bridge);
+      if (otherCtx.bridge.connected && otherTarget && otherTarget === row.target) {
+        return {
+          ok: false,
+          error: `target "${row.target}" is already held by radio "${otherId}". Disconnect that one first, or update "${radioId}" to a different target.`,
+        };
+      }
+    }
+
     const bridge = new MeshtasticSerialBridge();
     try {
       if (row.transport === 'tcp') {
