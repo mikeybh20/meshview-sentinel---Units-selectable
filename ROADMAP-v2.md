@@ -379,7 +379,7 @@ The minimum to stop being "incomplete" against the Apple client's published feat
 - 🔲 **Display config editor** (M) — orientation, screen-on time, units, 12/24h, OLED type, auto-brightness.
 - 🔲 **Bluetooth config editor** (S) — mode (PIN/NoPIN) + saved fixed PIN.
 - 🔲 **Settings → Modules: Remote Hardware** (M) — the last unshipped module; GPIO remote control.
-- 🔲 **Channel share URL export/import** (S) — encode/decode the standard `https://meshtastic.org/e/#…` set-link so configs can move between Sentinel and the official clients.
+- ✅ **Channel share URL export/import** — encode/decode the standard `https://meshtastic.org/e/#…` set-link. Already shipped in [channelShare.ts](src/lib/channelShare.ts) (`buildChannelShareUrl` + `parseChannelShareUrl`) with QR + URL export and paste-to-stage import in [ChannelsModal.tsx](src/components/ChannelsModal.tsx). Round-trips PSK, role, uplink/downlink, and position_precision; tolerates full URL, host-only, or bare base64url payload.
 - 🔲 **Markdown formatting toolbar in message compose** (S) — bold / italic / code / link.
 - 🔲 **Node-list Compact density mode** (S) — toggle for large meshes (100+ nodes).
 

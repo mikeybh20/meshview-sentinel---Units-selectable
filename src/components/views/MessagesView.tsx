@@ -1,5 +1,5 @@
 import React from 'react';
-import { Filter, Signal, Activity, Users, ArrowRight, Settings, Clock, Check, CheckCheck, AlertCircle, RotateCcw, Wifi, WifiOff, CornerDownRight, Smile, X, Search } from 'lucide-react';
+import { Filter, Signal, Activity, Users, ArrowRight, Settings, Clock, Check, CheckCheck, AlertCircle, RotateCcw, Wifi, WifiOff, CornerDownRight, Smile, X, Search, Bold, Italic, Code, Link2 } from 'lucide-react';
 // ReactionPicker is lazy-loaded so emoji-picker-react (~140 KB) only ships
 // when the operator actually opens a reaction picker.
 const ReactionPicker = React.lazy(() => import('../lazy/ReactionPicker'));
@@ -220,7 +220,31 @@ export function MessagesView({
 }: MessagesViewProps) {
   const messagesEndRef = React.useRef<HTMLDivElement>(null);
   const messageRefs = React.useRef<Map<string, HTMLDivElement>>(new Map());
+  const composeInputRef = React.useRef<HTMLInputElement | null>(null);
   const [highlightId, setHighlightId] = React.useState<string | null>(null);
+
+  // Beta 3: markdown formatting toolbar. Wraps the current selection in the
+  // requested syntax, or inserts the syntax with a placeholder if there's no
+  // selection. Operates on the compose input + draftMessage state in lockstep
+  // so the caret/selection stay sensible after the splice.
+  const wrapSelection = (before: string, after: string, placeholder: string) => {
+    const el = composeInputRef.current;
+    if (!el) {
+      setDraftMessage(draftMessage + before + placeholder + after);
+      return;
+    }
+    const start = el.selectionStart ?? draftMessage.length;
+    const end = el.selectionEnd ?? draftMessage.length;
+    const selected = draftMessage.slice(start, end) || placeholder;
+    const next = draftMessage.slice(0, start) + before + selected + after + draftMessage.slice(end);
+    setDraftMessage(next);
+    requestAnimationFrame(() => {
+      if (!composeInputRef.current) return;
+      const caret = start + before.length + selected.length;
+      composeInputRef.current.focus();
+      composeInputRef.current.setSelectionRange(start + before.length, caret);
+    });
+  };
 
   // v2.0 multi-radio: look up the per-radio color for the message chip.
   const { radios, selectedRadioId, defaultRadioId } = useRadios();
@@ -884,8 +908,38 @@ export function MessagesView({
                       ))}
                     </div>
                   )}
+                  {/* Beta 3: markdown formatting toolbar. Inserts bold/italic/code/link
+                      syntax around the current selection. The firmware doesn't render
+                      markdown itself, but clients that do (MeshDash, some mobile clients)
+                      will display it correctly. */}
+                  <div className="flex items-center gap-1 mb-1.5">
+                    <button type="button" title="Bold (**text**)"
+                      onClick={() => wrapSelection('**', '**', 'text')}
+                      className="p-1 rounded text-brand-muted hover:text-brand-ink hover:bg-brand-line transition-colors">
+                      <Bold size={12} />
+                    </button>
+                    <button type="button" title="Italic (*text*)"
+                      onClick={() => wrapSelection('*', '*', 'text')}
+                      className="p-1 rounded text-brand-muted hover:text-brand-ink hover:bg-brand-line transition-colors">
+                      <Italic size={12} />
+                    </button>
+                    <button type="button" title="Inline code (`text`)"
+                      onClick={() => wrapSelection('`', '`', 'code')}
+                      className="p-1 rounded text-brand-muted hover:text-brand-ink hover:bg-brand-line transition-colors">
+                      <Code size={12} />
+                    </button>
+                    <button type="button" title="Link ([text](url))"
+                      onClick={() => wrapSelection('[', '](url)', 'text')}
+                      className="p-1 rounded text-brand-muted hover:text-brand-ink hover:bg-brand-line transition-colors">
+                      <Link2 size={12} />
+                    </button>
+                    <span className="text-[9px] mono-text text-brand-muted/60 ml-auto">
+                      Markdown — rendered by clients that support it
+                    </span>
+                  </div>
                   <div className="flex gap-2">
                     <input
+                      ref={composeInputRef}
                       type="text"
                       value={draftMessage}
                       onChange={(e) => setDraftMessage(e.target.value)}

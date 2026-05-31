@@ -19,6 +19,8 @@ import {
   Copy,
   Clock,
   History,
+  Rows3,
+  LayoutList,
 } from 'lucide-react';
 import { Map, Marker, GeoJson } from "pigeon-maps";
 
@@ -1251,6 +1253,21 @@ export function DashboardView({
   const [bulkBusy, setBulkBusy] = React.useState(false);
   const [showGroupMenu, setShowGroupMenu] = React.useState(false);
 
+  // Beta 3: node-list density mode. Compact halves row height + hides the
+  // "Heard By" column for operators running 100+-node meshes where the
+  // default Complete density wastes too much vertical real estate.
+  // Persisted to localStorage so the choice survives reloads.
+  const [density, setDensity] = React.useState<'complete' | 'compact'>(() => {
+    try {
+      const stored = localStorage.getItem('mesh.nodeListDensity');
+      return stored === 'compact' ? 'compact' : 'complete';
+    } catch { return 'complete'; }
+  });
+  React.useEffect(() => {
+    try { localStorage.setItem('mesh.nodeListDensity', density); } catch { /* ignore */ }
+  }, [density]);
+  const compact = density === 'compact';
+
   // Drop selections that no longer exist in the filtered list (e.g. node
   // disappeared, search filter narrowed).
   React.useEffect(() => {
@@ -1419,11 +1436,21 @@ export function DashboardView({
                       Active Network Peers
                       <span className="text-brand-muted/60 mono-text">({filteredNodes.length})</span>
                     </h3>
-                    {someSelected && (
-                      <span className="text-[10px] mono-text text-brand-accent">
-                        {selectedIds.size} selected
-                      </span>
-                    )}
+                    <div className="flex items-center gap-2">
+                      {someSelected && (
+                        <span className="text-[10px] mono-text text-brand-accent">
+                          {selectedIds.size} selected
+                        </span>
+                      )}
+                      <button
+                        onClick={() => setDensity(d => d === 'compact' ? 'complete' : 'compact')}
+                        title={compact ? 'Switch to Complete density' : 'Switch to Compact density (better for 100+ nodes)'}
+                        className="flex items-center gap-1 text-[10px] mono-text uppercase font-bold text-brand-muted hover:text-brand-ink border border-brand-line hover:border-brand-muted rounded px-2 py-1 transition-colors"
+                      >
+                        {compact ? <Rows3 size={11} /> : <LayoutList size={11} />}
+                        {compact ? 'Compact' : 'Complete'}
+                      </button>
+                    </div>
                   </div>
                   <div className="flex-1 min-h-0 overflow-y-auto overflow-x-auto">
                     <table className="w-full text-left">
@@ -1448,7 +1475,9 @@ export function DashboardView({
                           <th className="px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-brand-muted">Status</th>
                           <th className="px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-brand-muted">Node ID</th>
                           <th className="px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-brand-muted">Name</th>
-                          <th className="px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-brand-muted hidden md:table-cell">Heard By</th>
+                          {!compact && (
+                            <th className="px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-brand-muted hidden md:table-cell">Heard By</th>
+                          )}
                           <th className="px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-brand-muted text-right">Actions</th>
                         </tr>
                       </thead>
@@ -1467,7 +1496,7 @@ export function DashboardView({
                               selectedNodeId === node.id && !isChecked && "bg-brand-line/30"
                             )}
                           >
-                            <td className="pl-4 py-4 w-8">
+                            <td className={cn('pl-4 w-8', compact ? 'py-1.5' : 'py-4')}>
                               <button
                                 onClick={(e) => toggleSelection(node.id, e)}
                                 title={isChecked ? 'Deselect' : 'Select (shift-click for range)'}
@@ -1481,14 +1510,14 @@ export function DashboardView({
                                 {isChecked && <Check size={10} strokeWidth={3} />}
                               </button>
                             </td>
-                            <td className="px-4 py-4">
+                            <td className={cn('px-4', compact ? 'py-1.5' : 'py-4')}>
                               <div className={cn(
                                 "w-2 h-2 rounded-full",
                                 node.online ? "bg-brand-accent status-glow-green" : "bg-red-500 status-glow-amber opacity-50"
                               )} />
                             </td>
-                            <td className="px-4 py-4 data-value text-xs">{node.id}</td>
-                            <td className="px-4 py-4">
+                            <td className={cn('px-4 data-value text-xs', compact ? 'py-1.5' : 'py-4')}>{node.id}</td>
+                            <td className={cn('px-4', compact ? 'py-1.5' : 'py-4')}>
                               <div className="flex items-center gap-2">
                                 {node.shortName && (
                                   <span className="text-[10px] font-bold mono-text text-brand-accent bg-brand-accent/10 border border-brand-accent/30 px-1.5 py-0.5 rounded flex-shrink-0">
@@ -1511,10 +1540,12 @@ export function DashboardView({
                                 {node.sensors && <Activity size={12} className="text-brand-accent animate-pulse" />}
                               </div>
                             </td>
-                            <td className="px-4 py-4 hidden md:table-cell">
-                              <HeardByBadges nodeId={node.id} heardBy={node.heardByRadios ?? []} />
-                            </td>
-                            <td className="px-4 py-4 text-right">
+                            {!compact && (
+                              <td className="px-4 py-4 hidden md:table-cell">
+                                <HeardByBadges nodeId={node.id} heardBy={node.heardByRadios ?? []} />
+                              </td>
+                            )}
+                            <td className={cn('px-4 text-right', compact ? 'py-1.5' : 'py-4')}>
                               <ArrowRight size={16} className="ml-auto opacity-0 group-hover:opacity-100 transition-opacity" />
                             </td>
                           </tr>
