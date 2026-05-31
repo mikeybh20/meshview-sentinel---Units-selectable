@@ -1920,6 +1920,60 @@ app.post('/api/mesh/modules/paxcounter', async (req, res) => {
   }
 });
 
+// Remote Hardware module: refresh + write
+app.post('/api/mesh/modules/remote-hardware/refresh', async (_req, res) => {
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.requestRemoteHardwareConfig();
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/mesh/modules/remote-hardware', async (req, res) => {
+  const body = req.body ?? {};
+  if (typeof body.enabled !== 'boolean') {
+    return res.status(400).json({ error: 'enabled must be a boolean' });
+  }
+  if (typeof body.allowUndefinedPinAccess !== 'boolean') {
+    return res.status(400).json({ error: 'allowUndefinedPinAccess must be a boolean' });
+  }
+  if (!Array.isArray(body.availablePins)) {
+    return res.status(400).json({ error: 'availablePins must be an array' });
+  }
+  // Validate each pin
+  const pins: { gpioPin: number; name: string; type: number }[] = [];
+  for (let i = 0; i < body.availablePins.length; i++) {
+    const p = body.availablePins[i];
+    if (typeof p !== 'object' || p === null) {
+      return res.status(400).json({ error: `availablePins[${i}] must be an object` });
+    }
+    if (typeof p.gpioPin !== 'number' || p.gpioPin < 0 || p.gpioPin > 64) {
+      return res.status(400).json({ error: `availablePins[${i}].gpioPin must be 0..64` });
+    }
+    if (typeof p.name !== 'string') {
+      return res.status(400).json({ error: `availablePins[${i}].name must be a string` });
+    }
+    if (typeof p.type !== 'number' || p.type < 0 || p.type > 3) {
+      return res.status(400).json({ error: `availablePins[${i}].type must be 0..3` });
+    }
+    pins.push({ gpioPin: p.gpioPin, name: p.name.slice(0, 32), type: p.type });
+  }
+
+  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  try {
+    await meshBridge.setRemoteHardwareConfig({
+      enabled: body.enabled,
+      allowUndefinedPinAccess: body.allowUndefinedPinAccess,
+      availablePins: pins,
+    });
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // External Notification module: refresh + write
 app.post('/api/mesh/modules/external-notification/refresh', async (_req, res) => {
   if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });

@@ -1579,6 +1579,42 @@ export class MeshDataService {
     }
   }
 
+  /** Ask the radio to re-send its current Remote Hardware module config. Local admin only. */
+  async refreshRemoteHardwareConfig(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/remote-hardware/refresh`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
+  /** Configure the Remote Hardware (GPIO remote control) module on the connected radio. */
+  async setRemoteHardwareConfig(cfg: {
+    enabled: boolean;
+    allowUndefinedPinAccess: boolean;
+    availablePins: Array<{ gpioPin: number; name: string; type: number }>;
+  }): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/modules/remote-hardware`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(cfg),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err.message || 'Network error' };
+    }
+  }
+
   /** Ask the radio to re-send its current MQTT module config. Local admin only. */
   async refreshMqttConfig(): Promise<{ ok: boolean; error?: string }> {
     try {

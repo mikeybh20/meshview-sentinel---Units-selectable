@@ -349,6 +349,21 @@ export interface PaxcounterModuleConfig {
   lastReadAt: number;
 }
 
+export interface RemoteHardwarePin {
+  gpioPin: number;
+  name: string;
+  /** RemoteHardwarePinType enum: UNKNOWN=0, DIGITAL_READ=1, DIGITAL_WRITE=2. */
+  type: number;
+}
+
+export interface RemoteHardwareModuleConfig {
+  enabled: boolean;
+  allowUndefinedPinAccess: boolean;
+  availablePins: RemoteHardwarePin[];
+  /** Epoch ms when this config was last read from the radio. */
+  lastReadAt: number;
+}
+
 export interface MqttModuleConfig {
   enabled: boolean;
   address: string;
@@ -427,6 +442,8 @@ export interface LocalModuleConfigSnapshot {
   ambientLighting?: AmbientLightingModuleConfig;
   /** Authoritative Paxcounter module config (WiFi/BLE device counting). */
   paxcounter?: PaxcounterModuleConfig;
+  /** Authoritative Remote Hardware module config (GPIO remote control). */
+  remoteHardware?: RemoteHardwareModuleConfig;
   /** Live state of timed surveys (Range Test sender / NeighborInfo cadence). */
   activeSurveys?: {
     rangeTestExpiresAt: number | null;

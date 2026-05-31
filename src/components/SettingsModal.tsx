@@ -2506,8 +2506,11 @@ function ModulesSection({ localModuleConfig, radioConnected }: SettingsModalProp
       {/* Paxcounter (WiFi/BLE device counting) */}
       <PaxcounterModuleCard radioConnected={radioConnected} px={localModuleConfig.paxcounter} />
 
+      {/* Remote Hardware (GPIO remote control) */}
+      <RemoteHardwareModuleCard radioConnected={radioConnected} rh={localModuleConfig.remoteHardware} />
+
       <p className="text-[10px] text-brand-muted leading-relaxed">
-        Eleven modules now configurable end-to-end. Remote Hardware remains on the roadmap.
+        All twelve firmware modules now configurable end-to-end.
       </p>
     </div>
   );
@@ -4901,6 +4904,219 @@ function PaxcounterModuleCard({ radioConnected, px }: {
       <div className="flex items-center justify-between gap-2 pt-2 border-t border-brand-line">
         <p className="text-[9px] mono-text text-brand-muted">
           {lastReadLabel ? `Last read: ${lastReadLabel}` : px ? 'Set by you (no readback yet)' : 'No readback yet — Save will apply your values'}
+        </p>
+        <button
+          onClick={handleSave}
+          disabled={!radioConnected || busy || !dirty}
+          className="flex items-center gap-1.5 bg-brand-accent/20 hover:bg-brand-accent/30 border border-brand-accent/50 text-brand-accent text-xs font-bold uppercase tracking-widest rounded px-3 py-1.5 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          {busy ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
+          {busy ? 'Saving…' : dirty ? 'Save' : 'No changes'}
+        </button>
+      </div>
+
+      {status && (
+        <p className={`text-[10px] leading-snug ${status.kind === 'ok' ? 'text-brand-accent' : 'text-brand-error'}`}>
+          {status.text}
+        </p>
+      )}
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------
+// Remote Hardware module — expose GPIO pins for read/write across the mesh
+// ----------------------------------------------------------------------------
+const REMOTE_HW_PIN_TYPE_OPTIONS = [
+  { value: 0, label: 'Unknown / disabled' },
+  { value: 1, label: 'Digital read (input)' },
+  { value: 2, label: 'Digital write (output)' },
+];
+
+function RemoteHardwareModuleCard({ radioConnected, rh }: {
+  radioConnected: boolean;
+  rh: import('../types').RemoteHardwareModuleConfig | undefined;
+}) {
+  const [enabled, setEnabled] = React.useState<boolean>(rh?.enabled ?? false);
+  const [allowUndefined, setAllowUndefined] = React.useState<boolean>(rh?.allowUndefinedPinAccess ?? false);
+  const [pins, setPins] = React.useState<import('../types').RemoteHardwarePin[]>(rh?.availablePins ?? []);
+
+  const [busy, setBusy] = React.useState(false);
+  const [refreshing, setRefreshing] = React.useState(false);
+  const [status, setStatus] = React.useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
+
+  const lastSyncedRef = React.useRef<number | null>(null);
+  React.useEffect(() => {
+    if (!rh || busy) return;
+    if (lastSyncedRef.current === rh.lastReadAt) return;
+    lastSyncedRef.current = rh.lastReadAt;
+    setEnabled(rh.enabled);
+    setAllowUndefined(rh.allowUndefinedPinAccess);
+    setPins(rh.availablePins);
+  }, [rh?.lastReadAt, rh, busy]);
+
+  const samePins = (a: import('../types').RemoteHardwarePin[], b: import('../types').RemoteHardwarePin[]) =>
+    a.length === b.length && a.every((p, i) => p.gpioPin === b[i].gpioPin && p.name === b[i].name && p.type === b[i].type);
+  const dirty = !rh
+    ? true
+    : (enabled !== rh.enabled || allowUndefined !== rh.allowUndefinedPinAccess || !samePins(pins, rh.availablePins));
+
+  const addPin = () => setPins(p => [...p, { gpioPin: 0, name: '', type: 1 }]);
+  const removePin = (i: number) => setPins(p => p.filter((_, idx) => idx !== i));
+  const updatePin = (i: number, patch: Partial<import('../types').RemoteHardwarePin>) =>
+    setPins(p => p.map((pin, idx) => idx === i ? { ...pin, ...patch } : pin));
+
+  const handleSave = async () => {
+    setBusy(true);
+    setStatus(null);
+    const r = await meshDataService.setRemoteHardwareConfig({
+      enabled,
+      allowUndefinedPinAccess: allowUndefined,
+      availablePins: pins,
+    });
+    setBusy(false);
+    if (r.ok) setStatus({ kind: 'ok', text: 'Saved — radio is committing the new config' });
+    else setStatus({ kind: 'error', text: r.error ?? 'Save failed' });
+  };
+
+  const handleRefresh = async () => {
+    setRefreshing(true);
+    setStatus(null);
+    const r = await meshDataService.refreshRemoteHardwareConfig();
+    setRefreshing(false);
+    if (!r.ok) setStatus({ kind: 'error', text: r.error ?? 'Refresh failed' });
+  };
+
+  const lastReadLabel = rh?.lastReadAt
+    ? new Date(rh.lastReadAt).toLocaleString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' })
+    : null;
+
+  return (
+    <div className="bg-brand-line/40 border border-brand-line rounded-lg p-4 space-y-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <div className="flex items-center gap-2">
+            <Network size={14} className="text-brand-accent" />
+            <h5 className="text-xs font-bold uppercase tracking-tight text-brand-ink">Remote Hardware</h5>
+            {rh && (
+              <span className={cn(
+                'text-[9px] uppercase font-bold mono-text px-1.5 py-0.5 rounded border',
+                rh.enabled
+                  ? 'text-brand-accent bg-brand-accent/10 border-brand-accent/30'
+                  : 'text-brand-muted bg-brand-line border-brand-line',
+              )}>
+                {rh.enabled ? `Enabled · ${rh.availablePins.length} pin${rh.availablePins.length === 1 ? '' : 's'}` : 'Disabled'}
+              </span>
+            )}
+            {!rh && radioConnected && (
+              <span className="text-[9px] uppercase font-bold mono-text px-1.5 py-0.5 rounded border border-brand-line text-brand-muted bg-brand-line">
+                Reading…
+              </span>
+            )}
+          </div>
+          <p className="text-[11px] text-brand-muted mt-1 leading-relaxed">
+            Lets mesh peers read or toggle GPIO pins on this radio (e.g. mailbox-open sensor, gate latch). Each pin is whitelisted by name + type. <span className="text-brand-warning font-bold">Allowing undefined pin access</span> exposes <span className="italic">every</span> GPIO to anyone on the mesh — generally a bad idea.
+          </p>
+        </div>
+        <button
+          onClick={handleRefresh}
+          disabled={!radioConnected || refreshing}
+          title="Re-read the config from the radio"
+          className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest text-brand-muted hover:text-brand-ink border border-brand-line hover:border-brand-muted rounded px-2 py-1 transition-colors disabled:opacity-50"
+        >
+          <RefreshCw size={10} className={refreshing ? 'animate-spin' : ''} />
+          {refreshing ? '...' : 'Refresh'}
+        </button>
+      </div>
+
+      <label className="flex items-center justify-between cursor-pointer">
+        <div>
+          <p className="text-xs font-bold text-brand-ink">Module enabled</p>
+          <p className="text-[10px] text-brand-muted">Master switch — disables every Remote Hardware control below when off.</p>
+        </div>
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={e => setEnabled(e.target.checked)}
+          disabled={!radioConnected}
+          className="w-4 h-4 accent-emerald-500"
+        />
+      </label>
+
+      <label className="flex items-center justify-between cursor-pointer">
+        <div>
+          <p className="text-xs font-bold text-brand-warning">Allow undefined pin access</p>
+          <p className="text-[10px] text-brand-muted">Off (default) restricts access to the whitelist below. On = mesh peers can read/write any GPIO.</p>
+        </div>
+        <input
+          type="checkbox"
+          checked={allowUndefined}
+          onChange={e => setAllowUndefined(e.target.checked)}
+          disabled={!radioConnected || !enabled}
+          className="w-4 h-4 accent-amber-500"
+        />
+      </label>
+
+      <div className="border-t border-brand-line pt-3 space-y-2">
+        <div className="flex items-center justify-between">
+          <p className="text-[10px] font-bold uppercase tracking-widest text-brand-muted">Available pins</p>
+          <button
+            onClick={addPin}
+            disabled={!radioConnected || !enabled}
+            className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest text-brand-accent hover:text-brand-ink border border-brand-accent/40 hover:border-brand-accent rounded px-2 py-1 transition-colors disabled:opacity-40"
+          >
+            <Plus size={10} /> Add pin
+          </button>
+        </div>
+        {pins.length === 0 && (
+          <p className="text-[11px] text-brand-muted italic">No pins whitelisted. Click <em>Add pin</em> to expose a GPIO to the mesh.</p>
+        )}
+        {pins.map((pin, i) => (
+          <div key={i} className="flex items-center gap-2 bg-brand-bg/40 border border-brand-line rounded p-2">
+            <div className="flex-1 grid grid-cols-[80px_1fr_180px] gap-2">
+              <input
+                type="number"
+                min={0}
+                max={64}
+                value={pin.gpioPin}
+                onChange={e => updatePin(i, { gpioPin: Math.max(0, Math.min(64, parseInt(e.target.value, 10) || 0)) })}
+                disabled={!radioConnected || !enabled}
+                placeholder="GPIO"
+                className="bg-brand-line text-xs mono-text rounded px-2 py-1 border border-brand-line hover:border-brand-muted focus:outline-none focus:border-brand-accent/50 disabled:opacity-50"
+              />
+              <input
+                type="text"
+                maxLength={32}
+                value={pin.name}
+                onChange={e => updatePin(i, { name: e.target.value })}
+                disabled={!radioConnected || !enabled}
+                placeholder="Name (e.g. Mailbox)"
+                className="bg-brand-line text-xs rounded px-2 py-1 border border-brand-line hover:border-brand-muted focus:outline-none focus:border-brand-accent/50 disabled:opacity-50"
+              />
+              <select
+                value={pin.type}
+                onChange={e => updatePin(i, { type: parseInt(e.target.value, 10) })}
+                disabled={!radioConnected || !enabled}
+                className="bg-brand-line text-xs rounded px-2 py-1 border border-brand-line hover:border-brand-muted focus:outline-none focus:border-brand-accent/50 disabled:opacity-50"
+              >
+                {REMOTE_HW_PIN_TYPE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+              </select>
+            </div>
+            <button
+              onClick={() => removePin(i)}
+              disabled={!radioConnected || !enabled}
+              title="Remove pin"
+              className="text-brand-muted hover:text-brand-error border border-brand-line hover:border-brand-error/40 rounded p-1 transition-colors disabled:opacity-40"
+            >
+              <Trash2 size={12} />
+            </button>
+          </div>
+        ))}
+      </div>
+
+      <div className="flex items-center justify-between gap-2 pt-2 border-t border-brand-line">
+        <p className="text-[9px] mono-text text-brand-muted">
+          {lastReadLabel ? `Last read: ${lastReadLabel}` : rh ? 'Set by you (no readback yet)' : 'No readback yet — Save will apply your values'}
         </p>
         <button
           onClick={handleSave}

@@ -351,6 +351,30 @@ export interface PaxcounterModuleConfig {
   lastReadAt: number;
 }
 
+/**
+ * Single GPIO pin exposed by the Remote Hardware module. Each pin advertises
+ * its access mode (read, write, or both) to other nodes on the mesh.
+ */
+export interface RemoteHardwarePin {
+  /** Arduino-style GPIO pin number on this board. */
+  gpioPin: number;
+  /** Human-readable name shown on the mesh (e.g. "Mailbox", "Gate"). */
+  name: string;
+  /** RemoteHardwarePinType enum: UNKNOWN=0, DIGITAL_READ=1, DIGITAL_WRITE=2. */
+  type: number;
+}
+
+export interface RemoteHardwareModuleConfig {
+  /** Master enable for the Remote Hardware module. */
+  enabled: boolean;
+  /** Allow mesh peers to read/write GPIO pins NOT in availablePins (dangerous). */
+  allowUndefinedPinAccess: boolean;
+  /** Whitelist of exposed pins. */
+  availablePins: RemoteHardwarePin[];
+  /** Epoch ms when this config was last read from the radio. */
+  lastReadAt: number;
+}
+
 export interface MqttModuleConfig {
   /** Master enable for the MQTT module on the local radio. */
   enabled: boolean;
@@ -616,6 +640,8 @@ export interface LocalModuleConfigSnapshot {
   ambientLighting?: AmbientLightingModuleConfig;
   /** Authoritative Paxcounter module config (WiFi/BLE device counting). */
   paxcounter?: PaxcounterModuleConfig;
+  /** Authoritative Remote Hardware module config (GPIO remote control). */
+  remoteHardware?: RemoteHardwareModuleConfig;
   /**
    * Active timed surveys: epoch-ms restore deadlines for any module currently
    * running an accelerated cadence. `null` for any module that's not in survey mode.
@@ -1743,6 +1769,7 @@ export class MeshtasticSerialBridge extends EventEmitter {
               this.requestSerialConfig().catch(() => { /* best-effort */ });
               this.requestAmbientLightingConfig().catch(() => { /* best-effort */ });
               this.requestPaxcounterConfig().catch(() => { /* best-effort */ });
+              this.requestRemoteHardwareConfig().catch(() => { /* best-effort */ });
             }, 500);
           }
         } else if (fieldNumber === 8) {
@@ -4038,6 +4065,8 @@ export class MeshtasticSerialBridge extends EventEmitter {
   private static readonly MODULE_CFG_AMBIENT_LIGHTING = 10;
   /** ModuleConfigType enum value for Paxcounter (mesh.proto). */
   private static readonly MODULE_CFG_PAXCOUNTER = 12;
+  /** ModuleConfigType enum value for Remote Hardware (mesh.proto). */
+  private static readonly MODULE_CFG_REMOTE_HARDWARE = 8;
 
   /**
    * Ask the local radio for its current NeighborInfo module config. The reply
@@ -5547,6 +5576,61 @@ export class MeshtasticSerialBridge extends EventEmitter {
     console.log('[MeshtasticSerial] Requested Paxcounter module config readback');
   }
 
+  // ---- Remote Hardware module ---------------------------------------------
+
+  /**
+   * Build AdminMessage { set_module_config: ModuleConfig { remote_hardware: ... } }.
+   * Field numbers per module_config.proto:
+   *   ModuleConfig.remote_hardware = 9 (length-delim RemoteHardwareConfig)
+   *   RemoteHardwareConfig: 1=enabled, 2=allow_undefined_pin_access,
+   *     3=available_pins (repeated RemoteHardwarePin)
+   *   RemoteHardwarePin: 1=gpio_pin, 2=name, 3=type (RemoteHardwarePinType enum)
+   */
+  private buildAdminSetRemoteHardwareConfig(cfg: Omit<RemoteHardwareModuleConfig, 'lastReadAt'>): Buffer {
+    const parts: Buffer[] = [
+      this.encodeTagBool(1, cfg.enabled),
+      this.encodeTagBool(2, cfg.allowUndefinedPinAccess),
+    ];
+    // Each pin is its own length-delim submessage at field 3 (repeated).
+    for (const pin of cfg.availablePins) {
+      const pinPayload = Buffer.concat([
+        this.encodeTagVarint(1, Math.max(0, Math.floor(pin.gpioPin))),
+        ...(pin.name ? [this.encodeTagLen(2, Buffer.from(pin.name, 'utf-8'))] : []),
+        this.encodeTagVarint(3, Math.max(0, Math.floor(pin.type))),
+      ]);
+      parts.push(this.encodeTagLen(3, pinPayload));
+    }
+    const rhCfg = Buffer.concat(parts);
+    const moduleConfig = this.encodeTagLen(9, rhCfg);   // ModuleConfig.remote_hardware
+    return this.encodeTagLen(34, moduleConfig);          // AdminMessage.set_module_config
+  }
+
+  async setRemoteHardwareConfig(cfg: Omit<RemoteHardwareModuleConfig, 'lastReadAt'>): Promise<void> {
+    if (!this.isLinkOpen()) throw new Error('Radio not connected');
+    if (!this.localNodeNum) throw new Error('Local node not yet identified — try again in a moment');
+
+    this.sendAdminMessage(this.buildAdminSetRemoteHardwareConfig(cfg));
+    await new Promise(r => setTimeout(r, 80));
+    this.sendAdminMessage(this.buildAdminCommit());
+
+    console.log(`[MeshtasticSerial] Remote Hardware module ${cfg.enabled ? 'ENABLED' : 'DISABLED'} (${cfg.availablePins.length} pin(s), undefined-access=${cfg.allowUndefinedPinAccess})`);
+    this.addEvent('TELEMETRY', this.localNodeId || '!local',
+      `Remote Hardware module ${cfg.enabled ? 'enabled' : 'disabled'}`);
+
+    this.localModuleConfig.remoteHardware = { ...cfg, lastReadAt: Date.now() };
+    this.updateLocalModuleConfig();
+
+    setTimeout(() => { this.requestRemoteHardwareConfig().catch(() => { /* best-effort */ }); }, 250);
+  }
+
+  async requestRemoteHardwareConfig(): Promise<void> {
+    if (!this.isLinkOpen()) return;
+    if (!this.localNodeNum) return;
+    const adminPayload = this.encodeTagVarint(3, MeshtasticSerialBridge.MODULE_CFG_REMOTE_HARDWARE);
+    this.sendAdminMessage(adminPayload);
+    console.log('[MeshtasticSerial] Requested Remote Hardware module config readback');
+  }
+
   /**
    * Parse an inbound PORT_ADMIN_APP packet. We're looking for
    * `get_module_config_response` (AdminMessage field 4) which contains a
@@ -5743,6 +5827,12 @@ export class MeshtasticSerialBridge extends EventEmitter {
           const cfg = this.parsePaxcounterConfigSub(sub);
           this.localModuleConfig.paxcounter = { ...cfg, lastReadAt: Date.now() };
           console.log(`[MeshtasticSerial] Paxcounter readback: enabled=${cfg.enabled} interval=${cfg.updateIntervalSecs}s wifi=${cfg.wifiThreshold} ble=${cfg.bleThreshold}`);
+          this.updateLocalModuleConfig();
+        } else if (fieldNumber === 9) {
+          // ModuleConfig.remote_hardware (RemoteHardwareConfig)
+          const cfg = this.parseRemoteHardwareConfigSub(sub);
+          this.localModuleConfig.remoteHardware = { ...cfg, lastReadAt: Date.now() };
+          console.log(`[MeshtasticSerial] Remote Hardware readback: enabled=${cfg.enabled} pins=${cfg.availablePins.length} undefined=${cfg.allowUndefinedPinAccess}`);
           this.updateLocalModuleConfig();
         }
       } else if (wireType === 0) {
@@ -5943,6 +6033,64 @@ export class MeshtasticSerialBridge extends EventEmitter {
       } else { break; }
     }
     return { enabled, updateIntervalSecs, wifiThreshold, bleThreshold };
+  }
+
+  private parseRemoteHardwareConfigSub(buf: Buffer): Omit<RemoteHardwareModuleConfig, 'lastReadAt'> {
+    let enabled = false;
+    let allowUndefinedPinAccess = false;
+    const availablePins: RemoteHardwarePin[] = [];
+    let offset = 0;
+
+    while (offset < buf.length) {
+      const tag = buf[offset++];
+      const fieldNumber = tag >> 3;
+      const wireType = tag & 0x07;
+      if (wireType === 0) {
+        const { value, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (fieldNumber === 1) enabled = value !== 0;
+        else if (fieldNumber === 2) allowUndefinedPinAccess = value !== 0;
+      } else if (wireType === 2) {
+        const { value: len, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (offset + len > buf.length) break;
+        const sub = buf.subarray(offset, offset + len);
+        offset += len;
+        if (fieldNumber === 3) {
+          availablePins.push(this.parseRemoteHardwarePinSub(sub));
+        }
+      } else if (wireType === 5) { offset += 4; }
+      else if (wireType === 1) { offset += 8; }
+      else break;
+    }
+    return { enabled, allowUndefinedPinAccess, availablePins };
+  }
+
+  private parseRemoteHardwarePinSub(buf: Buffer): RemoteHardwarePin {
+    let gpioPin = 0, type = 0;
+    let name = '';
+    let offset = 0;
+    while (offset < buf.length) {
+      const tag = buf[offset++];
+      const fieldNumber = tag >> 3;
+      const wireType = tag & 0x07;
+      if (wireType === 0) {
+        const { value, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (fieldNumber === 1) gpioPin = value;
+        else if (fieldNumber === 3) type = value;
+      } else if (wireType === 2) {
+        const { value: len, bytesRead } = this.readVarint(buf, offset);
+        offset += bytesRead;
+        if (offset + len > buf.length) break;
+        const s = buf.subarray(offset, offset + len).toString('utf-8');
+        offset += len;
+        if (fieldNumber === 2) name = s;
+      } else if (wireType === 5) { offset += 4; }
+      else if (wireType === 1) { offset += 8; }
+      else break;
+    }
+    return { gpioPin, name, type };
   }
 
   private parseMqttConfigSub(buf: Buffer): Omit<MqttModuleConfig, 'lastReadAt'> {
