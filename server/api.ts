@@ -2965,6 +2965,32 @@ if (process.env.SERIAL_AUTO_DISCOVER === 'true') {
   }
 }
 
+// v2.0 Beta 3: auto-reconnect-secondaries on boot.
+// SerialDiscovery handles the singleton (whichever serial device enumerates
+// first), but TCP-configured radios + serial radios on non-default ports
+// otherwise sit unconnected after every container restart — the operator
+// would have to click Connect on each one manually. This pass iterates the
+// radios DB after a short delay (gives SerialDiscovery + identity exchange
+// time to settle so we know what the singleton is actually serving), then
+// spawns secondaries for every enabled row that isn't the singleton.
+// spawnSecondary's target-collision check refuses any row whose target is
+// already held — those get logged and skipped cleanly. Runs regardless of
+// which transport branch above fired.
+setTimeout(async () => {
+  const rows = meshDb().listRadios();
+  for (const r of rows) {
+    if (!r.enabled) continue;
+    const result = await bridgeManager.spawnSecondary(r.radio_id);
+    if (!result.ok) {
+      // Refused due to singleton-collision / already-connected / target-busy.
+      // These are expected and harmless — log at debug-level rather than error.
+      console.log(`[API] auto-reconnect: skipped "${r.radio_id}" — ${(result as { ok: false; error: string }).error}`);
+      continue;
+    }
+    console.log(`[API] auto-reconnect: spawned "${r.radio_id}" (${r.transport}:${r.target})`);
+  }
+}, 8000);
+
 const PORT = process.env.API_PORT || 3001;
 app.listen(PORT, () => {
   console.log(`API server running on http://localhost:${PORT}`);

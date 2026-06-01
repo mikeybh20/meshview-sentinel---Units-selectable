@@ -293,13 +293,23 @@ class BridgeManager extends EventEmitter {
   async spawnSecondary(radioId: string): Promise<{ ok: true } | { ok: false; error: string }> {
     const row = meshDb().getRadio(radioId);
     if (!row) return { ok: false, error: `radio "${radioId}" not found` };
-    // v2.0 bugfix: gate on the LIVE default (the radio currently held by the
-    // singleton bridge) rather than the DB column. They diverge when an
-    // operator hot-swaps radios — the DB row's is_default sticks to whichever
-    // radio was first to auto-discover historically, but the runtime default
-    // is whichever radio claimed the singleton this boot. Blocking on the DB
-    // column would refuse to connect a radio that's actually free to use.
-    if (radioId === this.defaultRadioId) {
+    // v2.0 Beta 3 bugfix: gate on the singleton bridge's *registered* radio
+    // id (post-identity) rather than `this.defaultRadioId` (DB `is_default`).
+    //
+    // Why this matters: at boot, `this.defaultRadioId` is initialised from
+    // the DB. The singleton, meanwhile, gets whichever port SerialDiscovery
+    // finds first — which may NOT match the DB's default row. Until identity
+    // exchange completes, the two diverge. Gating on `this.defaultRadioId`
+    // would then refuse spawn for the DB-default radio even though the
+    // singleton is physically on a different port. The target-collision
+    // check below catches the actually-conflicting case independently.
+    //
+    // `meshBridge.getRadioId()` returns the singleton's confirmed radio_id
+    // once `tryAutoRegisterDefault` has run (i.e., after identity arrived),
+    // and null before that — so we only refuse once we're sure the singleton
+    // really is serving this radio.
+    const singletonRadio = meshBridge.getRadioId();
+    if (singletonRadio && radioId === singletonRadio) {
       return { ok: false, error: `"${radioId}" is the currently auto-connected default radio (held by the singleton bridge)` };
     }
     if (this.contexts.has(radioId)) return { ok: false, error: `radio "${radioId}" is already connected` };
