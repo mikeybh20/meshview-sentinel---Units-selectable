@@ -83,10 +83,29 @@ export function useReadStatus({ messages, channels, localNodeId, activeChatId, m
     return counts;
   }, [messages, channels, localNodeId, activeChatId, markActiveAsRead, readMap]);
 
+  // v2.0 Beta 3: per-radio unread count for the RadioBar pill badges.
+  // Same per-chat lastRead semantics as `unreadCounts`, just grouped by
+  // m.radioId instead of chat. Operators running multiple radios can see at
+  // a glance which radio has fresh traffic without having to click each
+  // pill. Messages with no radioId (legacy 1.x rows) are skipped.
+  const unreadByRadio = useMemo<Record<string, number>>(() => {
+    const counts: Record<string, number> = {};
+    for (const m of messages) {
+      if (m.isOwn) continue;
+      if (!m.radioId) continue;
+      const chatId = chatIdForMessage(m, channels, localNodeId);
+      if (!chatId) continue;
+      if (chatId === activeChatId && markActiveAsRead) continue;
+      const lastRead = readMap[chatId] || 0;
+      if (m.timestamp > lastRead) counts[m.radioId] = (counts[m.radioId] || 0) + 1;
+    }
+    return counts;
+  }, [messages, channels, localNodeId, activeChatId, markActiveAsRead, readMap]);
+
   const totalUnread = useMemo(
     () => Object.values(unreadCounts).reduce((a, b) => a + b, 0),
     [unreadCounts]
   );
 
-  return { unreadCounts, totalUnread, firstUnreadAt };
+  return { unreadCounts, unreadByRadio, totalUnread, firstUnreadAt };
 }

@@ -27,9 +27,13 @@ interface RadioBarProps {
   /** v2.0 Beta 2: when true, omit the outer border/background so the bar
    *  can sit inside a shared wrapper alongside the ViaFilter. */
   embedded?: boolean;
+  /** v2.0 Beta 3: count of unread messages per radio_id. Pills render a
+   *  small red badge with the count when > 0 so multi-radio operators can
+   *  see at a glance which radio has fresh traffic. */
+  unreadByRadio?: Record<string, number>;
 }
 
-export function RadioBar({ defaultConnected, nodes, embedded }: RadioBarProps) {
+export function RadioBar({ defaultConnected, nodes, embedded, unreadByRadio }: RadioBarProps) {
   const { radios, defaultRadioId, connectionStates, selectedRadioId, setSelectedRadioId } = useRadios();
   // Pre-compute per-radio heard-by counts so each pill renders its own
   // tally without re-scanning nodes inside the map callback.
@@ -100,6 +104,14 @@ export function RadioBar({ defaultConnected, nodes, embedded }: RadioBarProps) {
               style={{ background: r.color_hex ?? '#666' }}
             />
             <span className="mono-text">{r.radio_id}</span>
+            {/* v2.0 Beta 3: per-radio unread message badge. Surfaces fresh
+                traffic on each pill so multi-radio operators don't have to
+                click each one to find out which has new messages. */}
+            {(unreadByRadio?.[r.radio_id] ?? 0) > 0 && (
+              <span className="flex-shrink-0 text-[9px] font-bold mono-text text-white bg-red-500 rounded-full min-w-[16px] h-4 px-1 flex items-center justify-center leading-none">
+                {unreadByRadio![r.radio_id] > 99 ? '99+' : unreadByRadio![r.radio_id]}
+              </span>
+            )}
             {isDefault && <Star size={9} className="text-amber-400 fill-amber-400 flex-shrink-0" />}
             <span className="opacity-70 normal-case font-normal">
               {r.region ?? '?'} · {r.modem_preset ?? '?'} · slot {r.frequency_slot ?? '?'}

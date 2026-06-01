@@ -344,9 +344,21 @@ export default function App() {
     // MessagesView's auto-scroll-to-bottom keeps the newest message in view.
     const byTimeAsc = (a: Message, b: Message) => a.timestamp - b.timestamp;
 
+    // v2.0 Beta 3: when the operator selects a specific radio in the top bar,
+    // filter messages to only those that flowed through that radio (matches
+    // by m.radioId, which the bridge stamps on both inbound packets and
+    // outbound sends). "All Radios" (selectedRadioId === null) keeps every
+    // message visible. This means clicking a radio pill cleanly switches
+    // the view to that radio's traffic — same channel name on different
+    // physical slots no longer commingles, and the reply compose box (which
+    // also routes by selectedRadioId) lines up with what's on screen.
+    const matchesRadio = (m: Message) =>
+      !selectedRadioId || m.radioId === selectedRadioId;
+
     if (activeChannel) {
       const label = activeChannel.name || (activeChannel.role === 'PRIMARY' ? 'LongFast' : `Channel ${activeChannel.index}`);
       return messages
+        .filter(matchesRadio)
         .filter(m =>
           m.channel === label ||
           (activeChannel.role === 'PRIMARY' && (m.channel === 'LongFast' || m.channel === 'Broadcast')) ||
@@ -357,6 +369,7 @@ export default function App() {
         .sort(byTimeAsc);
     }
     return messages
+      .filter(matchesRadio)
       .filter(m =>
         (m.from === activeChatId && m.to !== '!ffffffff') ||
         (m.to === activeChatId)
@@ -364,7 +377,7 @@ export default function App() {
       .filter(m => !blockList.isBlocked(m.from))
       .map(applyAck)
       .sort(byTimeAsc);
-  }, [messages, activeChatId, activeChannel, ackStatuses, blockList]);
+  }, [messages, activeChatId, activeChannel, ackStatuses, blockList, selectedRadioId]);
 
   const handleSendMessage = async (
     overrideText?: string,
@@ -410,7 +423,7 @@ export default function App() {
   // Shared read/unread state — drives both the sidebar Messages badge and the
   // in-view "—— New ——" divider. Only marks as read while user is actually
   // on the messages tab; otherwise unread counts keep accruing.
-  const { unreadCounts, totalUnread, firstUnreadAt } = useReadStatus({
+  const { unreadCounts, unreadByRadio, totalUnread, firstUnreadAt } = useReadStatus({
     messages,
     channels,
     localNodeId,
@@ -886,7 +899,7 @@ export default function App() {
             <div className="border-b border-brand-line bg-brand-bg/50 px-3 sm:px-6 py-1.5 flex items-center justify-between gap-3 overflow-x-auto">
               {showRadioBar && (
                 <div className="flex items-center gap-2 flex-shrink-0">
-                  <RadioBar defaultConnected={radioConnected} nodes={nodes} embedded />
+                  <RadioBar defaultConnected={radioConnected} nodes={nodes} embedded unreadByRadio={unreadByRadio} />
                 </div>
               )}
               <ViaFilter value={selectedVia} onChange={setSelectedVia} counts={viaCounts} />
