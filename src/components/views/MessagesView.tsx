@@ -409,8 +409,37 @@ export function MessagesView({
   };
 
   const visibleChannels = channels
-    .filter(c => c.role !== 'DISABLED')
+    // Hide DISABLED slots — UNLESS they have unread. Otherwise a stray
+    // message that lands on a disabled-but-still-named channel becomes a
+    // phantom "1" indicator with no clickable chat to clear it.
+    .filter(c => c.role !== 'DISABLED' || (unreadCounts[`chan:${c.index}`] ?? 0) > 0)
     .sort((a, b) => a.index - b.index);
+
+  // Orphan DM unread: an `unreadCounts['!hex']` entry whose sender isn't in
+  // `nodes` yet (first contact, NodeInfo not received). Without this the
+  // total-unread badge points to a chat that no row in the DM list can render.
+  // Synthesize a minimal Node so the operator can click into the conversation;
+  // once the real NodeInfo arrives it replaces this stub on the next render.
+  const nodeIds = React.useMemo(() => new Set(nodes.map(n => n.id)), [nodes]);
+  const orphanUnreadNodes = React.useMemo<Node[]>(() => {
+    const orphans: Node[] = [];
+    for (const chatId of Object.keys(unreadCounts)) {
+      if (!chatId.startsWith('!')) continue;
+      if (nodeIds.has(chatId)) continue;
+      if (blockedNodeIds.has(chatId)) continue;
+      if (chatId === localNodeId) continue;
+      orphans.push({
+        id: chatId,
+        name: `Unknown ${chatId}`,
+        shortName: chatId.slice(1, 5).toUpperCase(),
+        online: false,
+        favorite: false,
+        lastSeen: 0,
+        heardByRadios: selectedRadioId ? [selectedRadioId] : [],
+      });
+    }
+    return orphans;
+  }, [unreadCounts, nodeIds, blockedNodeIds, localNodeId, selectedRadioId]);
 
   const channelEntries = visibleChannels.length > 0
     ? visibleChannels
@@ -515,7 +544,7 @@ export function MessagesView({
 
           <div className="p-2">
             <p className="text-[10px] text-brand-muted px-2 py-1 uppercase font-bold tracking-widest">Direct Messages</p>
-            {nodes
+            {[...nodes, ...orphanUnreadNodes]
               // Filter out: the placeholder demo node, blocked nodes, and
               // the local node itself. The local node can't be DMed —
               // self-DMs don't actually transmit, they just consume rate-
@@ -529,13 +558,21 @@ export function MessagesView({
               // operator might think their reply is going somewhere
               // useful when it can't actually reach the peer through the
               // selected radio's mesh.
-              .filter(n =>
-                n.online
-                && n.id !== '!abcdef01'
-                && n.id !== localNodeId
-                && !blockedNodeIds.has(n.id)
-                && (!selectedRadioId || (n.heardByRadios ?? []).includes(selectedRadioId))
-              )
+              //
+              // Hard exception: nodes with UNREAD messages always show,
+              // even if they're now offline or `heardByRadios` lags the
+              // actual receive. Otherwise the sidebar/radio-pill "1"
+              // badge points to a chat that's invisible in the list, and
+              // the operator can't get to it without searching.
+              .filter(n => {
+                if (n.id === '!abcdef01' || n.id === localNodeId) return false;
+                if (blockedNodeIds.has(n.id)) return false;
+                const hasUnread = (unreadCounts[n.id] ?? 0) > 0;
+                if (hasUnread) return true;
+                if (!n.online) return false;
+                if (selectedRadioId && !(n.heardByRadios ?? []).includes(selectedRadioId)) return false;
+                return true;
+              })
               .map(n => (
               <ChannelItem
                 key={n.id}
