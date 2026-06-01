@@ -9,6 +9,10 @@ import { cn } from '../lib/utils';
 
 interface ChannelsModalProps {
   onClose: () => void;
+  /** Pre-select a specific radio when opening. When omitted, falls back to
+   *  the default radio. Used to open from the Messages sidebar so the
+   *  Settings icon edits whichever radio is currently scoped in the top bar. */
+  initialRadioId?: string | null;
 }
 
 const MAX_CHANNELS = 8;
@@ -133,12 +137,12 @@ function ChannelMqttBadge({ up, down }: { up: boolean; down: boolean }) {
   );
 }
 
-export function ChannelsModal({ onClose }: ChannelsModalProps) {
+export function ChannelsModal({ onClose, initialRadioId }: ChannelsModalProps) {
   const { radios, defaultRadioId, connectionStates } = useRadios();
   // v2.0 Phase 4: which radio's channel set is being edited. Defaults to the
   // default radio; operators with multiple radios can switch via the picker
   // at the top. Re-fetches channels from that radio's bridge on change.
-  const [targetRadioId, setTargetRadioId] = useState<string | null>(defaultRadioId);
+  const [targetRadioId, setTargetRadioId] = useState<string | null>(initialRadioId ?? defaultRadioId);
   const [channels, setChannels] = useState<Channel[]>(() => meshDataService.getChannels());
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(false);

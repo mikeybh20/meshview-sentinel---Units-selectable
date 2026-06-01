@@ -448,17 +448,53 @@ export function MessagesView({
   const partnerOnline = activeChatPartner?.online ?? false;
   const partnerLastSeen = activeChatPartner?.lastSeen;
 
+  // v2.0 Beta 3: make the channel-list scope visible. When the operator
+  // selects a specific radio in the top bar, the list now reflects THAT
+  // radio's channel slots — but with no header indicator the lists can
+  // look identical between radios (especially when both are configured
+  // with the same channel names). Show the radio's short name + color
+  // chip so it's unambiguous which radio's channels you're seeing, and
+  // so configuring each radio with different channels (e.g., alerts vs
+  // chat) produces a visible difference in the sidebar.
+  const scopedRadio = selectedRadioId
+    ? radios.find(r => r.radio_id === selectedRadioId)
+    : (defaultRadioId ? radios.find(r => r.radio_id === defaultRadioId) : null);
+  const scopedRadioIsDefault = !selectedRadioId || selectedRadioId === defaultRadioId;
+
   return (
     <>
       {/* Chat List */}
       <div className="md:col-span-4 technical-panel flex flex-col h-full bg-brand-bg/50">
-        <div className="p-4 border-b border-brand-line flex items-center justify-between">
-          <h3 className="font-bold text-xs uppercase tracking-widest">Active Channels</h3>
-          <div className="flex items-center gap-1">
+        <div className="p-4 border-b border-brand-line flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 min-w-0">
+            <h3 className="font-bold text-xs uppercase tracking-widest shrink-0">Active Channels</h3>
+            {scopedRadio && radios.length > 1 && (
+              <span
+                title={
+                  scopedRadioIsDefault
+                    ? `Showing ${scopedRadio.radio_id}'s channels (default radio). Select another radio in the top bar to see its channel set.`
+                    : `Showing ${scopedRadio.radio_id}'s channels. Each radio can have its own channel slots — configure via the Settings icon →.`
+                }
+                className="flex items-center gap-1 px-1.5 py-0.5 rounded border text-[9px] font-bold mono-text uppercase tracking-tight shrink truncate"
+                style={{
+                  color: scopedRadio.color_hex ?? undefined,
+                  borderColor: scopedRadio.color_hex ? `${scopedRadio.color_hex}55` : undefined,
+                  background: scopedRadio.color_hex ? `${scopedRadio.color_hex}15` : undefined,
+                }}
+              >
+                <span
+                  className="w-1.5 h-1.5 rounded-full shrink-0"
+                  style={{ background: scopedRadio.color_hex ?? 'currentColor' }}
+                />
+                {scopedRadio.radio_id}
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-1 shrink-0">
             <button
               onClick={onManageChannels}
               className="p-1 hover:bg-brand-line rounded transition-colors"
-              title="Manage channels"
+              title={scopedRadio ? `Manage ${scopedRadio.radio_id}'s channels` : 'Manage channels'}
             >
               <Settings size={14} />
             </button>

@@ -1288,7 +1288,10 @@ export default function App() {
 
         <AnimatePresence>
           {showChannelsModal && (
-            <ChannelsModal onClose={() => setShowChannelsModal(false)} />
+            <ChannelsModal
+              onClose={() => setShowChannelsModal(false)}
+              initialRadioId={selectedRadioId ?? defaultRadioId}
+            />
           )}
         </AnimatePresence>
 
