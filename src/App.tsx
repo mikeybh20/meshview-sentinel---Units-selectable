@@ -38,7 +38,6 @@ import { TopologyView } from './components/TopologyView';
 import { NodeSettingsModal } from './components/NodeSettingsModal';
 import { ChannelsModal } from './components/ChannelsModal';
 import { ExportModal } from './components/ExportModal';
-import { ImportModal } from './components/ImportModal';
 import { DashboardDesigner } from './components/DashboardDesigner';
 import { RadioBar } from './components/RadioBar';
 import { RefreshSplitButton } from './components/RefreshSplitButton';
@@ -70,7 +69,6 @@ export default function App() {
   const [selectedNodeId, setSelectedNodeId] = React.useState<string | null>(null);
   const [configuringNodeId, setConfiguringNodeId] = React.useState<string | null>(null);
   const [showExportModal, setShowExportModal] = React.useState(false);
-  const [showImportModal, setShowImportModal] = React.useState(false);
   const [showSettings, setShowSettings] = React.useState(false);
   const blockList = useBlockList();
   const [isEditingDashboard, setIsEditingDashboard] = React.useState(false);
@@ -172,6 +170,25 @@ export default function App() {
   React.useEffect(() => {
     try { localStorage.setItem('mesh.selectedVia', selectedVia); } catch {}
   }, [selectedVia]);
+
+  // v2.0 Beta 4 (Item 5): per-radio scope toggle. When a specific radio is
+  // selected in the RadioBar, the operator can flip between:
+  //   'ever'   — every node `heardByRadios` records this radio for (default,
+  //              matches Beta 3 behavior)
+  //   'recent' — only nodes whose `lastHeardAtPerRadio[selectedRadio]` is
+  //              within the active-window (60 min) — the actually-live set
+  //              on this radio right now
+  // Toggle only matters when selectedRadioId is set; ignored in "All
+  // Radios" mode. Useful when both radios subscribe to MQTT and the
+  // heard-by sets overlap heavily (most operator setups), making
+  // "Recent" the operator's "what's on THIS mesh right now" lens.
+  const PER_RADIO_RECENT_WINDOW_MS = 60 * 60 * 1000;
+  const [perRadioScope, setPerRadioScope] = React.useState<'ever' | 'recent'>(() => {
+    try { return (localStorage.getItem('mesh.perRadioScope') as 'ever' | 'recent') || 'ever'; } catch { return 'ever'; }
+  });
+  React.useEffect(() => {
+    try { localStorage.setItem('mesh.perRadioScope', perRadioScope); } catch {}
+  }, [perRadioScope]);
 
   // Grouping State — groups are persisted server-side; we mirror them here.
   const [groups, setGroups] = React.useState<Group[]>([]);
@@ -517,6 +534,16 @@ export default function App() {
     // shows them — only the per-radio filter view excludes unstamped nodes.
     if (selectedRadioId) {
       result = result.filter(n => n.heardByRadios?.includes(selectedRadioId));
+      // v2.0 Beta 4 (Item 5): when the scope toggle is 'recent', additionally
+      // gate on lastHeardAtPerRadio so we exclude nodes the radio hasn't
+      // heard from in a while (but the heardByRadios list still remembers).
+      if (perRadioScope === 'recent') {
+        const cutoff = Date.now() - PER_RADIO_RECENT_WINDOW_MS;
+        result = result.filter(n => {
+          const t = n.lastHeardAtPerRadio?.[selectedRadioId];
+          return typeof t === 'number' && t >= cutoff;
+        });
+      }
     }
 
     // v2.0 Beta 2: transport filter (RF vs MQTT-bridged).
@@ -536,7 +563,7 @@ export default function App() {
       n.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
       n.id.toLowerCase().includes(searchQuery.toLowerCase())
     );
-  }, [nodes, searchQuery, selectedGroupId, selectedRadioId, selectedVia]);
+  }, [nodes, searchQuery, selectedGroupId, selectedRadioId, selectedVia, perRadioScope]);
 
   // v2.0 Beta 2: counts for the ViaFilter chip labels. Scoped to the
   // active radio so the numbers match what the user is actually looking at.
@@ -932,6 +959,39 @@ export default function App() {
                 </div>
               )}
               <ViaFilter value={selectedVia} onChange={setSelectedVia} counts={viaCounts} />
+              {/* v2.0 Beta 4 (Item 5): per-radio scope toggle. Only shows
+                  when a specific radio is selected — otherwise there's no
+                  scope to refine. "Recent" gates on lastHeardAtPerRadio so
+                  operators with both radios on MQTT (where the heard-by
+                  sets overlap heavily) can see what's actively reaching
+                  THIS radio versus the union of ever-heard. */}
+              {selectedRadioId && (
+                <div className="flex items-center gap-1 flex-shrink-0" title="Scope nodes shown to those recently heard via the selected radio">
+                  <button
+                    onClick={() => setPerRadioScope('ever')}
+                    className={cn(
+                      'text-[10px] font-bold uppercase tracking-widest px-2 py-1 rounded-full border transition-colors',
+                      perRadioScope === 'ever'
+                        ? 'bg-brand-accent/15 border-brand-accent/50 text-brand-accent'
+                        : 'border-brand-line text-brand-muted hover:text-brand-ink hover:border-brand-accent/30',
+                    )}
+                  >
+                    Heard ever
+                  </button>
+                  <button
+                    onClick={() => setPerRadioScope('recent')}
+                    className={cn(
+                      'text-[10px] font-bold uppercase tracking-widest px-2 py-1 rounded-full border transition-colors',
+                      perRadioScope === 'recent'
+                        ? 'bg-brand-accent/15 border-brand-accent/50 text-brand-accent'
+                        : 'border-brand-line text-brand-muted hover:text-brand-ink hover:border-brand-accent/30',
+                    )}
+                    title="Only nodes whose last heard-at on this radio is within the last 60 min"
+                  >
+                    Active · 60m
+                  </button>
+                </div>
+              )}
             </div>
           );
         })()}
@@ -1259,14 +1319,6 @@ export default function App() {
           )}
         </AnimatePresence>
 
-        <AnimatePresence>
-          {showImportModal && (
-            <ImportModal 
-              nodes={nodes}
-              onClose={() => setShowImportModal(false)}
-            />
-          )}
-        </AnimatePresence>
 
         <AnimatePresence>
           {isEditingDashboard && (
@@ -1295,7 +1347,6 @@ export default function App() {
               setThemePreference={theme.setPreference}
               appliedTheme={theme.applied}
               onOpenExport={() => setShowExportModal(true)}
-              onOpenImport={() => setShowImportModal(true)}
               blockedNodeIds={blockList.blocked}
               nodes={nodes}
               onUnblockNode={blockList.unblock}

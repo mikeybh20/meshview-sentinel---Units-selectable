@@ -64,7 +64,6 @@ interface SettingsModalProps {
 
   // Data section
   onOpenExport: () => void;
-  onOpenImport: () => void;
 
   // Blocked section
   blockedNodeIds: Set<string>;
@@ -523,29 +522,28 @@ function DisplaySection({ unitSystem, setUnitSystem, themePreference, setThemePr
 // ============================================================================
 // Data (Export / Import)
 // ============================================================================
-function DataSection({ onOpenExport, onOpenImport, onClose }: SettingsModalProps) {
+function DataSection({ onOpenExport, onClose }: SettingsModalProps) {
   return (
     <div className="space-y-5">
-      <SectionHeader title="Data" subtitle="Export and import mesh data as CSV." />
+      <SectionHeader title="Data" subtitle="Export mesh data as CSV. Full encrypted backup below." />
 
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-1 gap-3">
         <button
           onClick={() => { onOpenExport(); onClose(); }}
           className="flex flex-col items-start gap-1.5 bg-brand-line/40 hover:bg-brand-line border border-brand-line hover:border-brand-accent/50 rounded-lg p-4 text-left transition-colors"
         >
           <FileDown size={16} className="text-brand-accent" />
           <p className="text-xs font-bold text-brand-ink uppercase tracking-wide">Export</p>
-          <p className="text-[10px] text-brand-muted leading-snug">Download messages, events, or telemetry as CSV with date and node filters.</p>
-        </button>
-        <button
-          onClick={() => { onOpenImport(); onClose(); }}
-          className="flex flex-col items-start gap-1.5 bg-brand-line/40 hover:bg-brand-line border border-brand-line hover:border-brand-accent/50 rounded-lg p-4 text-left transition-colors"
-        >
-          <FileUp size={16} className="text-brand-accent" />
-          <p className="text-xs font-bold text-brand-ink uppercase tracking-wide">Import</p>
-          <p className="text-[10px] text-brand-muted leading-snug">Bulk-import node data from CSV.</p>
+          <p className="text-[10px] text-brand-muted leading-snug">Download messages, events, or telemetry as CSV with date and node filters. BBS mail + weather subscribers have their own CSV export buttons in those tabs.</p>
         </button>
       </div>
+
+      {/* v2.0 Beta 4 (Item 6): CSV Import button removed — was a stub that
+          parsed the file and discarded the result. Operators got success
+          toasts for a no-op. Migration is now covered by the encrypted
+          Full Backup below (which round-trips actual DB state). If a
+          plaintext CSV import becomes needed later, add it back with a
+          real implementation. */}
 
       {/* v2.0 Beta 2: encrypted config backup/restore. Separate from the CSV
           export above — this captures the radios registry + channels (with
