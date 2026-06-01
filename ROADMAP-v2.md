@@ -435,7 +435,26 @@ The features that materially change how Sentinel feels day-to-day.
 
 ---
 
-### Phase 6 — AI + sidecar expansion (target 2.0 GA, after Beta 3 stabilizes)
+## 2.0.0 Beta 4 — Filed during Beta 3 hardware testing
+
+Bugs + features surfaced while exercising the multi-radio stack against real Heltec V3/V4 hardware on the GB10 dev box. Items here are scoped enough to ship together as a focused follow-up after Beta 3.
+
+### 🔲 Bugs
+
+- 🔲 **Singleton USB-CDC frame parser drops frames from ESP32-S3 native USB.**
+  Reproducer: WRTJ (Heltec V4, firmware 2.7.20, ESP32-S3 USB-Serial-JTAG controller, idProduct `303a:1001`) plugged into the GB10. The singleton bridge successfully opens `/dev/ttyACM0` and writes `want_config_id`, but **no `FromRadio` frames are ever surfaced** — no `Local node identified as …` log line, no packets logged, no `Port closed` event either. The radio is willing and able to talk: a standalone pyserial test against the same port + cable returns 49 protobuf frames including a clean `MyNodeInfo` carrying `heltec-v4x`. Sentinel's bridge is reading from the port but the rxBuffer-→-frame state machine isn't surfacing the frames as parsed messages. Likely a subtle issue specific to ESP32-S3 USB CDC pacing (full-speed bulk endpoint behavior differs slightly from FTDI/CP210x adapters that Sentinel was originally written against). Workaround for now: put the affected radio on WiFi and connect via TCP — the StreamAPI parser is identical in both bridges but works fine on the TCP transport. Captured-from-direct-pyserial byte stream + repro script attached to the bug.
+
+### 🔲 Features
+
+- 🔲 **mDNS / Bonjour auto-discovery of TCP radios.** The official Meshtastic iOS / desktop / web clients all discover nearby radios automatically by listening for the firmware's `_meshtastic._tcp.local` advertisement on port 4403 (announced whenever WiFi is enabled). Sentinel currently requires the operator to type the IP into the Add Radio form by hand and then click Detect Identity. Plan: server-side mDNS scanner (Node `bonjour-service` package — pure JS, container-friendly), API endpoint `/api/mesh/discover/mdns` returning detected services, and an "Auto-discover" dropdown in Add Radio that auto-fills target on selection. Periodic background scan would also let the dashboard surface "we found a new Meshtastic device at X" as an actionable banner.
+
+### 🔲 Polish (carried from operator UX feedback)
+
+- 🔲 **NetworkConfig write over local admin** — currently read-only across the board for the WiFi-PSK-on-LoRa safety reason. Enable writes specifically over the local-admin path (USB / BLE / direct connection to the radio Sentinel is bound to), refuse writes via mesh-admin (LoRa). Lets operators configure a radio's WiFi from Sentinel itself instead of having to bounce through the phone app.
+
+---
+
+### Phase 6 — AI + sidecar expansion (target 2.0 GA, after Beta 4 stabilizes)
 Unchanged from original plan. AI evaluation + decision point (keep / evolve / remove), anomaly detection, AGX Orin + GB10 deployment guides.
 
 ---

@@ -16,6 +16,7 @@
 import React from 'react';
 import {
   Star, Plus, Trash2, AlertCircle, Loader2, RefreshCw, HelpCircle, X, Check, Copy,
+  Pencil, Plug, Unplug, Activity,
 } from 'lucide-react';
 
 import { meshDataService } from '../../services/meshDataService';
@@ -749,29 +750,32 @@ function RadioRowCard({
             )}
           </div>
         </div>
-        <div className="flex items-center gap-1 flex-shrink-0">
+        {/* v2.0 Beta 3: icon-only action buttons — the row already shows the
+            radio name, transport, IP/port, and stats; verbose text labels just
+            crowded the row. Tooltips remain on hover via the `title` attribute. */}
+        <div className="flex items-center gap-0.5 flex-shrink-0">
           {!isSingleton && (
             isConnected ? (
               <button
                 onClick={onDisconnect}
                 disabled={busy}
-                className="text-[10px] font-bold uppercase tracking-widest text-amber-300 hover:bg-amber-500/15 disabled:opacity-40 px-2 py-1 rounded"
+                className="text-amber-300 hover:bg-amber-500/15 disabled:opacity-40 p-2 rounded"
                 title="Disconnect this radio"
               >
-                {busy ? <Loader2 size={11} className="animate-spin" /> : 'Disconnect'}
+                {busy ? <Loader2 size={14} className="animate-spin" /> : <Unplug size={14} />}
               </button>
             ) : (
               <button
                 onClick={onConnect}
                 disabled={busy}
-                className="text-[10px] font-bold uppercase tracking-widest text-emerald-400 hover:bg-emerald-400/15 disabled:opacity-40 px-2 py-1 rounded"
-                title="Open this radio's transport and start ingesting packets"
+                className="text-emerald-400 hover:bg-emerald-400/15 disabled:opacity-40 p-2 rounded"
+                title="Connect this radio"
               >
-                {busy ? <Loader2 size={11} className="animate-spin" /> : 'Connect'}
+                {busy ? <Loader2 size={14} className="animate-spin" /> : <Plug size={14} />}
               </button>
             )
           )}
-          {/* v2.0 Beta 3: HTTP /json/report viewer for TCP radios.
+          {/* HTTP /json/report viewer for TCP radios.
               Meshtastic firmware serves a status JSON on port 80 whenever
               WiFi is enabled — shows live battery / wifi RSSI / uptime /
               memory / channel airtime. Gated on transport === 'tcp' since
@@ -779,10 +783,10 @@ function RadioRowCard({
           {row.transport === 'tcp' && (
             <button
               onClick={onShowStatus}
-              className="text-[10px] font-bold uppercase tracking-widest text-sky-400 hover:bg-sky-400/15 px-2 py-1 rounded"
-              title="Fetch the radio's firmware /json/report — battery, WiFi RSSI, uptime, memory, channel airtime"
+              className="text-sky-400 hover:bg-sky-400/15 p-2 rounded"
+              title="Live HTTP status — battery, WiFi RSSI, uptime, memory, channel airtime"
             >
-              Status
+              <Activity size={14} />
             </button>
           )}
           {/* Promote to Singleton: hot-swaps which radio holds the live
@@ -793,22 +797,23 @@ function RadioRowCard({
             <button
               onClick={onPromote}
               disabled={busy}
-              className="text-[10px] font-bold uppercase tracking-widest text-amber-400 hover:bg-amber-400/15 disabled:opacity-40 px-2 py-1 rounded"
-              title="Make this the primary radio — disconnects the current primary and re-opens the bridge on this radio's transport"
+              className="text-amber-400 hover:bg-amber-400/15 disabled:opacity-40 p-2 rounded"
+              title="Make this radio the primary — hot-swaps which radio Sentinel's singleton bridge serves"
             >
-              {busy ? <Loader2 size={11} className="animate-spin" /> : 'Make Primary'}
+              {busy ? <Loader2 size={14} className="animate-spin" /> : <Star size={14} />}
             </button>
           )}
           <button
             onClick={onEdit}
             className={cn(
-              "text-[10px] font-bold uppercase tracking-widest px-2 py-1 rounded transition-colors",
+              "p-2 rounded transition-colors",
               isEditing
                 ? "bg-brand-accent/15 text-brand-accent"
                 : "text-brand-muted hover:text-brand-ink hover:bg-brand-line/40"
             )}
+            title={isEditing ? 'Close editor' : 'Edit radio metadata, transport, and LoRa config'}
           >
-            {isEditing ? 'Done' : 'Edit'}
+            {isEditing ? <Check size={14} /> : <Pencil size={14} />}
           </button>
           {!isSingleton && (
             <button
