@@ -14,7 +14,7 @@
  */
 
 import React from 'react';
-import { CloudRain, Trash2, RefreshCw } from 'lucide-react';
+import { CloudRain, Trash2, RefreshCw, Download } from 'lucide-react';
 import { Node } from '../../types';
 import { cn } from '../../lib/utils';
 import { meshDataService } from '../../services/meshDataService';
@@ -108,15 +108,26 @@ export function WeatherView({ nodes }: WeatherViewProps) {
             </p>
           </div>
         </div>
-        <button
-          onClick={reload}
-          disabled={loading}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded border border-brand-line hover:bg-brand-line/40 disabled:opacity-50 transition-colors"
-          title="Refresh"
-        >
-          <RefreshCw size={11} className={cn(loading && 'animate-spin')} />
-          REFRESH
-        </button>
+        <div className="flex items-center gap-2">
+          <a
+            href={`/api/mesh/bbs/weather/subscribers/export.csv${selectedRadioId ? `?radio_id=${encodeURIComponent(selectedRadioId)}` : ''}`}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded border border-brand-line hover:bg-brand-line/40 transition-colors"
+            title="Download subscribers as CSV"
+            download
+          >
+            <Download size={11} />
+            EXPORT CSV
+          </a>
+          <button
+            onClick={reload}
+            disabled={loading}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded border border-brand-line hover:bg-brand-line/40 disabled:opacity-50 transition-colors"
+            title="Refresh"
+          >
+            <RefreshCw size={11} className={cn(loading && 'animate-spin')} />
+            REFRESH
+          </button>
+        </div>
       </div>
 
       <div className="flex-1 overflow-y-auto technical-panel">

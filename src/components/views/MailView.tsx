@@ -11,7 +11,7 @@
  */
 
 import React from 'react';
-import { Mail, Send, Inbox as InboxIcon, Forward as OutboxIcon, Users, Trash2, Check, X, RefreshCw } from 'lucide-react';
+import { Mail, Send, Inbox as InboxIcon, Forward as OutboxIcon, Users, Trash2, Check, X, RefreshCw, Download } from 'lucide-react';
 import { Node } from '../../types';
 import { cn } from '../../lib/utils';
 import { meshDataService } from '../../services/meshDataService';
@@ -190,15 +190,26 @@ export function MailView({ nodes, localNodeId }: MailViewProps) {
             Remote senders DM <span className="text-brand-accent">:mail</span> to your node. 30-day retention.
           </p>
         </div>
-        <button
-          onClick={refresh}
-          disabled={loading}
-          className="flex items-center gap-2 px-3 py-1.5 text-xs font-bold uppercase tracking-widest text-brand-muted hover:text-brand-accent border border-brand-line hover:border-brand-accent/50 rounded transition-colors disabled:opacity-40"
-          title="Refresh inbox and outbox"
-        >
-          <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
-          {loading ? 'Loading…' : 'Refresh'}
-        </button>
+        <div className="flex items-center gap-2">
+          <a
+            href={`/api/mesh/bbs/mail/export.csv${selectedRadioId ? `?radio_id=${encodeURIComponent(selectedRadioId)}` : ''}`}
+            className="flex items-center gap-2 px-3 py-1.5 text-xs font-bold uppercase tracking-widest text-brand-muted hover:text-brand-accent border border-brand-line hover:border-brand-accent/50 rounded transition-colors"
+            title="Download all mail as CSV (current radio scope)"
+            download
+          >
+            <Download size={12} />
+            Export CSV
+          </a>
+          <button
+            onClick={refresh}
+            disabled={loading}
+            className="flex items-center gap-2 px-3 py-1.5 text-xs font-bold uppercase tracking-widest text-brand-muted hover:text-brand-accent border border-brand-line hover:border-brand-accent/50 rounded transition-colors disabled:opacity-40"
+            title="Refresh inbox and outbox"
+          >
+            <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
+            {loading ? 'Loading…' : 'Refresh'}
+          </button>
+        </div>
       </div>
 
       {/* Tab strip */}

@@ -3110,6 +3110,100 @@ app.get('/api/mesh/bbs/users', (_req, res) => {
   }
 });
 
+/**
+ * v2.0 Beta 4 (Item 8): CSV exports for BBS data.
+ *
+ * The full-backup envelope (b21659d) bundles mail + subscribers in an
+ * encrypted binary blob — fine for migrations, useless for ad-hoc
+ * archival / compliance review where the operator just wants plaintext
+ * rows in a spreadsheet.
+ *
+ * Both endpoints accept optional ?radio_id=<short> to scope to one
+ * radio's traffic. Mail also accepts ?from=<ms>&to=<ms> for time-range
+ * archival. Output is RFC 4180-ish CSV — `"` inside fields gets doubled,
+ * any field containing `,`, `"`, or newlines gets quoted. UTF-8, no BOM.
+ */
+function toCsv(headers: string[], rows: any[][]): string {
+  const escape = (v: any): string => {
+    if (v === null || v === undefined) return '';
+    const s = String(v);
+    if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+    return s;
+  };
+  const lines = [headers.map(escape).join(',')];
+  for (const r of rows) lines.push(r.map(escape).join(','));
+  return lines.join('\r\n');
+}
+
+app.get('/api/mesh/bbs/mail/export.csv', (req, res) => {
+  const radioId = typeof req.query.radio_id === 'string' && req.query.radio_id ? req.query.radio_id : null;
+  const fromMs = Number(req.query.from);
+  const toMs   = Number(req.query.to);
+  try {
+    const mail = meshDb().listAllMail({
+      radioId,
+      fromMs: Number.isFinite(fromMs) ? fromMs : undefined,
+      toMs:   Number.isFinite(toMs)   ? toMs   : undefined,
+    });
+    const csv = toCsv(
+      ['id', 'posted_at_iso', 'posted_at_ms', 'sender_node_id', 'sender_short_name', 'recipient_node_id', 'radio_id', 'read_at_iso', 'delivered_at_iso', 'body'],
+      mail.map(m => [
+        m.id,
+        new Date(m.postedAt).toISOString(),
+        m.postedAt,
+        m.senderNodeId,
+        m.senderShortName,
+        m.recipientNodeId,
+        m.radioId ?? '',
+        m.readAt ? new Date(m.readAt).toISOString() : '',
+        m.deliveredAt ? new Date(m.deliveredAt).toISOString() : '',
+        m.body,
+      ])
+    );
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="bbs-mail-${new Date().toISOString().slice(0, 10)}${radioId ? '-' + radioId : ''}.csv"`);
+    return res.send(csv);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/mesh/bbs/weather/subscribers/export.csv', (req, res) => {
+  const radioId = typeof req.query.radio_id === 'string' && req.query.radio_id ? req.query.radio_id : null;
+  try {
+    const subs = meshDb().listWeatherSubscribers(radioId);
+    // Decorate with node names from the aggregator so the CSV is
+    // self-contained — operators looking at it later won't have to
+    // cross-reference !hex ids back to short names manually.
+    const nodes = bridgeManager.getAllNodes();
+    const nameOf = (id: string) => {
+      const n = nodes.find(nn => nn.id === id);
+      return [n?.shortName ?? '', n?.name ?? ''];
+    };
+    const csv = toCsv(
+      ['node_id', 'short_name', 'long_name', 'subscribed_at_iso', 'subscribed_at_ms', 'channel_index', 'radio_id', 'last_alert_at_iso'],
+      subs.map(s => {
+        const [shortN, longN] = nameOf(s.nodeId);
+        return [
+          s.nodeId,
+          shortN,
+          longN,
+          new Date(s.subscribedAt).toISOString(),
+          s.subscribedAt,
+          s.channelIndex,
+          s.radioId ?? '',
+          s.lastAlertAt ? new Date(s.lastAlertAt).toISOString() : '',
+        ];
+      })
+    );
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="bbs-weather-subscribers-${new Date().toISOString().slice(0, 10)}${radioId ? '-' + radioId : ''}.csv"`);
+    return res.send(csv);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 /** GET /api/mesh/bbs/weather/subscribers?radio_id=<short>  — list of nodes opted into alerts. */
 app.get('/api/mesh/bbs/weather/subscribers', (req, res) => {
   const radioId = typeof req.query.radio_id === 'string' && req.query.radio_id ? req.query.radio_id : null;

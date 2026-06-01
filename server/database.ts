@@ -1698,6 +1698,54 @@ export class MeshDatabase {
     return row?.c ?? 0;
   }
 
+  /**
+   * v2.0 Beta 4 (Item 8): list ALL mail rows, optionally scoped by date
+   * range and/or radio. Used by the CSV export endpoint — the existing
+   * loadInbox/loadOutbox helpers are scoped to a single nodeId, which is
+   * fine for the UI panels but not for the operator's "archive everything
+   * the BBS has ever handled" export.
+   */
+  listAllMail(opts: { radioId?: string | null; fromMs?: number; toMs?: number } = {}): Array<{
+    id: number;
+    senderNodeId: string;
+    senderShortName: string;
+    recipientNodeId: string;
+    postedAt: number;
+    body: string;
+    readAt: number | null;
+    deliveredAt: number | null;
+    radioId: string | null;
+  }> {
+    const where: string[] = [];
+    const params: any[] = [];
+    if (opts.radioId) { where.push('(radio_id = ? OR radio_id IS NULL)'); params.push(opts.radioId); }
+    if (typeof opts.fromMs === 'number') { where.push('posted_at >= ?'); params.push(opts.fromMs); }
+    if (typeof opts.toMs === 'number')   { where.push('posted_at <= ?'); params.push(opts.toMs); }
+    const sql = `
+      SELECT id, sender_node_id, sender_short_name, recipient_node_id,
+             posted_at, body, read_at, delivered_at, radio_id
+      FROM bbs_mail
+      ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+      ORDER BY posted_at DESC
+    `;
+    const rows = this.db.prepare(sql).all(...params) as Array<{
+      id: number; sender_node_id: string; sender_short_name: string;
+      recipient_node_id: string; posted_at: number; body: string;
+      read_at: number | null; delivered_at: number | null; radio_id: string | null;
+    }>;
+    return rows.map(r => ({
+      id: r.id,
+      senderNodeId: r.sender_node_id,
+      senderShortName: r.sender_short_name,
+      recipientNodeId: r.recipient_node_id,
+      postedAt: r.posted_at,
+      body: r.body,
+      readAt: r.read_at,
+      deliveredAt: r.delivered_at,
+      radioId: r.radio_id,
+    }));
+  }
+
   /** Record that we just pushed an alert to this subscriber. Diagnostic only —
    *  used for the operator's subscriber list. */
   touchWeatherSubscriberAlert(nodeId: string, now: number = Date.now()): void {
