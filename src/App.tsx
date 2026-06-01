@@ -19,6 +19,7 @@ import {
   Radio,
   RefreshCw,
   Mail,
+  CloudRain,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -58,13 +59,14 @@ import { MessagesView } from './components/views/MessagesView';
 import { LogsView } from './components/views/LogsView';
 import { MatrixView } from './components/views/MatrixView';
 import { MailView } from './components/views/MailView';
+import { WeatherView } from './components/views/WeatherView';
 
 export default function App() {
   const theme = useTheme();
   const [nodes, setNodes] = React.useState<Node[]>([]);
   const [messages, setMessages] = React.useState<Message[]>([]);
   const [events, setEvents] = React.useState<RadioEvent[]>([]);
-  const [activeTab, setActiveTab] = React.useState<'dashboard' | 'map' | 'messages' | 'logs' | 'matrix' | 'topology' | 'mail' | 'radios'>('dashboard');
+  const [activeTab, setActiveTab] = React.useState<'dashboard' | 'map' | 'messages' | 'logs' | 'matrix' | 'topology' | 'mail' | 'weather' | 'radios'>('dashboard');
   const [selectedNodeId, setSelectedNodeId] = React.useState<string | null>(null);
   const [configuringNodeId, setConfiguringNodeId] = React.useState<string | null>(null);
   const [showExportModal, setShowExportModal] = React.useState(false);
@@ -669,6 +671,12 @@ export default function App() {
             badge={bbsUnread}
           />
           <NavItem
+            active={activeTab === 'weather'}
+            onClick={() => setActiveTab('weather')}
+            icon={<CloudRain size={20} />}
+            label="BBS Weather"
+          />
+          <NavItem
             active={activeTab === 'logs'}
             onClick={() => setActiveTab('logs')}
             icon={<History size={20} />}
@@ -1154,6 +1162,18 @@ export default function App() {
                 className="h-full overflow-hidden"
               >
                 <MailView nodes={nodes} localNodeId={localNodeId} />
+              </motion.div>
+            )}
+
+            {activeTab === 'weather' && (
+              <motion.div
+                key="weather"
+                initial={{ opacity: 0, scale: 0.98 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.98 }}
+                className="h-full overflow-hidden"
+              >
+                <WeatherView nodes={nodes} />
               </motion.div>
             )}
 

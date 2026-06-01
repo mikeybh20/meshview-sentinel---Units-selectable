@@ -214,6 +214,10 @@ export class MeshDataService {
         this.emitActivity('rx');
         this.bbsMailListeners.forEach(l => { try { l(); } catch { /* keep firing */ } });
       });
+      // BBS weather subscriber events — operator-facing Weather view re-fetches.
+      this.eventSource.addEventListener('bbsSubscriber', () => {
+        this.bbsSubscriberListeners.forEach(l => { try { l(); } catch { /* keep firing */ } });
+      });
 
       this.eventSource.onerror = () => {
         // Browser will auto-reconnect; no action needed
@@ -279,6 +283,7 @@ export class MeshDataService {
   /** Mail row shape returned by /api/mesh/bbs/inbox (recipient side). */
   // (declared inline to avoid creating a separate type file for one feature)
   private bbsMailListeners: Array<() => void> = [];
+  private bbsSubscriberListeners: Array<() => void> = [];
 
   /** Subscribe to "something about BBS mail changed" notifications. The callback
    *  fires after any mail insert / read / delete and is the cue to re-fetch
@@ -357,6 +362,55 @@ export class MeshDataService {
     } catch (err: any) {
       return { ok: false, error: err?.message || 'request failed' };
     }
+  }
+
+  /**
+   * v2.0 Beta 3: list nodes opted into the BBS weather-alert push. Pass
+   * radioId to scope to the receiving radio's subscribers (subscribers with
+   * `radio_id IS NULL` from older inserts are included in either filter).
+   */
+  async listWeatherSubscribers(radioId?: string | null): Promise<{
+    subscribers: Array<{
+      nodeId: string;
+      subscribedAt: number;
+      channelIndex: number;
+      lastAlertAt: number | null;
+      radioId: string | null;
+    }>;
+    total: number;
+    radioId: string | null;
+  } | null> {
+    try {
+      const qs = radioId ? `?radio_id=${encodeURIComponent(radioId)}` : '';
+      const res = await fetch(`${API_BASE}/api/mesh/bbs/weather/subscribers${qs}`);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  }
+
+  /** Operator-side unsubscribe. Use when a subscriber has gone silent or
+   *  shouldn't receive alerts anymore. Subscriber-initiated unsubscribe
+   *  flows through `:weather unsubscribe` over DM instead. */
+  async removeWeatherSubscriber(nodeId: string): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/bbs/weather/subscribers/${encodeURIComponent(nodeId)}`, {
+        method: 'DELETE',
+      });
+      if (!res.ok) {
+        const b = await res.json().catch(() => ({}));
+        return { ok: false, error: b.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'request failed' };
+    }
+  }
+
+  /** Subscribe to bbsSubscriber SSE events (push when someone subscribes /
+   *  unsubscribes / receives an alert). Lets the Weather view re-fetch. */
+  onBbsSubscriber(cb: () => void): () => void {
+    this.bbsSubscriberListeners.push(cb);
+    return () => { this.bbsSubscriberListeners = this.bbsSubscriberListeners.filter(l => l !== cb); };
   }
 
   async markBbsRead(id: number): Promise<boolean> {
