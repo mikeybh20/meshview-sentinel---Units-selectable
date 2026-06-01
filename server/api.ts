@@ -7,7 +7,7 @@ import { fileURLToPath } from 'url';
 import os from 'os';
 import dotenv from 'dotenv';
 import { serialDiscovery } from './serialDiscovery.js';
-import { meshBridge } from './meshtasticSerial.js';
+import { meshBridge, type MeshtasticSerialBridge } from './meshtasticSerial.js';
 import { meshDb } from './database.js';
 // BbsService is no longer instantiated here in v2.0 — see [bridgeManager.ts](./bridgeManager.ts)
 // which owns one BbsService per RadioContext. api.ts just plumbs config + endpoints.
@@ -352,6 +352,51 @@ console.log(`[API] MeshView Sentinel ${SYSTEM_VERSION}`);
 app.get('/api/mesh/discover/mdns', (_req, res) => {
   return res.json({ services: mdnsDiscovery.list() });
 });
+
+// v2.0 Beta 4: resolve which bridge an admin-write endpoint should operate
+// on. Most module-config endpoints used to hard-code meshBridge directly,
+// which (a) failed when meshBridge had been silently detached from the
+// default radio's context (the singleton-desync bug class we band-aided on
+// the read side throughout Beta 3), and (b) gave operators no way to write
+// configs to a SECONDARY radio at all. This helper unifies the lookup:
+//   - explicit ?radio_id=<short> or {radio_id} in body → that bridge
+//   - else → default radio's bridge from BridgeManager
+//   - else → meshBridge (pre-registration boot window safety)
+// Returns null when no bridge can be resolved or the resolved bridge is
+// disconnected; the caller emits a 503 with a useful error.
+function resolveBridge(req: express.Request): { bridge: MeshtasticSerialBridge; radioId: string | null } | null {
+  const fromQuery = typeof req.query?.radio_id === 'string' && req.query.radio_id ? String(req.query.radio_id) : null;
+  const fromBody  = typeof req.body?.radio_id  === 'string' && req.body.radio_id  ? String(req.body.radio_id)  : null;
+  const radioId = fromQuery ?? fromBody;
+  if (radioId) {
+    const ctx = bridgeManager.get(radioId);
+    if (!ctx?.bridge.connected) return null;
+    return { bridge: ctx.bridge, radioId };
+  }
+  const def = bridgeManager.getDefault();
+  if (def?.bridge.connected) return { bridge: def.bridge, radioId: def.radioId };
+  if (meshBridge.connected) return { bridge: meshBridge, radioId: bridgeManager.getDefaultRadioId() };
+  return null;
+}
+
+/** Default bridge for DB-cache operations (groups, refreshNodeDb, etc.).
+ *  Always returns a bridge — these ops don't require a connected radio
+ *  (the in-memory cache and DB write happen regardless of transport state). */
+function defaultDbBridge(): MeshtasticSerialBridge {
+  return bridgeManager.getDefault()?.bridge ?? meshBridge;
+}
+
+/** Apply an operation to every distinct bridge instance — default + every
+ *  secondary context. Used for shared settings like retention windows that
+ *  should be uniform across all connected radios. Deduped by reference in
+ *  case a context's bridge happens to be the singleton meshBridge. */
+function forEachBridge(fn: (b: MeshtasticSerialBridge) => void): void {
+  const seen = new Set<MeshtasticSerialBridge>();
+  for (const ctx of bridgeManager.list()) {
+    if (!seen.has(ctx.bridge)) { seen.add(ctx.bridge); fn(ctx.bridge); }
+  }
+  if (!seen.has(meshBridge)) fn(meshBridge);
+}
 
 // Status: is the radio connected?
 app.get('/api/mesh/status', (_req, res) => {
@@ -1270,8 +1315,9 @@ app.post('/api/gpu/topology', async (req, res) => {
 // full path we reconstruct is [origin, ...relays, target]; `route` holds only
 // the intermediate relays (empty = direct hop).
 app.post('/api/gpu/route-stability', async (_req, res) => {
-  const origin = meshBridge.getLocalNodeId();
-  const traces = meshBridge.getTraces()
+  const bridge = defaultDbBridge();
+  const origin = bridge.getLocalNodeId();
+  const traces = bridge.getTraces()
     .filter(t => t.status === 'response')
     .map(t => {
       const relays = (t.route ?? []).map(h => h.nodeId);
@@ -1372,18 +1418,25 @@ app.post('/api/mesh/refresh', (req, res) => {
   // v2.0: optional ?radio_id=NOVA scopes the refresh to a single radio. When
   // omitted, refreshes the default radio (Phase 3a); Phase 3b will fan out
   // to every connected secondary bridge when none is specified.
+  // v2.0 Beta 4: per-radio support shipped — radio_id picks the bridge,
+  // omitting it fans out to every connected bridge.
   const radioId = typeof req.query.radio_id === 'string' ? req.query.radio_id : null;
-  const targetIds = radioId ? [radioId] : [];
   try {
     if (radioId) {
-      if (radioId !== bridgeManager.getDefaultRadioId()) {
-        return res.status(501).json({
-          error: 'Per-radio refresh of non-default radios lands in Phase 3b (secondary-bridge support)',
-        });
-      }
+      const ctx = bridgeManager.get(radioId);
+      if (!ctx) return res.status(404).json({ error: `radio "${radioId}" is not connected` });
+      ctx.bridge.refreshNodeDb();
+      return res.json({ ok: true, refreshed: [radioId] });
     }
-    meshBridge.refreshNodeDb();
-    return res.json({ ok: true, refreshed: targetIds.length ? targetIds : ['<default>'] });
+    // Fan out to every connected bridge — operator hit "refresh" with no
+    // scope, so they want the union view (visible in /api/mesh/nodes) to
+    // reflect a fresh pull from each radio.
+    const refreshed: string[] = [];
+    forEachBridge(b => {
+      try { b.refreshNodeDb(); refreshed.push(b.getRadioId() ?? '<unknown>'); }
+      catch (e: any) { console.warn('[API] refreshNodeDb failed for one bridge:', e.message); }
+    });
+    return res.json({ ok: true, refreshed: refreshed.length ? refreshed : ['<default>'] });
   } catch (err: any) {
     return res.status(409).json({ error: err.message || 'refresh failed' });
   }
@@ -1401,8 +1454,13 @@ app.get('/api/mesh/nodes', (_req, res) => {
 });
 
 // Node groups (operator-defined organizational tags)
+// v2.0 Beta 4: routed through defaultDbBridge() instead of meshBridge
+// directly. Groups operate against a per-bridge in-memory cache + the
+// shared SQLite DB; if meshBridge is detached from the default radio
+// (singleton-desync class — see resolveBridge comment above), reads and
+// writes silently target a stale cache.
 app.get('/api/mesh/groups', (_req, res) => {
-  return res.json(meshBridge.getGroups());
+  return res.json(defaultDbBridge().getGroups());
 });
 
 app.post('/api/mesh/groups', (req, res) => {
@@ -1414,7 +1472,7 @@ app.post('/api/mesh/groups', (req, res) => {
     return res.status(400).json({ error: 'color must be a 6-digit hex like #10b981' });
   }
   try {
-    const group = meshBridge.createGroup(name, color);
+    const group = defaultDbBridge().createGroup(name, color);
     broadcastGroupsChanged();
     return res.json({ ok: true, group });
   } catch (err: any) {
@@ -1428,7 +1486,7 @@ app.patch('/api/mesh/groups/:id', (req, res) => {
     return res.status(400).json({ error: 'color must be a 6-digit hex like #10b981' });
   }
   try {
-    const group = meshBridge.updateGroup(req.params.id, { name, color });
+    const group = defaultDbBridge().updateGroup(req.params.id, { name, color });
     if (!group) return res.status(404).json({ error: 'Group not found' });
     broadcastGroupsChanged();
     return res.json({ ok: true, group });
@@ -1438,7 +1496,7 @@ app.patch('/api/mesh/groups/:id', (req, res) => {
 });
 
 app.delete('/api/mesh/groups/:id', (req, res) => {
-  const ok = meshBridge.deleteGroup(req.params.id);
+  const ok = defaultDbBridge().deleteGroup(req.params.id);
   if (!ok) return res.status(404).json({ error: 'Group not found' });
   broadcastGroupsChanged();
   return res.json({ ok: true });
@@ -1453,7 +1511,11 @@ app.post('/api/mesh/nodes/:id/group', (req, res) => {
   if (!req.params.id.startsWith('!')) {
     return res.status(400).json({ error: 'id must be a !hex node id' });
   }
-  const ok = meshBridge.setNodeGroup(req.params.id, groupId ?? null);
+  // Same singleton-desync mitigation as the favorite endpoint above:
+  // walk every connected bridge so we hit the one that actually has the
+  // node in its in-memory map.
+  let ok = false;
+  forEachBridge(b => { if (!ok && b.setNodeGroup(req.params.id, groupId ?? null)) ok = true; });
   if (!ok) return res.status(404).json({ error: 'Node or group not found' });
   // Node-update event already fans out via the existing 'node' SSE channel
   return res.json({ ok: true });
@@ -1623,10 +1685,12 @@ app.get('/api/mesh/snapshot', (_req, res) => {
 
 // Trigger a readback of the local NeighborInfo module config from the radio.
 // Admin to local node only — does not consume mesh airtime.
-app.post('/api/mesh/modules/neighbor-info/refresh', async (_req, res) => {
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+app.post('/api/mesh/modules/neighbor-info/refresh', async (req, res) => {
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.requestNeighborInfoConfig();
+    await bridge.requestNeighborInfoConfig();
     return res.json({ ok: true });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
@@ -1634,7 +1698,7 @@ app.post('/api/mesh/modules/neighbor-info/refresh', async (_req, res) => {
 });
 
 app.get('/api/mesh/neighbor-info', (_req, res) => {
-  return res.json(meshBridge.getNeighborInfo());
+  return res.json(defaultDbBridge().getNeighborInfo());
 });
 
 // Configure the NeighborInfo module on the connected radio (admin write).
@@ -1644,9 +1708,11 @@ app.post('/api/mesh/modules/neighbor-info', async (req, res) => {
   if (intervalSecs !== undefined && (typeof intervalSecs !== 'number' || intervalSecs < 60 || intervalSecs > 86400)) {
     return res.status(400).json({ error: 'intervalSecs must be between 60 and 86400' });
   }
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.setNeighborInfoConfig({
+    await bridge.setNeighborInfoConfig({
       enabled,
       intervalSecs,
       transmitOverLora: typeof transmitOverLora === 'boolean' ? transmitOverLora : true,
@@ -1667,19 +1733,23 @@ app.post('/api/mesh/modules/range-test/survey', async (req, res) => {
   if (typeof senderIntervalSecs !== 'number' || senderIntervalSecs < 15 || senderIntervalSecs > 3600) {
     return res.status(400).json({ error: 'senderIntervalSecs must be 15..3600' });
   }
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    const r = await meshBridge.startRangeTestSurvey({ durationMinutes, senderIntervalSecs });
+    const r = await bridge.startRangeTestSurvey({ durationMinutes, senderIntervalSecs });
     return res.json({ ok: true, expiresAt: r.expiresAt });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
   }
 });
 
-app.delete('/api/mesh/modules/range-test/survey', async (_req, res) => {
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+app.delete('/api/mesh/modules/range-test/survey', async (req, res) => {
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.cancelRangeTestSurvey();
+    await bridge.cancelRangeTestSurvey();
     return res.json({ ok: true });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
@@ -1696,19 +1766,23 @@ app.post('/api/mesh/modules/neighbor-info/survey', async (req, res) => {
   if (typeof intervalSecs !== 'number' || intervalSecs < 60 || intervalSecs > 14400) {
     return res.status(400).json({ error: 'intervalSecs must be 60..14400' });
   }
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    const r = await meshBridge.startNeighborInfoSurvey({ durationMinutes, intervalSecs });
+    const r = await bridge.startNeighborInfoSurvey({ durationMinutes, intervalSecs });
     return res.json({ ok: true, expiresAt: r.expiresAt });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
   }
 });
 
-app.delete('/api/mesh/modules/neighbor-info/survey', async (_req, res) => {
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+app.delete('/api/mesh/modules/neighbor-info/survey', async (req, res) => {
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.cancelNeighborInfoSurvey();
+    await bridge.cancelNeighborInfoSurvey();
     return res.json({ ok: true });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
@@ -1716,10 +1790,12 @@ app.delete('/api/mesh/modules/neighbor-info/survey', async (_req, res) => {
 });
 
 // Range Test module: refresh + write
-app.post('/api/mesh/modules/range-test/refresh', async (_req, res) => {
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+app.post('/api/mesh/modules/range-test/refresh', async (req, res) => {
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.requestRangeTestConfig();
+    await bridge.requestRangeTestConfig();
     return res.json({ ok: true });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
@@ -1733,9 +1809,11 @@ app.post('/api/mesh/modules/range-test', async (req, res) => {
   if (senderIntervalSecs !== undefined && (typeof senderIntervalSecs !== 'number' || senderIntervalSecs < 0 || senderIntervalSecs > 86400)) {
     return res.status(400).json({ error: 'senderIntervalSecs must be between 0 and 86400' });
   }
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.setRangeTestConfig({
+    await bridge.setRangeTestConfig({
       enabled,
       senderIntervalSecs,
       save: typeof save === 'boolean' ? save : false,
@@ -1747,10 +1825,12 @@ app.post('/api/mesh/modules/range-test', async (req, res) => {
 });
 
 // Telemetry module: refresh + write
-app.post('/api/mesh/modules/telemetry/refresh', async (_req, res) => {
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+app.post('/api/mesh/modules/telemetry/refresh', async (req, res) => {
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.requestTelemetryConfig();
+    await bridge.requestTelemetryConfig();
     return res.json({ ok: true });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
@@ -1778,9 +1858,11 @@ app.post('/api/mesh/modules/telemetry', async (req, res) => {
   ].filter(Boolean);
   if (errs.length) return res.status(400).json({ error: errs.join('; ') });
 
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.setTelemetryConfig({
+    await bridge.setTelemetryConfig({
       deviceUpdateIntervalSecs,
       environmentEnabled: typeof environmentEnabled === 'boolean' ? environmentEnabled : undefined,
       environmentUpdateIntervalSecs,
@@ -1794,10 +1876,12 @@ app.post('/api/mesh/modules/telemetry', async (req, res) => {
 });
 
 // Store & Forward module: refresh + write
-app.post('/api/mesh/modules/store-forward/refresh', async (_req, res) => {
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+app.post('/api/mesh/modules/store-forward/refresh', async (req, res) => {
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.requestStoreForwardConfig();
+    await bridge.requestStoreForwardConfig();
     return res.json({ ok: true });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
@@ -1827,9 +1911,11 @@ app.post('/api/mesh/modules/store-forward', async (req, res) => {
   ].filter(Boolean);
   if (errs.length) return res.status(400).json({ error: errs.join('; ') });
 
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.setStoreForwardConfig({
+    await bridge.setStoreForwardConfig({
       enabled,
       isServer: typeof isServer === 'boolean' ? isServer : undefined,
       heartbeat: typeof heartbeat === 'boolean' ? heartbeat : undefined,
@@ -1844,10 +1930,12 @@ app.post('/api/mesh/modules/store-forward', async (req, res) => {
 });
 
 // MQTT module: refresh + write
-app.post('/api/mesh/modules/mqtt/refresh', async (_req, res) => {
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+app.post('/api/mesh/modules/mqtt/refresh', async (req, res) => {
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.requestMqttConfig();
+    await bridge.requestMqttConfig();
     return res.json({ ok: true });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
@@ -1874,9 +1962,11 @@ app.post('/api/mesh/modules/mqtt', async (req, res) => {
   ].filter(Boolean);
   if (errs.length) return res.status(400).json({ error: errs.join('; ') });
 
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.setMqttConfig({
+    await bridge.setMqttConfig({
       enabled: body.enabled,
       address: body.address,
       username: body.username,
@@ -1897,10 +1987,12 @@ app.post('/api/mesh/modules/mqtt', async (req, res) => {
 });
 
 // Detection Sensor module: refresh + write
-app.post('/api/mesh/modules/detection-sensor/refresh', async (_req, res) => {
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+app.post('/api/mesh/modules/detection-sensor/refresh', async (req, res) => {
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.requestDetectionSensorConfig();
+    await bridge.requestDetectionSensorConfig();
     return res.json({ ok: true });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
@@ -1927,9 +2019,11 @@ app.post('/api/mesh/modules/detection-sensor', async (req, res) => {
   ].filter(Boolean);
   if (errs.length) return res.status(400).json({ error: errs.join('; ') });
 
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.setDetectionSensorConfig({
+    await bridge.setDetectionSensorConfig({
       enabled: body.enabled,
       minimumBroadcastSecs: body.minimumBroadcastSecs,
       stateBroadcastSecs: body.stateBroadcastSecs,
@@ -1946,10 +2040,12 @@ app.post('/api/mesh/modules/detection-sensor', async (req, res) => {
 });
 
 // Audio module: refresh + write
-app.post('/api/mesh/modules/audio/refresh', async (_req, res) => {
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+app.post('/api/mesh/modules/audio/refresh', async (req, res) => {
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.requestAudioConfig();
+    await bridge.requestAudioConfig();
     return res.json({ ok: true });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
@@ -1973,9 +2069,11 @@ app.post('/api/mesh/modules/audio', async (req, res) => {
   ].filter(Boolean);
   if (errs.length) return res.status(400).json({ error: errs.join('; ') });
 
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.setAudioConfig({
+    await bridge.setAudioConfig({
       codec2Enabled: body.codec2Enabled,
       pttPin: body.pttPin,
       bitrate: body.bitrate,
@@ -1991,10 +2089,12 @@ app.post('/api/mesh/modules/audio', async (req, res) => {
 });
 
 // Serial module: refresh + write
-app.post('/api/mesh/modules/serial/refresh', async (_req, res) => {
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+app.post('/api/mesh/modules/serial/refresh', async (req, res) => {
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.requestSerialConfig();
+    await bridge.requestSerialConfig();
     return res.json({ ok: true });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
@@ -2018,9 +2118,11 @@ app.post('/api/mesh/modules/serial', async (req, res) => {
   ].filter(Boolean);
   if (errs.length) return res.status(400).json({ error: errs.join('; ') });
 
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.setSerialConfig({
+    await bridge.setSerialConfig({
       enabled: body.enabled,
       echo: body.echo,
       rxd: body.rxd,
@@ -2036,10 +2138,12 @@ app.post('/api/mesh/modules/serial', async (req, res) => {
 });
 
 // Ambient Lighting module: refresh + write
-app.post('/api/mesh/modules/ambient-lighting/refresh', async (_req, res) => {
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+app.post('/api/mesh/modules/ambient-lighting/refresh', async (req, res) => {
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.requestAmbientLightingConfig();
+    await bridge.requestAmbientLightingConfig();
     return res.json({ ok: true });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
@@ -2061,9 +2165,11 @@ app.post('/api/mesh/modules/ambient-lighting', async (req, res) => {
   ].filter(Boolean);
   if (errs.length) return res.status(400).json({ error: errs.join('; ') });
 
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.setAmbientLightingConfig({
+    await bridge.setAmbientLightingConfig({
       ledState: body.ledState,
       current: body.current,
       red: body.red,
@@ -2077,10 +2183,12 @@ app.post('/api/mesh/modules/ambient-lighting', async (req, res) => {
 });
 
 // Paxcounter module: refresh + write
-app.post('/api/mesh/modules/paxcounter/refresh', async (_req, res) => {
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+app.post('/api/mesh/modules/paxcounter/refresh', async (req, res) => {
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.requestPaxcounterConfig();
+    await bridge.requestPaxcounterConfig();
     return res.json({ ok: true });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
@@ -2101,9 +2209,11 @@ app.post('/api/mesh/modules/paxcounter', async (req, res) => {
   ].filter(Boolean);
   if (errs.length) return res.status(400).json({ error: errs.join('; ') });
 
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.setPaxcounterConfig({
+    await bridge.setPaxcounterConfig({
       enabled: body.enabled,
       updateIntervalSecs: body.updateIntervalSecs,
       wifiThreshold: body.wifiThreshold,
@@ -2116,10 +2226,12 @@ app.post('/api/mesh/modules/paxcounter', async (req, res) => {
 });
 
 // Remote Hardware module: refresh + write
-app.post('/api/mesh/modules/remote-hardware/refresh', async (_req, res) => {
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+app.post('/api/mesh/modules/remote-hardware/refresh', async (req, res) => {
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.requestRemoteHardwareConfig();
+    await bridge.requestRemoteHardwareConfig();
     return res.json({ ok: true });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
@@ -2156,9 +2268,11 @@ app.post('/api/mesh/modules/remote-hardware', async (req, res) => {
     pins.push({ gpioPin: p.gpioPin, name: p.name.slice(0, 32), type: p.type });
   }
 
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.setRemoteHardwareConfig({
+    await bridge.setRemoteHardwareConfig({
       enabled: body.enabled,
       allowUndefinedPinAccess: body.allowUndefinedPinAccess,
       availablePins: pins,
@@ -2170,10 +2284,12 @@ app.post('/api/mesh/modules/remote-hardware', async (req, res) => {
 });
 
 // External Notification module: refresh + write
-app.post('/api/mesh/modules/external-notification/refresh', async (_req, res) => {
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+app.post('/api/mesh/modules/external-notification/refresh', async (req, res) => {
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.requestExternalNotificationConfig();
+    await bridge.requestExternalNotificationConfig();
     return res.json({ ok: true });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
@@ -2205,9 +2321,11 @@ app.post('/api/mesh/modules/external-notification', async (req, res) => {
   ].filter(Boolean);
   if (errs.length) return res.status(400).json({ error: errs.join('; ') });
 
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.setExternalNotificationConfig({
+    await bridge.setExternalNotificationConfig({
       enabled: body.enabled,
       outputMs: body.outputMs,
       output: body.output,
@@ -2313,7 +2431,7 @@ app.get('/api/mesh/range-test/coverage', (req, res) => {
 
 // Store & Forward: list routers, request history replay
 app.get('/api/mesh/store-forward', (_req, res) => {
-  return res.json(meshBridge.getStoreForwardRouters());
+  return res.json(defaultDbBridge().getStoreForwardRouters());
 });
 
 app.post('/api/mesh/store-forward/request-history', async (req, res) => {
@@ -2325,9 +2443,11 @@ app.post('/api/mesh/store-forward/request-history', async (req, res) => {
   if (!Number.isFinite(minutes) || minutes <= 0 || minutes > 1440) {
     return res.status(400).json({ error: 'windowMinutes must be between 1 and 1440' });
   }
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    await meshBridge.requestStoreForwardHistory(to, minutes, typeof channel === 'number' ? channel : 0);
+    await bridge.requestStoreForwardHistory(to, minutes, typeof channel === 'number' ? channel : 0);
     return res.json({ ok: true });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
@@ -2336,7 +2456,7 @@ app.post('/api/mesh/store-forward/request-history', async (req, res) => {
 
 // Waypoints: list / create-update / delete
 app.get('/api/mesh/waypoints', (_req, res) => {
-  return res.json(meshBridge.getWaypoints());
+  return res.json(defaultDbBridge().getWaypoints());
 });
 
 app.post('/api/mesh/waypoints', (req, res) => {
@@ -2344,8 +2464,13 @@ app.post('/api/mesh/waypoints', (req, res) => {
   if (typeof lat !== 'number' || typeof lng !== 'number') {
     return res.status(400).json({ error: 'lat and lng must be numbers' });
   }
+  // v2.0 Beta 4: route through resolveBridge so waypoints can target a
+  // specific radio (operator drops a pin and wants it sent through WRTJ
+  // instead of the default 3bec).
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
   try {
-    const wp = meshBridge.sendWaypoint(
+    const wp = resolved.bridge.sendWaypoint(
       { id, lat, lng, name, description, icon, expire, lockedToSelf },
       typeof channel === 'number' ? channel : 0,
     );
@@ -2360,8 +2485,13 @@ app.delete('/api/mesh/waypoints/:id', (req, res) => {
   if (!Number.isFinite(id) || id <= 0) {
     return res.status(400).json({ error: 'invalid waypoint id' });
   }
+  // Waypoint deletes are a mesh broadcast (sets expire=0). Use the same
+  // routing as the create above so cross-radio operators can scope the
+  // delete to one mesh.
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
   try {
-    const ok = meshBridge.deleteWaypoint(id);
+    const ok = resolved.bridge.deleteWaypoint(id);
     return res.json({ ok });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
@@ -2375,9 +2505,11 @@ app.post('/api/mesh/traceroute', async (req, res) => {
   if (typeof to !== 'string' || !to.startsWith('!')) {
     return res.status(400).json({ error: 'to must be a !hex node id' });
   }
-  if (!meshBridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  const resolved = resolveBridge(req);
+  if (!resolved) return res.status(503).json({ error: 'Radio not connected' });
+  const bridge = resolved.bridge;
   try {
-    const r = await meshBridge.sendTraceroute(to, typeof channel === 'number' ? channel : 0);
+    const r = await bridge.sendTraceroute(to, typeof channel === 'number' ? channel : 0);
     return res.json({ ok: true, requestId: r.requestId });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
@@ -2385,7 +2517,7 @@ app.post('/api/mesh/traceroute', async (req, res) => {
 });
 
 app.get('/api/mesh/traces', (_req, res) => {
-  return res.json(meshBridge.getTraces());
+  return res.json(defaultDbBridge().getTraces());
 });
 
 /**
@@ -2404,7 +2536,11 @@ app.get('/api/mesh/route-intel/pair', (req, res) => {
   const sinceMs = Date.now() - windowMs;
 
   try {
-    const allMessages = meshBridge.getMessages();
+    // v2.0 Beta 4: pull from the aggregator so messages received by either
+    // radio count toward the pair's delivery stats. Falls back to the
+    // singleton only pre-registration (no contexts yet).
+    const ctxs = bridgeManager.list();
+    const allMessages = ctxs.length === 0 ? meshBridge.getMessages() : bridgeManager.getAllMessages();
     // Filter on the in-memory cache; channel = "" or "BroadcastDM peer" — we
     // match by from/to ids regardless of channel since the same pair can
     // happen on either DM or a broadcast channel.
@@ -2468,7 +2604,7 @@ app.get('/api/mesh/route-intel/pair', (req, res) => {
     const total = subset.length;
     const totalEnded = successful + failed; // exclude pending from rate
     const aggregateRelays = Array.from(relayCounts.entries()).map(([nodeId, a]) => {
-      const node = meshBridge.getNodes().find(n => n.id === nodeId);
+      const node = bridgeManager.getAllNodes().find(n => n.id === nodeId);
       return {
         nodeId,
         nodeName: node?.name || node?.shortName || nodeId,
@@ -2482,8 +2618,8 @@ app.get('/api/mesh/route-intel/pair', (req, res) => {
     return res.json({
       fromId,
       toId,
-      fromName: meshBridge.getNodes().find(n => n.id === fromId)?.name ?? fromId,
-      toName: meshBridge.getNodes().find(n => n.id === toId)?.name ?? toId,
+      fromName: bridgeManager.getAllNodes().find(n => n.id === fromId)?.name ?? fromId,
+      toName: bridgeManager.getAllNodes().find(n => n.id === toId)?.name ?? toId,
       totalMessages: total,
       successful,
       failed,
@@ -2512,7 +2648,7 @@ app.get('/api/mesh/route-intel/uptime', (req, res) => {
   try {
     const all = meshDb().computeNodeUptime(windowMs);
     const filtered = nodeId ? all.filter(s => s.nodeId === nodeId) : all;
-    const nodes = meshBridge.getNodes();
+    const nodes = bridgeManager.getAllNodes();
     const enriched = filtered.map(s => {
       const node = nodes.find(n => n.id === s.nodeId);
       return {
@@ -2580,7 +2716,7 @@ try { meshBridge.setMessageRetention(loadMessageRetention()); } catch (err: any)
 }
 
 app.get('/api/mesh/log-retention', (_req, res) => {
-  return res.json({ hours: meshBridge.getEventRetention(), allowed: ALLOWED_RETENTION_HOURS });
+  return res.json({ hours: defaultDbBridge().getEventRetention(), allowed: ALLOWED_RETENTION_HOURS });
 });
 
 app.post('/api/mesh/log-retention', (req, res) => {
@@ -2589,7 +2725,10 @@ app.post('/api/mesh/log-retention', (req, res) => {
     return res.status(400).json({ error: `hours must be one of ${ALLOWED_RETENTION_HOURS.join(', ')}` });
   }
   try {
-    meshBridge.setEventRetention(hours);
+    // v2.0 Beta 4: fan out to every connected bridge so all radios prune on
+    // the same schedule. Previously only meshBridge got the new window;
+    // secondary-bridge instances kept whatever they were spawned with.
+    forEachBridge(b => b.setEventRetention(hours));
     saveRetention(hours);
     return res.json({ ok: true, hours });
   } catch (err: any) {
@@ -2598,7 +2737,7 @@ app.post('/api/mesh/log-retention', (req, res) => {
 });
 
 app.get('/api/mesh/message-retention', (_req, res) => {
-  return res.json({ hours: meshBridge.getMessageRetention(), allowed: ALLOWED_MESSAGE_RETENTION_HOURS });
+  return res.json({ hours: defaultDbBridge().getMessageRetention(), allowed: ALLOWED_MESSAGE_RETENTION_HOURS });
 });
 
 app.post('/api/mesh/message-retention', (req, res) => {
@@ -2607,7 +2746,7 @@ app.post('/api/mesh/message-retention', (req, res) => {
     return res.status(400).json({ error: `hours must be one of ${ALLOWED_MESSAGE_RETENTION_HOURS.join(', ')}` });
   }
   try {
-    meshBridge.setMessageRetention(hours);
+    forEachBridge(b => b.setMessageRetention(hours));
     saveMessageRetention(hours);
     return res.json({ ok: true, hours });
   } catch (err: any) {
@@ -2913,7 +3052,7 @@ app.get('/api/mesh/bbs/users', (_req, res) => {
     const users = meshDb().listMailUsers();
     // Decorate with the local node's friendly name + short_name when known,
     // so the UI doesn't have to re-fetch nodes just to label rows.
-    const nodes = meshBridge.getNodes();
+    const nodes = bridgeManager.getAllNodes();
     const nodeByid = new Map(nodes.map(n => [n.id, n]));
     const localNodeId = (meshBridge as any).localNodeId as string | null;
     const decorated = users.map(u => {
