@@ -3430,6 +3430,21 @@ export class MeshtasticSerialBridge extends EventEmitter {
       return;
     }
 
+    // v2.0 Beta 3: DM to us that ISN'T a BBS command — but the sender might
+    // have been mid-flow when their session was reaped. Fire-and-forget a
+    // hint reply if we have a recently-reaped record for them. The original
+    // message still flows through to normal DM storage below, so nothing
+    // gets lost; the hint just tells them how to restart the flow.
+    if (
+      !isReaction &&
+      toId === this.localNodeId &&
+      this.bbs
+    ) {
+      this.bbs.maybeHintReapedSession(fromId, channelIndex).catch(err =>
+        console.error('[MeshtasticSerial] BBS hint failed:', err?.message)
+      );
+    }
+
     // Resolve the channel name so incoming messages appear in the right chat pane.
     // Fall back progressively: channel map → channel index string → primary default.
     const channelName = this.resolveChannelName(channelIndex, toId);

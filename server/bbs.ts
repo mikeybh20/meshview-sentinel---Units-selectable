@@ -54,6 +54,11 @@ export class BbsService {
   /** Per-destination last-send timestamp for pacing. Cleared lazily — we never
    *  need this for nodes we haven't talked to in hours. */
   private lastSendAt = new Map<string, number>();
+  /** v2.0 Beta 3: track sender → epoch-ms of when the reaper last killed
+   *  their session, so a DM arriving shortly after gets a helpful hint
+   *  ("your session timed out, send :mail to restart") instead of being
+   *  silently swallowed as a normal DM. Entries age out after 30 min. */
+  private recentlyReaped = new Map<string, number>();
   private bridge: MeshtasticSerialBridge;
   private config: BbsConfig = defaultBbsConfig();
   /** v2.0 multi-radio: the receiving radio's 4-char short_name. Stamped onto
@@ -605,7 +610,19 @@ export class BbsService {
     }
     try {
       await this.bridge.sendMessage(text, toId, channelIndex);
-      this.lastSendAt.set(toId, Date.now());
+      const now = Date.now();
+      this.lastSendAt.set(toId, now);
+      // v2.0 Beta 3: each reply extends the session window. Previously
+      // enteredAt only got bumped on inbound messages, so a slow operator
+      // could get reaped mid-flow even though we were actively talking to
+      // them (we sent the prompt → they took 30s+ to type → reaper killed
+      // the session before their reply landed). Bumping on every reply
+      // gives them the full sessionTimeoutSecs from the prompt instead of
+      // from their previous input.
+      const mailSession = this.sessions.get(toId);
+      if (mailSession) mailSession.enteredAt = now;
+      const weatherSession = this.weatherSessions.get(toId);
+      if (weatherSession) weatherSession.enteredAt = now;
     } catch (err: any) {
       console.error(`[BBS] reply to ${toId} (ch=${channelIndex}) failed:`, err?.message);
     }
@@ -615,13 +632,53 @@ export class BbsService {
     const timeoutMs = (this.config.sessionTimeoutSecs ?? 0) > 0
       ? this.config.sessionTimeoutSecs * 1000
       : STATE_TIMEOUT_MS_FALLBACK;
-    const cutoff = Date.now() - timeoutMs;
+    const now = Date.now();
+    const cutoff = now - timeoutMs;
     for (const [id, s] of this.sessions) {
-      if (s.enteredAt < cutoff) this.sessions.delete(id);
+      if (s.enteredAt < cutoff) {
+        const idleSecs = Math.round((now - s.enteredAt) / 1000);
+        console.log(`[BBS] reaped stale session ${id} (kind=${s.kind} idle=${idleSecs}s, timeout=${Math.round(timeoutMs / 1000)}s)`);
+        this.sessions.delete(id);
+        this.recentlyReaped.set(id, now);
+      }
     }
     for (const [id, s] of this.weatherSessions) {
-      if (s.enteredAt < cutoff) this.weatherSessions.delete(id);
+      if (s.enteredAt < cutoff) {
+        const idleSecs = Math.round((now - s.enteredAt) / 1000);
+        console.log(`[BBS] reaped stale weather session ${id} (idle=${idleSecs}s)`);
+        this.weatherSessions.delete(id);
+        this.recentlyReaped.set(id, now);
+      }
     }
+    // Age out recentlyReaped entries older than 30 min so the hint doesn't
+    // surface long after the operator has moved on.
+    const reapedCutoff = now - 30 * 60 * 1000;
+    for (const [id, t] of this.recentlyReaped) {
+      if (t < reapedCutoff) this.recentlyReaped.delete(id);
+    }
+  }
+
+  /**
+   * v2.0 Beta 3: called from the bridge when a DM arrives to the local node
+   * that DOESN'T match isCommand() — i.e., no active session, doesn't start
+   * with a trigger. If we recently reaped this sender's session, send a hint
+   * so they know the BBS isn't ignoring them and how to recover. Returns
+   * true if a hint was sent (caller can use it for logging if useful).
+   */
+  async maybeHintReapedSession(fromId: string, channelIndex: number): Promise<boolean> {
+    if (!this.config.enabled) return false;
+    const reapedAt = this.recentlyReaped.get(fromId);
+    if (!reapedAt) return false;
+    // Only hint within a short window — if it's been longer, the operator
+    // has likely moved on and a stale hint would be noise.
+    if (Date.now() - reapedAt > 10 * 60 * 1000) {
+      this.recentlyReaped.delete(fromId);
+      return false;
+    }
+    // One-shot: don't re-hint if they keep sending non-trigger DMs.
+    this.recentlyReaped.delete(fromId);
+    await this.reply(fromId, `BBS session timed out. Send "${this.config.mailTrigger}" to start over.`, channelIndex);
+    return true;
   }
 }
 
