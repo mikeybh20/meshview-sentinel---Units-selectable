@@ -2188,6 +2188,42 @@ function AddRadioForm({ existing, onCancel, onCreated }: {
   const [detectMsg, setDetectMsg] = React.useState<string | null>(null);
   const [err, setErr] = React.useState<string | null>(null);
 
+  // v2.0 Beta 3: mDNS / Bonjour auto-discovery of Meshtastic radios on the LAN.
+  // Polls `/api/mesh/discover/mdns` every 5 s; clicking a discovered row
+  // auto-fills transport=tcp + target=<ipv4>:4403. Existing radios (those
+  // already in the registry) are filtered out so the operator doesn't try to
+  // re-add. List stays empty if the Sentinel container can't see mDNS
+  // multicast (Docker bridge networking).
+  type Discovered = Awaited<ReturnType<typeof meshDataService.getMdnsDiscovered>>[number];
+  const [discovered, setDiscovered] = React.useState<Discovered[]>([]);
+  React.useEffect(() => {
+    let cancelled = false;
+    const tick = async () => {
+      const list = await meshDataService.getMdnsDiscovered();
+      if (!cancelled) setDiscovered(list);
+    };
+    tick();
+    const iv = setInterval(tick, 5000);
+    return () => { cancelled = true; clearInterval(iv); };
+  }, []);
+  const usedTargets = new Set(existing.map(r => r.target.split(':')[0].trim()));
+  const usedRadioIds = new Set(existing.map(r => r.radio_id));
+  const candidates = discovered.filter(d =>
+    d.ipv4 && !usedTargets.has(d.ipv4) && !usedRadioIds.has(d.name)
+  );
+
+  const useDiscovered = (svc: Discovered) => {
+    if (!svc.ipv4) return;
+    setTransport('tcp');
+    setTarget(svc.ipv4);
+    // Pre-fill short_name + long_name from the advertised host if the user
+    // hasn't typed anything yet. Detect Identity will overwrite with the
+    // radio's real values once connected.
+    if (!radioId.trim()) setRadioId(svc.name.slice(0, 4).toUpperCase());
+    if (!longName.trim()) setLongName(svc.name);
+    setDetectMsg(`Selected ${svc.name} (${svc.ipv4}:${svc.port}) — click Detect Identity to verify.`);
+  };
+
   const submit = async () => {
     setBusy(true); setErr(null);
     const r = await meshDataService.addRadio({
@@ -2233,6 +2269,35 @@ function AddRadioForm({ existing, onCancel, onCreated }: {
       <p className="text-[11px] text-brand-muted">
         Enter the transport + target, then click <b>Detect Identity</b> to auto-fill the radio's short name + long name from its firmware. You can also fill the fields by hand.
       </p>
+
+      {/* v2.0 Beta 3: mDNS / Bonjour auto-discovery. Lists Meshtastic radios
+          announcing _meshtastic._tcp on the LAN that aren't already in the
+          registry. One-click fills transport=tcp + target=<ipv4>. Stays
+          hidden when nothing's discovered (e.g. Docker bridge networking
+          blocks multicast). */}
+      {candidates.length > 0 && (
+        <div className="bg-sky-500/5 border border-sky-500/30 rounded p-2 space-y-1.5">
+          <p className="text-[10px] font-bold uppercase tracking-widest text-sky-400">
+            Discovered on WiFi ({candidates.length})
+          </p>
+          <div className="space-y-1">
+            {candidates.map(svc => (
+              <button
+                key={svc.fqdn}
+                onClick={() => useDiscovered(svc)}
+                className="w-full flex items-center justify-between gap-2 px-2 py-1.5 rounded border border-sky-500/20 bg-brand-bg/40 hover:bg-sky-500/10 hover:border-sky-500/50 text-left transition-colors group"
+                title={`Click to fill: tcp / ${svc.ipv4}`}
+              >
+                <span className="text-xs text-brand-ink truncate">{svc.name}</span>
+                <span className="text-[10px] mono-text text-brand-muted group-hover:text-sky-400 shrink-0">
+                  {svc.ipv4}:{svc.port}
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className="grid grid-cols-2 gap-3">
         <div>
           <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Short Name (1–4 chars)</label>

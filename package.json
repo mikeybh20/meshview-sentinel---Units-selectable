@@ -25,6 +25,7 @@
     "@types/d3": "^7.4.3",
     "@vitejs/plugin-react": "^5.0.4",
     "better-sqlite3": "^11.10.0",
+    "bonjour-service": "^1.4.0",
     "clsx": "^2.1.1",
     "d3": "^7.9.0",
     "dotenv": "^17.2.3",

@@ -21,7 +21,9 @@ import { bridgeManager, testTransportConnection } from './bridgeManager.js';
 // at startup so the operator immediately knows their acceleration tier.
 import { probeGpuOnBoot, health as gpuHealth, clusterDbscan, buildTopology, buildHeatmap, simplifyTrace, routeStability } from './gpuClient.js';
 import { sealBackup, openBackup } from './backup.js';
+import { mdnsDiscovery } from './mdnsDiscovery.js';
 probeGpuOnBoot();
+mdnsDiscovery.start();
 
 // v2.0 multi-radio: BbsService is instantiated per RadioContext inside
 // BridgeManager.attachBbs() (default radio on auto-register, secondaries
@@ -339,6 +341,17 @@ app.post('/api/ai/chat', async (req, res) => {
 // the browser is loading. Falls back to "dev" when the env var is missing.
 const SYSTEM_VERSION = (process.env.SYSTEM_VERSION || '').trim() || 'dev';
 console.log(`[API] MeshView Sentinel ${SYSTEM_VERSION}`);
+
+// v2.0 Beta 3: mDNS-discovered Meshtastic radios on the LAN. The firmware
+// advertises `_meshtastic._tcp.local` on port 4403 whenever WiFi is up; the
+// scanner in mdnsDiscovery.ts watches for these announcements and the Add
+// Radio form uses this endpoint to populate an auto-discover dropdown. If
+// Sentinel is running in a Docker bridge container (default), mDNS multicast
+// will not traverse to the container and this list will stay empty — switch
+// the meshview service to `network_mode: host` to enable discovery.
+app.get('/api/mesh/discover/mdns', (_req, res) => {
+  return res.json({ services: mdnsDiscovery.list() });
+});
 
 // Status: is the radio connected?
 app.get('/api/mesh/status', (_req, res) => {

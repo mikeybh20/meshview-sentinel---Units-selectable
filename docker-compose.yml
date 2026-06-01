@@ -1,6 +1,21 @@
 services:
   meshview:
     build: .
+    # --- networking ---
+    # Default: bridge networking + port-mapping (below). mDNS / Bonjour
+    # multicast does NOT traverse Docker bridges, so Settings → Add Radio's
+    # "Discovered on WiFi" list will stay empty under this default mode.
+    # Manual IP entry + Detect Identity still work fine.
+    #
+    # To enable mDNS auto-discovery of Meshtastic radios on your LAN:
+    #   1. Comment out the `ports:` block below
+    #   2. Uncomment `network_mode: host`
+    #   3. Change MESHVIEW_GPU_URL from `http://meshview-gpu:7100`
+    #      to `http://localhost:7100` (host networking bypasses the
+    #      compose-internal service-name DNS)
+    #   4. Dashboard URL changes from http://<host>:3000 → http://<host>:3001
+    #
+    # network_mode: host
     ports:
       # Host port 3000 → container port 3001 (the API server's listen port).
       # We deliberately keep this on a high port: port 80 binding succeeds at

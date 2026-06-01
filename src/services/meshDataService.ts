@@ -789,6 +789,31 @@ export class MeshDataService {
     }
   }
 
+  /** v2.0 Beta 3: list nearby Meshtastic radios discovered via mDNS / Bonjour.
+   *  The firmware advertises `_meshtastic._tcp.local` on port 4403 when WiFi
+   *  is enabled — Sentinel's scanner watches for those announcements and the
+   *  Add Radio form uses this to auto-fill target on selection. Returns an
+   *  empty list when no radios are advertising or when Docker bridge mode
+   *  blocks multicast from reaching the container. */
+  async getMdnsDiscovered(): Promise<Array<{
+    name: string;
+    fqdn: string;
+    host: string;
+    port: number;
+    addresses: string[];
+    ipv4: string | null;
+    txt: Record<string, string>;
+    firstSeen: number;
+    lastSeen: number;
+  }>> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/discover/mdns`);
+      if (!res.ok) return [];
+      const body = await res.json().catch(() => ({}));
+      return Array.isArray(body?.services) ? body.services : [];
+    } catch { return []; }
+  }
+
   /** v2.0 Beta 3: fetch the radio's firmware /json/report (TCP radios only).
    *  Backend proxies this so we avoid CORS + work from anywhere the dashboard
    *  is reachable. Returns { ok: true, ... payload } on success, otherwise an
