@@ -1393,7 +1393,13 @@ app.post('/api/mesh/connect/tcp', async (req, res) => {
     return res.status(400).json({ error: 'port out of range' });
   }
   try {
-    await meshBridge.connectTcp(host.trim(), portNum);
+    // v2.0 Beta 4: route through BridgeManager.rebindSingletonTcp so the
+    // contexts table stays coherent with the singleton's actual transport.
+    // The old direct `meshBridge.connectTcp(host, port)` path silently left
+    // bridgeManager.contexts[defaultRadioId].bridge pointing at the stale
+    // pre-rebind state, which was the root cause of every "snapshot shows
+    // X but per-radio endpoint shows Y" symptom we Band-Aided in Beta 3.
+    await bridgeManager.rebindSingletonTcp(host.trim(), portNum);
     saveTcpEndpoint({ host: host.trim(), port: portNum });
     return res.json({ ok: true, transport: meshBridge.getTransport() });
   } catch (err: any) {

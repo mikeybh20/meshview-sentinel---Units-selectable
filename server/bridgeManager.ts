@@ -172,6 +172,41 @@ class BridgeManager extends EventEmitter {
   }
 
   /**
+   * v2.0 Beta 4: rebind the singleton bridge to a new TCP endpoint while
+   * keeping BridgeManager.contexts coherent.
+   *
+   * Replaces the old "just call meshBridge.connectTcp() and hope for the
+   * best" path that the legacy /api/mesh/connect/tcp endpoint was using.
+   * Symptoms of that bug class: the snapshot endpoint returns one radio's
+   * channels while /api/mesh/channels?radio_id=X returns another's,
+   * because meshBridge's actual identity diverged from
+   * contexts[defaultRadioId].bridge over a reconnect cycle.
+   *
+   * What this does, in order:
+   *   1. Disconnects whatever transport meshBridge currently holds.
+   *   2. Deletes the stale default context (so the identity exchange
+   *      after step 3 produces a fresh entry).
+   *   3. Resets defaultRegistered so tryAutoRegisterDefault fires.
+   *   4. Reconnects meshBridge to the new (host, port).
+   *
+   * The natural follow-up flow (nodeUpdate → tryAutoRegisterDefault →
+   * setRadioId → contexts.set) then re-establishes a clean default
+   * context with the right radio_id, matching the actual transport.
+   */
+  async rebindSingletonTcp(host: string, port: number): Promise<void> {
+    try { await meshBridge.disconnect(); } catch { /* best-effort */ }
+    if (this.defaultRadioId) {
+      this.contexts.delete(this.defaultRadioId);
+    }
+    this.defaultRadioId = null;
+    this.defaultRegistered = false;
+    await meshBridge.connectTcp(host, port);
+    // tryAutoRegisterDefault runs on the next nodeUpdate / connected event;
+    // the singleton-on-event listeners attached in this class's constructor
+    // (line 62-63) keep firing across reconnects, so no rewiring needed.
+  }
+
+  /**
    * One-shot: when the singleton bridge knows its local node id + short_name,
    * register/refresh the corresponding RadioContext. Idempotent — safe to call
    * on every event emission.
