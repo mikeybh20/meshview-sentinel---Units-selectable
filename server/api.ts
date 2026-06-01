@@ -1458,11 +1458,21 @@ app.get('/api/mesh/snapshot', (_req, res) => {
   try { blocked = meshDb().loadBlockedNodes(); } catch { /* fall back to empty */ }
   const ctxs = bridgeManager.list();
   const useAgg = ctxs.length > 0;
+  // v2.0 Beta 3 bugfix: pull channels from the *default radio's* bridge in
+  // BridgeManager rather than the raw singleton. They diverge after the
+  // operator points `/api/mesh/connect/tcp` at a different radio: meshBridge
+  // gets rebound to that new target's transport but BridgeManager's contexts
+  // (which the per-radio /api/mesh/channels?radio_id=X endpoint reads from)
+  // keep pointing at their original bridge instances. Result was that the
+  // snapshot's channel list could be a different radio's slots than what the
+  // /api/mesh/channels?radio_id=<default> endpoint returned — so the
+  // sidebar's "default radio" view showed someone else's channels.
+  const defaultBridge = bridgeManager.getDefault()?.bridge ?? meshBridge;
   return res.json({
     nodes:    useAgg ? bridgeManager.getAllNodes()    : meshBridge.getNodes(),
     messages: useAgg ? bridgeManager.getAllMessages() : meshBridge.getMessages(),
     events:   useAgg ? bridgeManager.getAllEvents()   : meshBridge.getEvents(),
-    channels: meshBridge.getChannels(),
+    channels: defaultBridge.getChannels(),
     waypoints: meshBridge.getWaypoints(),
     traces: meshBridge.getTraces(),
     neighborInfo: meshBridge.getNeighborInfo(),
@@ -2571,7 +2581,12 @@ app.get('/api/mesh/channels', (req, res) => {
     if (!ctx) return res.status(404).json({ error: `radio "${radioId}" is not currently connected` });
     return res.json(ctx.bridge.getChannels());
   }
-  return res.json(meshBridge.getChannels());
+  // v2.0 Beta 3 bugfix: no radio_id → return the default radio's bridge
+  // channels from BridgeManager, NOT meshBridge directly. See the analogous
+  // fix in /api/mesh/snapshot — these two paths must agree on which bridge
+  // instance is authoritative for the default radio.
+  const defaultBridge = bridgeManager.getDefault()?.bridge ?? meshBridge;
+  return res.json(defaultBridge.getChannels());
 });
 
 // v2.0 Phase 4: same optional `radio_id` in the body routes the channel
