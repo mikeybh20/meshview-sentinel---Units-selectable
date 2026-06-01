@@ -660,6 +660,42 @@ app.get('/api/mesh/radios/:radioId/power', (req, res) => {
   return res.json({ live: ctx.bridge.getLocalPowerConfig() });
 });
 
+// --- v2.0 Beta 3: Web Status (TCP radios only) ---
+// Proxy fetch of the firmware's built-in /json/report endpoint. The Meshtastic
+// firmware serves an HTTP status JSON on port 80 whenever WiFi is enabled —
+// includes live battery / wifi RSSI / uptime / memory / channel airtime, all
+// data Sentinel doesn't ordinarily collect over the StreamAPI. We proxy
+// rather than letting the browser fetch directly so:
+//   1. No CORS hassle (radio webserver doesn't emit Access-Control-Allow-*)
+//   2. Works from anywhere the dashboard is open, not just on the same LAN
+//      as the radio
+// Only meaningful for TCP-transport radios; serial/BLE radios have no IP.
+app.get('/api/mesh/radios/:radioId/web-status', async (req, res) => {
+  const row = meshDb().getRadio(req.params.radioId);
+  if (!row) return res.status(404).json({ error: 'radio not found' });
+  if (row.transport !== 'tcp') {
+    return res.status(400).json({ error: 'web-status is only available for TCP-transport radios' });
+  }
+  // target is "<host>:<port>" or bare "<host>"; the webserver lives on :80
+  const host = (row.target || '').split(':')[0].trim();
+  if (!host) return res.status(400).json({ error: 'radio target has no resolvable host' });
+
+  const url = `http://${host}/json/report`;
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 5000);
+  try {
+    const r = await fetch(url, { signal: ctrl.signal });
+    if (!r.ok) return res.status(502).json({ error: `radio webserver returned HTTP ${r.status}` });
+    const body = await r.json();
+    return res.json({ ok: true, source: url, fetched_at: Date.now(), data: body });
+  } catch (err: any) {
+    const msg = err?.name === 'AbortError' ? 'timeout after 5s' : (err?.message || 'fetch failed');
+    return res.status(502).json({ error: `couldn't reach ${url}: ${msg}` });
+  } finally {
+    clearTimeout(t);
+  }
+});
+
 app.post('/api/mesh/radios/:radioId/power/refresh', async (req, res) => {
   const ctx = bridgeManager.get(req.params.radioId);
   if (!ctx) return res.status(404).json({ error: 'radio not found or not connected' });

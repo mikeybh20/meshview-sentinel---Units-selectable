@@ -789,6 +789,24 @@ export class MeshDataService {
     }
   }
 
+  /** v2.0 Beta 3: fetch the radio's firmware /json/report (TCP radios only).
+   *  Backend proxies this so we avoid CORS + work from anywhere the dashboard
+   *  is reachable. Returns { ok: true, ... payload } on success, otherwise an
+   *  error string. */
+  async getRadioWebStatus(radioId: string): Promise<
+    | { ok: true; source: string; fetched_at: number; data: any }
+    | { ok: false; error: string }
+  > {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/web-status`);
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return body;
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'request failed' };
+    }
+  }
+
   // -------------------------------------------------------------------
   // v2.0 Beta 3: per-radio Device / Position / Display / Bluetooth config.
   // Each mirrors the Power triple: GET live snapshot, POST refresh, PUT write.

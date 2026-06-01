@@ -15,7 +15,7 @@
  */
 import React from 'react';
 import {
-  Star, Plus, Trash2, AlertCircle, Loader2, RefreshCw, HelpCircle, X,
+  Star, Plus, Trash2, AlertCircle, Loader2, RefreshCw, HelpCircle, X, Check, Copy,
 } from 'lucide-react';
 
 import { meshDataService } from '../../services/meshDataService';
@@ -112,6 +112,215 @@ function RamAdvisory({ info, radios, connected }: {
             {info.isJetson && ' On a Jetson Nano 2GB, the GPU sidecar can usually be disabled (its workloads fall back to CPU automatically).'}
           </p>
         )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * v2.0 Beta 3: live HTTP status viewer for TCP-transport radios. Calls the
+ * Sentinel server's proxy of the radio's `/json/report` endpoint (the
+ * Meshtastic firmware serves this on port 80 when WiFi is on) and renders the
+ * payload as a set of operator-relevant sections. The raw JSON is available
+ * at the bottom for power users + bug reports.
+ */
+function RadioWebStatusOverlay({ radioId, radioName, onClose }: {
+  radioId: string;
+  radioName: string;
+  onClose: () => void;
+}) {
+  const [loading, setLoading] = React.useState(true);
+  const [error, setError] = React.useState<string | null>(null);
+  const [payload, setPayload] = React.useState<any>(null);
+  const [source, setSource] = React.useState<string | null>(null);
+  const [fetchedAt, setFetchedAt] = React.useState<number | null>(null);
+  const [copied, setCopied] = React.useState(false);
+
+  const load = React.useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    const r = await meshDataService.getRadioWebStatus(radioId);
+    setLoading(false);
+    if (!r.ok) {
+      setError((r as { ok: false; error: string }).error);
+      return;
+    }
+    setPayload(r.data);
+    setSource(r.source);
+    setFetchedAt(r.fetched_at);
+  }, [radioId]);
+
+  React.useEffect(() => { load(); }, [load]);
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(payload, null, 2));
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch { /* ignore */ }
+  };
+
+  const data = payload?.data ?? {};
+  const power = data.power ?? {};
+  const wifi = data.wifi ?? {};
+  const radio = data.radio ?? {};
+  const airtime = data.airtime ?? {};
+  const memory = data.memory ?? {};
+  const device = data.device ?? {};
+
+  // Format uptime as Hh Mm Ss
+  const fmtUptime = (s: number | undefined): string => {
+    if (typeof s !== 'number' || s < 0) return '—';
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = Math.floor(s % 60);
+    return [h ? `${h}h` : '', m ? `${m}m` : '', `${sec}s`].filter(Boolean).join(' ');
+  };
+  const fmtBytes = (b: number | undefined): string => {
+    if (typeof b !== 'number') return '—';
+    if (b < 1024) return `${b} B`;
+    if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
+    return `${(b / (1024 * 1024)).toFixed(2)} MB`;
+  };
+  const isBoolish = (v: unknown): boolean | null => {
+    if (typeof v === 'boolean') return v;
+    if (v === 'true') return true;
+    if (v === 'false') return false;
+    return null;
+  };
+
+  const Section = ({ title, children }: { title: string; children: React.ReactNode }) => (
+    <div className="bg-brand-line/30 border border-brand-line rounded p-3 space-y-1.5">
+      <h5 className="text-[10px] font-bold uppercase tracking-widest text-brand-muted">{title}</h5>
+      <div className="grid grid-cols-[140px_1fr] gap-x-3 gap-y-1 text-xs">{children}</div>
+    </div>
+  );
+  const Row = ({ label, value }: { label: string; value: React.ReactNode }) => (
+    <>
+      <span className="text-brand-muted">{label}</span>
+      <span className="text-brand-ink mono-text">{value ?? '—'}</span>
+    </>
+  );
+
+  return (
+    <div
+      className="fixed inset-0 z-[300] flex items-center justify-center bg-brand-bg/80 backdrop-blur-md p-6"
+      onClick={onClose}
+    >
+      <div
+        onClick={e => e.stopPropagation()}
+        className="technical-panel w-full max-w-2xl bg-brand-bg max-h-[85vh] flex flex-col"
+      >
+        <div className="px-4 py-3 border-b border-brand-line flex items-center justify-between">
+          <div className="min-w-0">
+            <h3 className="text-base font-bold uppercase tracking-tight text-brand-ink">Radio Web Status</h3>
+            <p className="text-[10px] mono-text text-brand-muted truncate">
+              {radioName} · {source ?? `radio "${radioId}"`}
+            </p>
+          </div>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={load}
+              disabled={loading}
+              title="Refresh"
+              className="text-brand-muted hover:text-brand-ink p-1 rounded transition-colors disabled:opacity-50"
+            >
+              <RefreshCw size={13} className={loading ? 'animate-spin' : ''} />
+            </button>
+            <button onClick={onClose} title="Close" className="text-brand-muted hover:text-brand-ink p-1 rounded transition-colors">
+              <X size={14} />
+            </button>
+          </div>
+        </div>
+
+        <div className="overflow-y-auto p-4 space-y-3">
+          {loading && (
+            <div className="flex items-center justify-center gap-2 py-8 text-brand-muted text-[12px]">
+              <Loader2 size={14} className="animate-spin" /> Fetching /json/report…
+            </div>
+          )}
+
+          {!loading && error && (
+            <div className="bg-red-500/10 border border-red-500/40 rounded p-3 text-[11px] text-red-300">
+              <p className="font-bold mb-1">Couldn't fetch status</p>
+              <p>{error}</p>
+              <p className="mt-2 text-brand-muted">
+                The radio's webserver only responds when WiFi is enabled, joined, and the radio's IP matches the Sentinel target. Common causes: radio just rebooted (try Refresh in ~10s), WiFi dropped, or the target host/IP is out of date.
+              </p>
+            </div>
+          )}
+
+          {!loading && !error && payload && (
+            <>
+              <Section title="Power">
+                <Row label="Battery" value={typeof power.battery_percent === 'number' ? `${power.battery_percent}%` : '—'} />
+                <Row label="Voltage" value={typeof power.battery_voltage_mv === 'number' ? `${(power.battery_voltage_mv / 1000).toFixed(3)} V` : '—'} />
+                <Row label="Has battery" value={String(isBoolish(power.has_battery) ?? '—')} />
+                <Row label="USB connected" value={String(isBoolish(power.has_usb) ?? '—')} />
+                <Row label="Charging" value={String(isBoolish(power.is_charging) ?? '—')} />
+              </Section>
+
+              <Section title="WiFi">
+                <Row label="IP" value={wifi.ip ?? '—'} />
+                <Row label="RSSI" value={typeof wifi.rssi === 'number' ? `${wifi.rssi} dBm` : '—'} />
+              </Section>
+
+              <Section title="Radio">
+                <Row label="Frequency" value={typeof radio.frequency === 'number' ? `${radio.frequency.toFixed(3)} MHz` : '—'} />
+                <Row label="LoRa channel" value={radio.lora_channel ?? '—'} />
+              </Section>
+
+              <Section title="Airtime">
+                <Row label="Channel util" value={typeof airtime.channel_utilization === 'number' ? `${(airtime.channel_utilization * 100).toFixed(2)}%` : '—'} />
+                <Row label="TX util" value={typeof airtime.utilization_tx === 'number' ? `${(airtime.utilization_tx * 100).toFixed(3)}%` : '—'} />
+                <Row label="Uptime" value={fmtUptime(airtime.seconds_since_boot)} />
+                <Row label="Period length" value={typeof airtime.seconds_per_period === 'number' ? `${airtime.seconds_per_period}s` : '—'} />
+                <Row label="Periods logged" value={airtime.periods_to_log ?? '—'} />
+                {Array.isArray(airtime.rx_log) && (
+                  <Row label="RX (last 8h)" value={<span className="text-[10px]">[{airtime.rx_log.join(', ')}]</span>} />
+                )}
+                {Array.isArray(airtime.tx_log) && (
+                  <Row label="TX (last 8h)" value={<span className="text-[10px]">[{airtime.tx_log.join(', ')}]</span>} />
+                )}
+              </Section>
+
+              <Section title="Memory">
+                <Row label="Heap free" value={fmtBytes(memory.heap_free)} />
+                <Row label="Heap total" value={fmtBytes(memory.heap_total)} />
+                <Row label="Flash free" value={fmtBytes(memory.fs_free)} />
+                <Row label="Flash total" value={fmtBytes(memory.fs_total)} />
+                {typeof memory.psram_total === 'number' && memory.psram_total > 0 && (
+                  <>
+                    <Row label="PSRAM free" value={fmtBytes(memory.psram_free)} />
+                    <Row label="PSRAM total" value={fmtBytes(memory.psram_total)} />
+                  </>
+                )}
+              </Section>
+
+              <Section title="Device">
+                <Row label="Reboot count" value={device.reboot_counter ?? '—'} />
+                <Row label="Status" value={payload.status ?? '—'} />
+                <Row label="Fetched" value={fetchedAt ? new Date(fetchedAt).toLocaleString() : '—'} />
+              </Section>
+
+              <details className="bg-brand-line/30 border border-brand-line rounded">
+                <summary className="cursor-pointer px-3 py-2 text-[10px] font-bold uppercase tracking-widest text-brand-muted hover:text-brand-ink select-none">
+                  Raw JSON
+                </summary>
+                <div className="px-3 pb-3 pt-1">
+                  <pre className="text-[10px] mono-text text-brand-ink overflow-x-auto whitespace-pre-wrap">{JSON.stringify(payload, null, 2)}</pre>
+                  <button
+                    onClick={handleCopy}
+                    className="mt-2 flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest text-brand-muted hover:text-brand-ink border border-brand-line hover:border-brand-muted rounded px-2 py-1 transition-colors"
+                  >
+                    {copied ? <Check size={11} /> : <Copy size={11} />}
+                    {copied ? 'Copied' : 'Copy JSON'}
+                  </button>
+                </div>
+              </details>
+            </>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -242,6 +451,8 @@ export function RadiosView() {
   const [editingId, setEditingId] = React.useState<string | null>(null);
   const [busyRadioId, setBusyRadioId] = React.useState<string | null>(null);
   const [showHelp, setShowHelp] = React.useState(false);
+  // v2.0 Beta 3: which TCP radio's HTTP /json/report overlay is open (or null).
+  const [statusRadioId, setStatusRadioId] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
 
   const reload = React.useCallback(async () => {
@@ -386,6 +597,7 @@ export function RadiosView() {
                 onConnect={() => handleConnect(r.radio_id)}
                 onDisconnect={() => handleDisconnect(r.radio_id)}
                 onPromote={() => handlePromote(r.radio_id)}
+                onShowStatus={() => setStatusRadioId(r.radio_id)}
                 onChanged={reload}
               />
             ))}
@@ -400,12 +612,19 @@ export function RadiosView() {
           />
         )}
       </div>
+      {statusRadioId && (
+        <RadioWebStatusOverlay
+          radioId={statusRadioId}
+          radioName={radios.find(r => r.radio_id === statusRadioId)?.long_name ?? statusRadioId}
+          onClose={() => setStatusRadioId(null)}
+        />
+      )}
     </div>
   );
 }
 
 function RadioRowCard({
-  row, isSingleton, isConnected, health, isEditing, busy, onEdit, onDelete, onConnect, onDisconnect, onPromote, onChanged,
+  row, isSingleton, isConnected, health, isEditing, busy, onEdit, onDelete, onConnect, onDisconnect, onPromote, onShowStatus, onChanged,
 }: {
   row: RadioRow;
   /** This radio is held by the auto-discovered singleton bridge. Gates the star + suppresses Connect/Disconnect/Delete since the singleton can't be torn down from this panel. */
@@ -428,6 +647,7 @@ function RadioRowCard({
   onDisconnect: () => void;
   /** Hot-swap this radio into the singleton role. */
   onPromote: () => void;
+  onShowStatus: () => void;
   onChanged: () => void;
 }) {
   return (
@@ -550,6 +770,20 @@ function RadioRowCard({
                 {busy ? <Loader2 size={11} className="animate-spin" /> : 'Connect'}
               </button>
             )
+          )}
+          {/* v2.0 Beta 3: HTTP /json/report viewer for TCP radios.
+              Meshtastic firmware serves a status JSON on port 80 whenever
+              WiFi is enabled — shows live battery / wifi RSSI / uptime /
+              memory / channel airtime. Gated on transport === 'tcp' since
+              serial/BLE radios have no IP. */}
+          {row.transport === 'tcp' && (
+            <button
+              onClick={onShowStatus}
+              className="text-[10px] font-bold uppercase tracking-widest text-sky-400 hover:bg-sky-400/15 px-2 py-1 rounded"
+              title="Fetch the radio's firmware /json/report — battery, WiFi RSSI, uptime, memory, channel airtime"
+            >
+              Status
+            </button>
           )}
           {/* Promote to Singleton: hot-swaps which radio holds the live
               singleton bridge. The current singleton gets disconnected and
