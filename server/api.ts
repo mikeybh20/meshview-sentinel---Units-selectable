@@ -1468,20 +1468,30 @@ app.get('/api/mesh/snapshot', (_req, res) => {
   // /api/mesh/channels?radio_id=<default> endpoint returned — so the
   // sidebar's "default radio" view showed someone else's channels.
   const defaultBridge = bridgeManager.getDefault()?.bridge ?? meshBridge;
+  // v2.0 Beta 3 bugfix: ALL "the local radio's …" fields route through the
+  // default-radio bridge from BridgeManager, NOT meshBridge directly. Same
+  // root cause as the channels fix above — meshBridge can be silently
+  // rebound by /api/mesh/connect/tcp and end up holding stale or
+  // wrong-radio state. radioConnected + localNodeId driving MailView /
+  // RadioStatus gating on the wrong bridge made the BBS Mail page show
+  // "MAIL UNAVAILABLE — Waiting for the local radio to identify itself"
+  // even with two radios visibly connected. waypoints / traces /
+  // neighborInfo / store-forward / module-config / groups all sourced
+  // from the same authoritative bridge.
   return res.json({
-    nodes:    useAgg ? bridgeManager.getAllNodes()    : meshBridge.getNodes(),
-    messages: useAgg ? bridgeManager.getAllMessages() : meshBridge.getMessages(),
-    events:   useAgg ? bridgeManager.getAllEvents()   : meshBridge.getEvents(),
+    nodes:    useAgg ? bridgeManager.getAllNodes()    : defaultBridge.getNodes(),
+    messages: useAgg ? bridgeManager.getAllMessages() : defaultBridge.getMessages(),
+    events:   useAgg ? bridgeManager.getAllEvents()   : defaultBridge.getEvents(),
     channels: defaultBridge.getChannels(),
-    waypoints: meshBridge.getWaypoints(),
-    traces: meshBridge.getTraces(),
-    neighborInfo: meshBridge.getNeighborInfo(),
-    storeForwardRouters: meshBridge.getStoreForwardRouters(),
-    localModuleConfig: meshBridge.getLocalModuleConfig(),
-    groups: meshBridge.getGroups(),
+    waypoints: defaultBridge.getWaypoints(),
+    traces: defaultBridge.getTraces(),
+    neighborInfo: defaultBridge.getNeighborInfo(),
+    storeForwardRouters: defaultBridge.getStoreForwardRouters(),
+    localModuleConfig: defaultBridge.getLocalModuleConfig(),
+    groups: defaultBridge.getGroups(),
     blocked,
-    radioConnected: meshBridge.connected,
-    localNodeId: meshBridge.getLocalNodeId(),
+    radioConnected: defaultBridge.connected,
+    localNodeId: defaultBridge.getLocalNodeId(),
   });
 });
 
