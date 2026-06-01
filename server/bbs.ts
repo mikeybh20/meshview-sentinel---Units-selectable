@@ -44,8 +44,8 @@ const STATE_TIMEOUT_MS_FALLBACK = 300_000;
 const PUSH_CHANNEL_FALLBACK = 0;
 
 type SessionState =
-  | { kind: 'awaiting-recipient'; enteredAt: number; channelIndex: number }
-  | { kind: 'awaiting-recipient-pick'; enteredAt: number; channelIndex: number; candidates: MeshNode[] }
+  | { kind: 'awaiting-recipient'; enteredAt: number; channelIndex: number; pendingBody?: string }
+  | { kind: 'awaiting-recipient-pick'; enteredAt: number; channelIndex: number; candidates: MeshNode[]; pendingBody?: string }
   | { kind: 'awaiting-body'; enteredAt: number; channelIndex: number; recipientNodeId: string; recipientShortName: string }
   | { kind: 'reading'; enteredAt: number; channelIndex: number; currentMailId: number };
 
@@ -235,7 +235,13 @@ export class BbsService {
 
   private async startSend(fromId: string, channelIndex: number): Promise<boolean> {
     this.sessions.set(fromId, { kind: 'awaiting-recipient', enteredAt: Date.now(), channelIndex });
-    await this.reply(fromId, 'Send TO: short name (4 chars) or X.', channelIndex);
+    // v2.0 Beta 3: explicit "recipient first" wording. The old "Send TO: short
+    // name (4 chars) or X." prompt left operators thinking the next thing
+    // they typed was the body — and the body would then get silently
+    // truncated to its first 4 chars and looked up as a recipient name. The
+    // fallback path in handleRecipientText now catches that case + caches
+    // the body, but a clearer prompt up front prevents the confusion at all.
+    await this.reply(fromId, 'TO whom? Reply with 4-char name (e.g. BH20) or X to cancel. Body comes after.', channelIndex);
     return true;
   }
 
@@ -304,6 +310,15 @@ export class BbsService {
   // ---- Recipient resolution ----
 
   private async handleRecipientText(fromId: string, text: string, channelIndex: number): Promise<boolean> {
+    const session = this.sessions.get(fromId);
+    // Carry pendingBody forward across re-prompts so the operator only types
+    // it once. Set only on awaiting-recipient(-pick) sessions; cleared once
+    // we hand off to storeMail or to awaiting-body.
+    const pendingBody = (session?.kind === 'awaiting-recipient' || session?.kind === 'awaiting-recipient-pick')
+      ? session.pendingBody
+      : undefined;
+    const senderShortName = this.bridge.getNodes().find(n => n.id === fromId)?.shortName || fromId.slice(-4);
+
     // Hex id form (!02eb3bec) — bypass short-name lookup.
     if (/^![0-9a-f]{8}$/i.test(text)) {
       const targetId = text.toLowerCase();
@@ -312,17 +327,49 @@ export class BbsService {
         await this.reply(fromId, `No node ${targetId} on mesh.`, channelIndex);
         return true;
       }
-      return this.advanceToBody(fromId, node, channelIndex);
+      return pendingBody
+        ? this.storeMail(fromId, senderShortName, node.id, node.shortName || node.id.slice(-4), pendingBody, channelIndex)
+        : this.advanceToBody(fromId, node, channelIndex);
     }
 
     // Pick-by-number flow if we previously offered candidates.
-    const session = this.sessions.get(fromId);
     if (session?.kind === 'awaiting-recipient-pick' && session.candidates.length > 0) {
       const idx = parseInt(text, 10) - 1;
       if (Number.isFinite(idx) && idx >= 0 && idx < session.candidates.length) {
-        return this.advanceToBody(fromId, session.candidates[idx], channelIndex);
+        const recipient = session.candidates[idx];
+        return pendingBody
+          ? this.storeMail(fromId, senderShortName, recipient.id, recipient.shortName || recipient.id.slice(-4), pendingBody, channelIndex)
+          : this.advanceToBody(fromId, recipient, channelIndex);
       }
       // Not a number? Treat as a fresh short-name lookup.
+    }
+
+    // v2.0 Beta 3: detect "this input is clearly a body, not a 4-char name."
+    // A valid Meshtastic short name is 1-4 chars and is a single token (no
+    // spaces). If the operator dumps a real message at this prompt — what
+    // they expected to be the body field, since the UI looks like iMessage
+    // — cache it as pendingBody and re-prompt for the recipient instead of
+    // truncating to the first 4 chars and silently losing their typing.
+    // Bypass when we ALREADY have a pendingBody cached so they don't
+    // accidentally overwrite it by typing twice.
+    const looksLikeBody = !pendingBody && (text.length > 4 || /\s/.test(text));
+    if (looksLikeBody) {
+      const recent = this.recentOnlineNames(fromId);
+      this.sessions.set(fromId, {
+        kind: 'awaiting-recipient',
+        enteredAt: Date.now(),
+        channelIndex,
+        pendingBody: text.slice(0, this.config.bodyMaxChars),
+      });
+      const truncNote = text.length > this.config.bodyMaxChars
+        ? ` (trimmed to ${this.config.bodyMaxChars}c)`
+        : '';
+      await this.reply(
+        fromId,
+        `Body saved (${Math.min(text.length, this.config.bodyMaxChars)}c)${truncNote}. TO whom? 4-char name. Online: ${recent || '(none)'}.`,
+        channelIndex,
+      );
+      return true;
     }
 
     // Short-name lookup.
@@ -332,19 +379,17 @@ export class BbsService {
     );
 
     if (matches.length === 0) {
-      const recent = this.bridge.getNodes()
-        .filter(n => n.online && n.id !== fromId)
-        .sort((a, b) => b.lastSeen - a.lastSeen)
-        .slice(0, 6)
-        .map(n => n.shortName)
-        .filter(Boolean)
-        .join(' ');
-      await this.reply(fromId, `No '${wanted}'. Online: ${recent || '(none)'}.`, channelIndex);
+      const recent = this.recentOnlineNames(fromId);
+      const bodyHint = pendingBody ? ' Body still saved.' : '';
+      await this.reply(fromId, `No '${wanted}'. Online: ${recent || '(none)'}.${bodyHint}`, channelIndex);
       return true;
     }
 
     if (matches.length === 1) {
-      return this.advanceToBody(fromId, matches[0], channelIndex);
+      const recipient = matches[0];
+      return pendingBody
+        ? this.storeMail(fromId, senderShortName, recipient.id, recipient.shortName || recipient.id.slice(-4), pendingBody, channelIndex)
+        : this.advanceToBody(fromId, recipient, channelIndex);
     }
 
     // Multiple — disambiguate.
@@ -356,9 +401,22 @@ export class BbsService {
       enteredAt: Date.now(),
       channelIndex,
       candidates: matches.slice(0, 4),
+      pendingBody,
     });
     await this.reply(fromId, `${matches.length} '${wanted}': ${listing}. Reply 1-${Math.min(4, matches.length)}.`, channelIndex);
     return true;
+  }
+
+  /** Helper: comma-less list of recent-online short names for the
+   *  "Online: …" hint in error replies. Skips the sender themselves. */
+  private recentOnlineNames(fromId: string): string {
+    return this.bridge.getNodes()
+      .filter(n => n.online && n.id !== fromId)
+      .sort((a, b) => b.lastSeen - a.lastSeen)
+      .slice(0, 6)
+      .map(n => n.shortName)
+      .filter(Boolean)
+      .join(' ');
   }
 
   private async advanceToBody(fromId: string, recipient: MeshNode, channelIndex: number): Promise<boolean> {
