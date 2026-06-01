@@ -555,6 +555,22 @@ function DataSection({ onOpenExport, onOpenImport, onClose }: SettingsModalProps
   );
 }
 
+/** Sections an operator can opt out of when restoring. Each key matches the
+ *  server's `sections` field; default-true means "include in restore" (no
+ *  toggle change = restore everything, same as before this feature shipped). */
+const RESTORE_SECTIONS = [
+  { key: 'radios',                label: 'Radios + transports' },
+  { key: 'channels',              label: 'Channels (incl. PSKs)' },
+  { key: 'bbsConfig',             label: 'BBS config' },
+  { key: 'groups',                label: 'Node groups' },
+  { key: 'waypoints',             label: 'Waypoints' },
+  { key: 'blockedNodes',          label: 'Block list' },
+  { key: 'bbsMail',               label: 'BBS mail history' },
+  { key: 'bbsWeatherSubscribers', label: 'Weather subscribers' },
+  { key: 'tcpEndpoint',           label: 'TCP auto-reconnect endpoint' },
+  { key: 'history',               label: 'History (messages, events, telemetry, …)' },
+] as const;
+
 function ConfigBackupSection() {
   const [exportPass, setExportPass] = React.useState('');
   const [restorePass, setRestorePass] = React.useState('');
@@ -563,6 +579,13 @@ function ConfigBackupSection() {
   const [busy, setBusy] = React.useState(false);
   const fileRef = React.useRef<HTMLInputElement | null>(null);
   const [pendingEnvelope, setPendingEnvelope] = React.useState<any>(null);
+  // Sections to RESTORE (default everything on). Used to drive the
+  // selective-restore checkboxes. Stays in sync with the keys the server
+  // recognizes in /api/mesh/restore's `sections` body field.
+  const [restoreSections, setRestoreSections] = React.useState<Record<string, boolean>>(
+    () => Object.fromEntries(RESTORE_SECTIONS.map(s => [s.key, true]))
+  );
+  const allOn = RESTORE_SECTIONS.every(s => restoreSections[s.key]);
 
   const doExport = async () => {
     setMsg(null);
@@ -621,10 +644,15 @@ function ConfigBackupSection() {
     )) return;
     setBusy(true);
     try {
+      // Send the `sections` body only when the operator changed at least
+      // one toggle (selective restore). All-on collapses to undefined so
+      // the server takes its default-everything path and the existing
+      // back-compat behavior is preserved exactly.
+      const sections = allOn ? undefined : restoreSections;
       const res = await fetch(`${API_BASE}/api/mesh/restore`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ passphrase: restorePass, envelope: pendingEnvelope }),
+        body: JSON.stringify({ passphrase: restorePass, envelope: pendingEnvelope, sections }),
       });
       const b = await res.json().catch(() => ({}));
       if (!res.ok) { setMsg({ tone: 'err', text: b.error || `HTTP ${res.status}` }); return; }
@@ -729,6 +757,45 @@ function ConfigBackupSection() {
             placeholder="Backup passphrase"
             className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs text-brand-ink"
           />
+          {/* Selective-restore section toggles. Default all-on (back-compat
+              with the original all-or-nothing restore); turn one off to
+              skip that section. */}
+          {pendingEnvelope && (
+            <details className="bg-brand-bg/40 border border-brand-line rounded">
+              <summary className="cursor-pointer px-2 py-1.5 text-[10px] font-bold uppercase tracking-widest text-brand-muted hover:text-brand-ink">
+                Sections to restore ({Object.values(restoreSections).filter(Boolean).length}/{RESTORE_SECTIONS.length})
+              </summary>
+              <div className="border-t border-brand-line px-2 py-2 space-y-1">
+                {RESTORE_SECTIONS.map(s => (
+                  <label key={s.key} className="flex items-center gap-2 text-[10px] text-brand-ink cursor-pointer hover:text-brand-accent">
+                    <input
+                      type="checkbox"
+                      checked={!!restoreSections[s.key]}
+                      onChange={e => setRestoreSections(prev => ({ ...prev, [s.key]: e.target.checked }))}
+                      className="accent-brand-accent"
+                    />
+                    <span>{s.label}</span>
+                  </label>
+                ))}
+                <div className="flex gap-2 pt-1 border-t border-brand-line/40">
+                  <button
+                    type="button"
+                    onClick={() => setRestoreSections(Object.fromEntries(RESTORE_SECTIONS.map(s => [s.key, true])))}
+                    className="text-[10px] text-brand-muted hover:text-brand-ink"
+                  >
+                    All
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setRestoreSections(Object.fromEntries(RESTORE_SECTIONS.map(s => [s.key, false])))}
+                    className="text-[10px] text-brand-muted hover:text-brand-ink"
+                  >
+                    None
+                  </button>
+                </div>
+              </div>
+            </details>
+          )}
           <button
             onClick={doRestore}
             disabled={busy || !pendingEnvelope}

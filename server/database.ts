@@ -1314,8 +1314,33 @@ export class MeshDatabase {
       throw new Error(`table "${table}" is not exportable`);
     }
     if (!Array.isArray(rows) || rows.length === 0) return 0;
-    const cols = Object.keys(rows[0]);
-    if (cols.length === 0) return 0;
+
+    // v2.0 Beta 4 (Item 10): schema-drift recovery. If the backup envelope
+    // was produced by a newer build with extra columns (or has stale
+    // columns from an older build that we've since dropped), the raw row
+    // would fail to INSERT against the current schema with "no column
+    // named X" or "table has no column …". Intersect the backup's
+    // first-row columns with the current schema's actual columns before
+    // building the INSERT statement. Anything in the backup but missing
+    // here gets dropped silently with a one-time log; anything in the
+    // current schema but missing from the backup is left to its column
+    // default (or NULL). Rows still INSERT OR REPLACE — same upsert
+    // semantics as before, just on the column subset that exists in both.
+    const liveCols = new Set<string>(
+      (this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>)
+        .map(r => r.name)
+    );
+    const backupCols = Object.keys(rows[0]);
+    const cols = backupCols.filter(c => liveCols.has(c));
+    if (cols.length === 0) {
+      console.warn(`[MeshDB] loadTable ${table}: no column overlap between backup and current schema, skipping table`);
+      return 0;
+    }
+    const dropped = backupCols.filter(c => !liveCols.has(c));
+    if (dropped.length > 0) {
+      console.warn(`[MeshDB] loadTable ${table}: dropping ${dropped.length} unknown column(s) from backup: ${dropped.join(', ')}`);
+    }
+
     const placeholders = cols.map(c => `@${c}`).join(', ');
     const colList = cols.join(', ');
     const stmt = this.db.prepare(`INSERT OR REPLACE INTO ${table} (${colList}) VALUES (${placeholders})`);
@@ -1323,14 +1348,20 @@ export class MeshDatabase {
       if (opts?.truncate) this.db.prepare(`DELETE FROM ${table}`).run();
       let n = 0;
       for (const row of batch) {
-        // Defensive: skip rows missing keys we'd reference. Better to lose
-        // one bad row than abort the whole table restore.
+        // Build a row object containing ONLY the columns we'll bind. If
+        // the source row is missing a current-schema column entirely,
+        // bind null for it so the prepared statement's @-bindings still
+        // resolve cleanly.
+        const filtered: any = {};
+        for (const c of cols) filtered[c] = row[c] ?? null;
         try {
-          stmt.run(row);
+          stmt.run(filtered);
           n++;
         } catch (e: any) {
-          // Surface but continue. INSERT OR REPLACE rarely fails except
-          // on unrecognized columns from a schema drift across versions.
+          // Should be rare now that columns are pre-filtered; remaining
+          // failures are typically PK / NOT NULL constraints from data
+          // shape divergence (e.g., a NOT NULL column added since the
+          // backup that has no default).
           console.warn(`[MeshDB] loadTable ${table}: skipped row — ${e.message}`);
         }
       }

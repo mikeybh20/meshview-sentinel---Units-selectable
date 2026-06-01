@@ -1068,6 +1068,23 @@ app.post('/api/mesh/restore', (req, res) => {
   if (!envelope || typeof envelope !== 'object') {
     return res.status(400).json({ error: 'envelope is required' });
   }
+  // v2.0 Beta 4 (Item 9): selective restore. Body `sections` opts in to
+  // each section by name. Omitting `sections` (or sending `sections: true`)
+  // restores everything in the envelope — back-compat with the original
+  // all-or-nothing API.
+  //
+  //   sections: { radios, channels, bbsConfig, groups, waypoints,
+  //               blockedNodes, bbsMail, bbsWeatherSubscribers,
+  //               tcpEndpoint, history }
+  //
+  // Each key is boolean; missing or false → skip that section. Useful
+  // when an operator wants to copy channels from one install to another
+  // without clobbering the target's radios registry / BBS mail / etc.
+  const sectionsRaw = req.body?.sections;
+  const allOn = sectionsRaw === undefined || sectionsRaw === true;
+  const sections = allOn ? null : (typeof sectionsRaw === 'object' && sectionsRaw !== null ? sectionsRaw : {});
+  const wants = (key: string): boolean => allOn ? true : !!sections?.[key];
+
   let payload: any;
   try {
     payload = openBackup(envelope, passphrase);
@@ -1082,34 +1099,43 @@ app.post('/api/mesh/restore', (req, res) => {
   // the same way — only the v2 additions are version-gated.
   const version = typeof payload.version === 'number' ? payload.version : 1;
 
-  const summary: Record<string, number | boolean> = {
+  const summary: Record<string, number | boolean | string[]> = {
     radios: 0, channels: 0, bbsConfig: false,
     groups: 0, waypoints: 0, blockedNodes: 0,
     bbsMail: 0, bbsWeatherSubscribers: 0,
     tcpEndpoint: false,
     history: 0,
   };
+  const skipped: string[] = [];
 
   try {
     const db = meshDb();
 
     // ---- v1 fields ----
-    if (Array.isArray(payload.radios)) {
+    if (wants('radios') && Array.isArray(payload.radios)) {
       for (const r of payload.radios) { db.upsertRadio(r); summary.radios = (summary.radios as number) + 1; }
+    } else if (Array.isArray(payload.radios)) {
+      skipped.push('radios');
     }
-    if (Array.isArray(payload.channels)) {
+    if (wants('channels') && Array.isArray(payload.channels)) {
       for (const c of payload.channels) { db.upsertChannel(c); summary.channels = (summary.channels as number) + 1; }
+    } else if (Array.isArray(payload.channels)) {
+      skipped.push('channels');
     }
-    if (payload.bbsConfig && typeof payload.bbsConfig === 'object') {
+    if (wants('bbsConfig') && payload.bbsConfig && typeof payload.bbsConfig === 'object') {
       bbsConfig = normalizeBbsConfig(payload.bbsConfig);
       saveBbsConfig(bbsConfig);
       bridgeManager.setBbsConfig(bbsConfig);
       summary.bbsConfig = true;
+    } else if (payload.bbsConfig) {
+      skipped.push('bbsConfig');
     }
 
     // ---- v2 core ----
     if (version >= 2 && payload.core && typeof payload.core === 'object') {
-      const fieldMap: Record<string, string> = {
+      // Table name → frontend section key. Pairs to one summary slot and one
+      // selective-restore opt-in flag.
+      const sectionMap: Record<string, string> = {
         groups: 'groups',
         waypoints: 'waypoints',
         blocked_nodes: 'blockedNodes',
@@ -1119,15 +1145,18 @@ app.post('/api/mesh/restore', (req, res) => {
       for (const t of BACKUP_TABLES_CORE) {
         const rows = payload.core[t];
         if (!Array.isArray(rows)) continue;
-        const n = db.loadTable(t, rows);
-        summary[fieldMap[t]] = n;
+        const key = sectionMap[t];
+        if (!wants(key)) { skipped.push(key); continue; }
+        summary[key] = db.loadTable(t, rows);
       }
     }
 
     // ---- v2 TCP endpoint ----
     if (version >= 2 && payload.tcpEndpoint && typeof payload.tcpEndpoint === 'object') {
       const ep = payload.tcpEndpoint;
-      if (typeof ep.host === 'string' && Number.isFinite(ep.port)) {
+      if (!wants('tcpEndpoint')) {
+        skipped.push('tcpEndpoint');
+      } else if (typeof ep.host === 'string' && Number.isFinite(ep.port)) {
         saveTcpEndpoint({ host: ep.host, port: Math.floor(ep.port) });
         summary.tcpEndpoint = true;
       }
@@ -1135,18 +1164,23 @@ app.post('/api/mesh/restore', (req, res) => {
 
     // ---- v2 history (opt-in side; if present in envelope, restore it) ----
     if (version >= 2 && payload.history && typeof payload.history === 'object') {
-      let total = 0;
-      for (const t of BACKUP_TABLES_HISTORY) {
-        const rows = payload.history[t];
-        if (!Array.isArray(rows)) continue;
-        // Truncate first — history tables are append-only and merging with
-        // existing rows risks PK collisions / phantom dupes from different
-        // installs. The operator-confirmed restore overwrites by intent.
-        total += db.loadTable(t, rows, { truncate: true });
+      if (!wants('history')) {
+        skipped.push('history');
+      } else {
+        let total = 0;
+        for (const t of BACKUP_TABLES_HISTORY) {
+          const rows = payload.history[t];
+          if (!Array.isArray(rows)) continue;
+          // Truncate first — history tables are append-only and merging with
+          // existing rows risks PK collisions / phantom dupes from different
+          // installs. The operator-confirmed restore overwrites by intent.
+          total += db.loadTable(t, rows, { truncate: true });
+        }
+        summary.history = total;
       }
-      summary.history = total;
     }
 
+    summary.skipped = skipped;
     return res.json({ ok: true, restored: summary, version });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
