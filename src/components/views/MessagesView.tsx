@@ -200,7 +200,7 @@ function MessageStatusIcon({ status, errorCode, onRetry, isBroadcast }: {
 export function MessagesView({
   nodes,
   messages,
-  channels,
+  channels: channelsProp,
   filteredMessages,
   activeChatId,
   setActiveChatId,
@@ -254,6 +254,26 @@ export function MessagesView({
     return m;
   }, [radios]);
   const showRadioChips = radios.length > 1;
+
+  // v2.0 Beta 3: when the operator selects a non-default radio in the top
+  // bar, swap the channel list for that radio's channels. Different radios
+  // are subscribed to different LoRa channels (frequency slot + channel set),
+  // so the Messages page should reflect whichever radio the operator is
+  // focused on. The default-radio case falls through to the SSE-driven
+  // `channelsProp` (the singleton's channels, already kept up to date).
+  const [secondaryChannels, setSecondaryChannels] = React.useState<Channel[] | null>(null);
+  React.useEffect(() => {
+    if (!selectedRadioId || selectedRadioId === defaultRadioId) {
+      setSecondaryChannels(null);
+      return;
+    }
+    let cancelled = false;
+    meshDataService.fetchChannelsForRadio(selectedRadioId).then(list => {
+      if (!cancelled) setSecondaryChannels(list ?? []);
+    });
+    return () => { cancelled = true; };
+  }, [selectedRadioId, defaultRadioId]);
+  const channels = secondaryChannels ?? channelsProp;
 
   // v2.0 Beta 2: canned-message quick-send palette. Pulls the preset list
   // from the radio the compose box will actually send through (the selected
