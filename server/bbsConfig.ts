@@ -36,6 +36,13 @@ export interface BbsConfig {
   /** Minimum gap between successive BBS replies to the same destination, in ms.
    *  Lower values risk firmware rate-limit rejection (err=38). */
   replyPaceMs: number;
+  /** Per-session idle timeout in seconds. After this much time without a
+   *  message from the operator, the session is reaped — most importantly,
+   *  while typing a mail body. Beta 2 shipped 30s which was way too short
+   *  for typing a ~200-char body on mobile; bumped to 300s default in
+   *  Beta 3 with a 30..1800s clamp so operators on slow phones still have
+   *  time, but stale half-finished sessions don't pile up forever. */
+  sessionTimeoutSecs: number;
   /** 5-digit US ZIP for home-area weather alert polling. Empty disables the
    *  alert poller (the :weather command is unaffected). */
   homeZipCode: string;
@@ -48,6 +55,7 @@ const DEFAULTS: BbsConfig = {
   bodyMaxChars: 200,
   retentionDays: 30,
   replyPaceMs: 2_000,
+  sessionTimeoutSecs: 300,
   homeZipCode: '',
 };
 
@@ -78,6 +86,10 @@ export function normalizeBbsConfig(partial: Partial<BbsConfig>): BbsConfig {
   merged.bodyMaxChars = clamp(merged.bodyMaxChars, 50, 228, DEFAULTS.bodyMaxChars);
   merged.retentionDays = clamp(merged.retentionDays, 1, 365, DEFAULTS.retentionDays);
   merged.replyPaceMs = clamp(merged.replyPaceMs, 0, 10_000, DEFAULTS.replyPaceMs);
+  // 30s minimum so the reaper still cleans up genuinely abandoned sessions;
+  // 30min cap so a forgotten "S → typed a few chars then put phone down" can't
+  // hold a slot indefinitely.
+  merged.sessionTimeoutSecs = clamp(merged.sessionTimeoutSecs, 30, 1800, DEFAULTS.sessionTimeoutSecs);
 
   // ZIP: 5 digits or empty.
   const zip = String(merged.homeZipCode ?? '').trim();

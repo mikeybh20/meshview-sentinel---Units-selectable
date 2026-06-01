@@ -31,7 +31,13 @@ import { weatherService } from './weather.js';
 
 const meshDb: MeshDatabase = meshDbFactory();
 
-const STATE_TIMEOUT_MS = 30_000;
+// v2.0 Beta 3: session idle timeout is now driven by BbsConfig.sessionTimeoutSecs
+// (default 300s, clamped 30..1800s). The legacy 30s default was way too short
+// for typing a ~200-char mail body on mobile — by the time the operator
+// finished typing, the reaper had already swept the session and the body
+// arrived to a BBS that no longer recognized them mid-flow. Kept here as the
+// fallback when the runtime config hasn't been pushed yet.
+const STATE_TIMEOUT_MS_FALLBACK = 300_000;
 /** Fallback channel index for push notifications when we don't know which
  *  channel a recipient shares with us. 0 = PRIMARY, the only universally
  *  shared channel on a default Meshtastic install. */
@@ -606,7 +612,10 @@ export class BbsService {
   }
 
   private reapStaleSessions() {
-    const cutoff = Date.now() - STATE_TIMEOUT_MS;
+    const timeoutMs = (this.config.sessionTimeoutSecs ?? 0) > 0
+      ? this.config.sessionTimeoutSecs * 1000
+      : STATE_TIMEOUT_MS_FALLBACK;
+    const cutoff = Date.now() - timeoutMs;
     for (const [id, s] of this.sessions) {
       if (s.enteredAt < cutoff) this.sessions.delete(id);
     }
