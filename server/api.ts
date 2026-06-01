@@ -941,19 +941,72 @@ app.get('/api/gpu/health', async (_req, res) => {
   return res.json(h);
 });
 
-// --- v2.0 Beta 2: encrypted config backup / restore ---
-// Bundles the radios registry + channels (with PSKs) + BBS config into a
-// passphrase-sealed AES-256-GCM envelope. See [backup.ts](./backup.ts).
+// --- v2.0 Beta 2 / Beta 3: encrypted full-state backup / restore ---
+// Bundles everything operator-side into a passphrase-sealed AES-256-GCM
+// envelope so a Sentinel install can be lifted-and-shifted to a new host.
+// See [backup.ts](./backup.ts) for the crypto envelope; this file decides
+// what goes IN it.
+//
+// Payload structure (v2):
+//
+//   Always-included operator data — small, painful to re-enter:
+//     radios               radios registry (transport, target, color, etc.)
+//     channels             channel slots with PSKs (firmware uploads them)
+//     bbsConfig            BBS triggers / pacing / ZIP / session timeout
+//     groups               operator-defined node groups + colors
+//     waypoints            operator-dropped map waypoints
+//     blockedNodes         block list
+//     bbsMail              mail history (small text rows)
+//     bbsWeatherSubscribers   weather subscribers
+//     tcpEndpoint          singleton TCP host:port (auto-reconnect target)
+//
+//   Optional history (opt-in via ?includeHistory=true):
+//     nodes                NodeDB cache (rebuilds from radio reconnect)
+//     messages             chat history
+//     events               event log
+//     telemetry            telemetry samples
+//     neighborInfo         NeighborInfo packets
+//     storeForwardRouters  S&F router cache
+//     positionHistory      per-node position log
+//     traceResults         RouteDiscovery traces
+//     rangeTestObservations  Range Test rows
+//
+// Restore is Sentinel-side only — it rewrites local tables + the
+// tcp-endpoint config file. It does NOT push anything to radio firmware;
+// devices keep their own state and reconnecting re-reads it.
+const BACKUP_TABLES_CORE = [
+  'groups', 'waypoints', 'blocked_nodes',
+  'bbs_mail', 'bbs_weather_subscribers',
+] as const;
+const BACKUP_TABLES_HISTORY = [
+  'nodes', 'messages', 'events', 'telemetry',
+  'neighbor_info', 'store_forward_routers',
+  'position_history', 'trace_results', 'range_test_observations',
+] as const;
+
 app.post('/api/mesh/backup', (req, res) => {
   const passphrase = String(req.body?.passphrase ?? '');
+  const includeHistory = !!req.body?.includeHistory;
   try {
+    const db = meshDb();
+    const core: Record<string, any[]> = {};
+    for (const t of BACKUP_TABLES_CORE) core[t] = db.dumpTable(t);
+    const history: Record<string, any[]> | undefined = includeHistory
+      ? Object.fromEntries(BACKUP_TABLES_HISTORY.map(t => [t, db.dumpTable(t)]))
+      : undefined;
     const payload = {
       kind: 'meshview-sentinel-backup',
+      version: 2,
       exportedAt: Date.now(),
       systemVersion: SYSTEM_VERSION,
-      radios: meshDb().listRadios(),
-      channels: meshDb().loadChannels(),
+      // v1 fields (still emitted for back-compat — old restorers can read them)
+      radios: db.listRadios(),
+      channels: db.loadChannels(),
       bbsConfig,
+      // v2 additions
+      core,
+      tcpEndpoint: loadTcpEndpoint(),
+      history,
     };
     const envelope = sealBackup(payload, passphrase);
     res.setHeader('Content-Type', 'application/json');
@@ -979,16 +1032,28 @@ app.post('/api/mesh/restore', (req, res) => {
   if (payload?.kind !== 'meshview-sentinel-backup') {
     return res.status(400).json({ error: 'not a Sentinel backup envelope' });
   }
-  // Restore is Sentinel-side only: rewrites the radios table, channels cache,
-  // and BBS config. Does NOT push anything to radio firmware — devices keep
-  // their own config; reconnecting re-reads their actual channel state.
-  const summary = { radios: 0, channels: 0, bbsConfig: false };
+  // v1 envelopes have no `version` field; v2+ sets it explicitly. Either
+  // way the v1 fields (radios/channels/bbsConfig) are present and restored
+  // the same way — only the v2 additions are version-gated.
+  const version = typeof payload.version === 'number' ? payload.version : 1;
+
+  const summary: Record<string, number | boolean> = {
+    radios: 0, channels: 0, bbsConfig: false,
+    groups: 0, waypoints: 0, blockedNodes: 0,
+    bbsMail: 0, bbsWeatherSubscribers: 0,
+    tcpEndpoint: false,
+    history: 0,
+  };
+
   try {
+    const db = meshDb();
+
+    // ---- v1 fields ----
     if (Array.isArray(payload.radios)) {
-      for (const r of payload.radios) { meshDb().upsertRadio(r); summary.radios++; }
+      for (const r of payload.radios) { db.upsertRadio(r); summary.radios = (summary.radios as number) + 1; }
     }
     if (Array.isArray(payload.channels)) {
-      for (const c of payload.channels) { meshDb().upsertChannel(c); summary.channels++; }
+      for (const c of payload.channels) { db.upsertChannel(c); summary.channels = (summary.channels as number) + 1; }
     }
     if (payload.bbsConfig && typeof payload.bbsConfig === 'object') {
       bbsConfig = normalizeBbsConfig(payload.bbsConfig);
@@ -996,7 +1061,48 @@ app.post('/api/mesh/restore', (req, res) => {
       bridgeManager.setBbsConfig(bbsConfig);
       summary.bbsConfig = true;
     }
-    return res.json({ ok: true, restored: summary });
+
+    // ---- v2 core ----
+    if (version >= 2 && payload.core && typeof payload.core === 'object') {
+      const fieldMap: Record<string, string> = {
+        groups: 'groups',
+        waypoints: 'waypoints',
+        blocked_nodes: 'blockedNodes',
+        bbs_mail: 'bbsMail',
+        bbs_weather_subscribers: 'bbsWeatherSubscribers',
+      };
+      for (const t of BACKUP_TABLES_CORE) {
+        const rows = payload.core[t];
+        if (!Array.isArray(rows)) continue;
+        const n = db.loadTable(t, rows);
+        summary[fieldMap[t]] = n;
+      }
+    }
+
+    // ---- v2 TCP endpoint ----
+    if (version >= 2 && payload.tcpEndpoint && typeof payload.tcpEndpoint === 'object') {
+      const ep = payload.tcpEndpoint;
+      if (typeof ep.host === 'string' && Number.isFinite(ep.port)) {
+        saveTcpEndpoint({ host: ep.host, port: Math.floor(ep.port) });
+        summary.tcpEndpoint = true;
+      }
+    }
+
+    // ---- v2 history (opt-in side; if present in envelope, restore it) ----
+    if (version >= 2 && payload.history && typeof payload.history === 'object') {
+      let total = 0;
+      for (const t of BACKUP_TABLES_HISTORY) {
+        const rows = payload.history[t];
+        if (!Array.isArray(rows)) continue;
+        // Truncate first — history tables are append-only and merging with
+        // existing rows risks PK collisions / phantom dupes from different
+        // installs. The operator-confirmed restore overwrites by intent.
+        total += db.loadTable(t, rows, { truncate: true });
+      }
+      summary.history = total;
+    }
+
+    return res.json({ ok: true, restored: summary, version });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
   }

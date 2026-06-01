@@ -1272,6 +1272,73 @@ export class MeshDatabase {
     };
   }
 
+  // -------------------------------------------------------------------
+  // v2.0 Beta 3: full-fidelity backup helpers.
+  //
+  // The encrypted-backup endpoint started life capturing only the radios
+  // registry + channels + BBS config (enough to migrate a fresh install
+  // and let it decrypt the same mesh). For a real "move this dev console
+  // to my long-term host" workflow that's not enough — operator data
+  // (groups, waypoints, block list, BBS mail, weather subscribers) lives
+  // in the SQLite DB and would be lost.
+  //
+  // `dumpTable` returns raw SQLite rows for a single table by name; the
+  // backup endpoint composes those into a versioned envelope. We gate on
+  // an explicit allowlist of table names so the public surface can't be
+  // tricked into SELECT-ing from arbitrary identifiers.
+  //
+  // `loadTable` reverses the dump: INSERT OR REPLACE for each row using
+  // the columns present on the first row. Returns the count inserted.
+  // Use within a transaction at the call site for atomicity.
+  // -------------------------------------------------------------------
+
+  private static readonly EXPORTABLE_TABLES = new Set([
+    'radios', 'channels',
+    'groups', 'waypoints', 'blocked_nodes',
+    'bbs_mail', 'bbs_weather_subscribers',
+    // history (opt-in)
+    'nodes', 'messages', 'events', 'telemetry',
+    'neighbor_info', 'store_forward_routers',
+    'position_history', 'trace_results', 'range_test_observations',
+  ]);
+
+  dumpTable(table: string): any[] {
+    if (!MeshDatabase.EXPORTABLE_TABLES.has(table)) {
+      throw new Error(`table "${table}" is not exportable`);
+    }
+    return this.db.prepare(`SELECT * FROM ${table}`).all() as any[];
+  }
+
+  loadTable(table: string, rows: any[], opts?: { truncate?: boolean }): number {
+    if (!MeshDatabase.EXPORTABLE_TABLES.has(table)) {
+      throw new Error(`table "${table}" is not exportable`);
+    }
+    if (!Array.isArray(rows) || rows.length === 0) return 0;
+    const cols = Object.keys(rows[0]);
+    if (cols.length === 0) return 0;
+    const placeholders = cols.map(c => `@${c}`).join(', ');
+    const colList = cols.join(', ');
+    const stmt = this.db.prepare(`INSERT OR REPLACE INTO ${table} (${colList}) VALUES (${placeholders})`);
+    const tx = this.db.transaction((batch: any[]) => {
+      if (opts?.truncate) this.db.prepare(`DELETE FROM ${table}`).run();
+      let n = 0;
+      for (const row of batch) {
+        // Defensive: skip rows missing keys we'd reference. Better to lose
+        // one bad row than abort the whole table restore.
+        try {
+          stmt.run(row);
+          n++;
+        } catch (e: any) {
+          // Surface but continue. INSERT OR REPLACE rarely fails except
+          // on unrecognized columns from a schema drift across versions.
+          console.warn(`[MeshDB] loadTable ${table}: skipped row — ${e.message}`);
+        }
+      }
+      return n;
+    });
+    return tx(rows);
+  }
+
   /**
    * Comprehensive per-table inventory for the Settings → Disk panel.
    *

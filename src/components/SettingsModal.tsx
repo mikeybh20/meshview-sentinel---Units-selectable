@@ -558,6 +558,7 @@ function DataSection({ onOpenExport, onOpenImport, onClose }: SettingsModalProps
 function ConfigBackupSection() {
   const [exportPass, setExportPass] = React.useState('');
   const [restorePass, setRestorePass] = React.useState('');
+  const [includeHistory, setIncludeHistory] = React.useState(false);
   const [msg, setMsg] = React.useState<{ tone: 'ok' | 'err'; text: string } | null>(null);
   const [busy, setBusy] = React.useState(false);
   const fileRef = React.useRef<HTMLInputElement | null>(null);
@@ -571,7 +572,7 @@ function ConfigBackupSection() {
       const res = await fetch(`${API_BASE}/api/mesh/backup`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ passphrase: exportPass }),
+        body: JSON.stringify({ passphrase: exportPass, includeHistory }),
       });
       if (!res.ok) {
         const b = await res.json().catch(() => ({}));
@@ -582,10 +583,10 @@ function ConfigBackupSection() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `sentinel-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      a.download = `sentinel-backup-${new Date().toISOString().slice(0, 10)}${includeHistory ? '-full' : ''}.json`;
       a.click();
       URL.revokeObjectURL(url);
-      setMsg({ tone: 'ok', text: 'Backup downloaded.' });
+      setMsg({ tone: 'ok', text: includeHistory ? 'Full backup downloaded (config + history).' : 'Config backup downloaded.' });
       setExportPass('');
     } finally {
       setBusy(false);
@@ -609,7 +610,15 @@ function ConfigBackupSection() {
     setMsg(null);
     if (!pendingEnvelope) { setMsg({ tone: 'err', text: 'Pick a backup file first.' }); return; }
     if (!restorePass) { setMsg({ tone: 'err', text: 'Enter the backup passphrase.' }); return; }
-    if (!confirm('Restore will overwrite your radios registry, channel cache, and BBS config from the backup. Continue?')) return;
+    if (!confirm(
+      'Restore will overwrite your local Sentinel state from the backup:\n\n' +
+      '  • Radios registry, channels (with PSKs), BBS config\n' +
+      '  • Groups, waypoints, block list\n' +
+      '  • BBS mail + weather subscribers\n' +
+      '  • TCP endpoint config\n' +
+      '  • Message/event/telemetry history (if included in the backup)\n\n' +
+      'Radio firmware is not touched. Continue?'
+    )) return;
     setBusy(true);
     try {
       const res = await fetch(`${API_BASE}/api/mesh/restore`, {
@@ -619,7 +628,22 @@ function ConfigBackupSection() {
       });
       const b = await res.json().catch(() => ({}));
       if (!res.ok) { setMsg({ tone: 'err', text: b.error || `HTTP ${res.status}` }); return; }
-      setMsg({ tone: 'ok', text: `Restored: ${b.restored.radios} radios, ${b.restored.channels} channels${b.restored.bbsConfig ? ', BBS config' : ''}. Reconnect radios to resync device state.` });
+      // Build a per-section summary line. Skip zeroes so a config-only
+      // restore doesn't carry noisy "0 history" tails.
+      const parts: string[] = [];
+      const r = b.restored ?? {};
+      if (r.radios)               parts.push(`${r.radios} radios`);
+      if (r.channels)             parts.push(`${r.channels} channels`);
+      if (r.bbsConfig)            parts.push('BBS config');
+      if (r.groups)               parts.push(`${r.groups} groups`);
+      if (r.waypoints)            parts.push(`${r.waypoints} waypoints`);
+      if (r.blockedNodes)         parts.push(`${r.blockedNodes} blocked`);
+      if (r.bbsMail)              parts.push(`${r.bbsMail} mail`);
+      if (r.bbsWeatherSubscribers) parts.push(`${r.bbsWeatherSubscribers} subs`);
+      if (r.tcpEndpoint)          parts.push('TCP endpoint');
+      if (r.history)              parts.push(`${r.history} history rows`);
+      const summary = parts.length ? parts.join(', ') : 'nothing applied';
+      setMsg({ tone: 'ok', text: `Restored (v${b.version ?? 1}): ${summary}. Reconnect radios to resync device state.` });
       setRestorePass('');
       setPendingEnvelope(null);
     } finally {
@@ -630,8 +654,14 @@ function ConfigBackupSection() {
   return (
     <div className="border-t border-brand-line pt-4 space-y-3">
       <SectionHeader
-        title="Config Backup"
-        subtitle="Encrypted export of the radios registry, channels (including PSKs), and BBS config. Sealed with AES-256-GCM — keep the passphrase safe; there's no recovery without it."
+        title="Full Backup"
+        subtitle={
+          'Encrypted export of everything operator-side: radios + channels (with PSKs), BBS config, ' +
+          'groups, waypoints, block list, BBS mail, weather subscribers, and TCP endpoint. Optionally ' +
+          'includes message / event / telemetry history (much larger). Sealed with AES-256-GCM — keep ' +
+          "the passphrase safe; there's no recovery without it. Restore overwrites local state only; " +
+          'radio firmware is not touched.'
+        }
       />
 
       {msg && (
@@ -655,12 +685,25 @@ function ConfigBackupSection() {
             placeholder="Encryption passphrase (≥6 chars)"
             className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs text-brand-ink"
           />
+          <label className="flex items-start gap-2 text-[10px] text-brand-muted leading-snug cursor-pointer">
+            <input
+              type="checkbox"
+              checked={includeHistory}
+              onChange={e => setIncludeHistory(e.target.checked)}
+              className="mt-0.5 accent-brand-accent"
+            />
+            <span>
+              Include history (nodes, messages, events, telemetry, position log, traces, neighbor info).
+              Much larger — the rebuild-on-reconnect path repopulates most of these for free, so leave
+              this off unless you really want bit-exact preservation across the migration.
+            </span>
+          </label>
           <button
             onClick={doExport}
             disabled={busy}
             className="flex items-center gap-1 bg-brand-accent/10 hover:bg-brand-accent/20 disabled:opacity-40 border border-brand-accent/40 text-brand-accent text-[10px] font-bold uppercase tracking-widest rounded px-3 py-1.5"
           >
-            <Download size={12} /> Download Backup
+            <Download size={12} /> Download {includeHistory ? 'Full Backup' : 'Config Backup'}
           </button>
         </div>
 
