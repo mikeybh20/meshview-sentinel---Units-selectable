@@ -487,6 +487,7 @@ export class MeshDataService {
 
   async updateRadio(radioId: string, patch: Partial<{
     long_name: string;
+    transport: 'serial' | 'tcp' | 'ble';
     target: string;
     color_hex: string | null;
     network_label: string | null;

@@ -337,6 +337,12 @@ export default function App() {
       const ack = ackStatuses[m.id];
       return ack ? { ...m, status: ack.status as Message['status'], errorCode: ack.errorCode } : m;
     };
+    // v2.0 Beta 3: enforce chat-style chronological ordering — oldest at the
+    // top, newest at the bottom. The server's snapshot doesn't guarantee any
+    // particular order (insertion order from the bridge, which can interleave
+    // sent + received in surprising ways once ACKs land), so we sort here.
+    // MessagesView's auto-scroll-to-bottom keeps the newest message in view.
+    const byTimeAsc = (a: Message, b: Message) => a.timestamp - b.timestamp;
 
     if (activeChannel) {
       const label = activeChannel.name || (activeChannel.role === 'PRIMARY' ? 'LongFast' : `Channel ${activeChannel.index}`);
@@ -347,7 +353,8 @@ export default function App() {
           m.channel === `Channel ${activeChannel.index}`
         )
         .filter(m => !blockList.isBlocked(m.from))
-        .map(applyAck);
+        .map(applyAck)
+        .sort(byTimeAsc);
     }
     return messages
       .filter(m =>
@@ -355,7 +362,8 @@ export default function App() {
         (m.to === activeChatId)
       )
       .filter(m => !blockList.isBlocked(m.from))
-      .map(applyAck);
+      .map(applyAck)
+      .sort(byTimeAsc);
   }, [messages, activeChatId, activeChannel, ackStatuses, blockList]);
 
   const handleSendMessage = async (

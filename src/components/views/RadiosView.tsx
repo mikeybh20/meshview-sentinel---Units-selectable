@@ -600,6 +600,14 @@ function RadioEditor({ row, onChanged }: { row: RadioRow; onChanged: () => void 
   const [networkLabel, setNetworkLabel] = React.useState(row.network_label ?? '');
   const [colorHex, setColorHex] = React.useState(row.color_hex ?? RADIO_COLOR_PALETTE[0]);
   const [enabled, setEnabled] = React.useState(!!row.enabled);
+  // v2.0 Beta 3: transport + target are now editable from the Edit form so the
+  // operator can switch a radio between serial / TCP without having to delete
+  // and re-add. Common case: switching from serial → tcp once the radio has
+  // been put on WiFi.
+  const [transport, setTransport] = React.useState<'serial' | 'tcp' | 'ble'>(row.transport);
+  const [target, setTarget] = React.useState(row.target);
+  const [detecting, setDetecting] = React.useState(false);
+  const [detectMsg, setDetectMsg] = React.useState<string | null>(null);
   const [saving, setSaving] = React.useState(false);
   const [testing, setTesting] = React.useState(false);
   const [testMsg, setTestMsg] = React.useState<string | null>(null);
@@ -633,12 +641,39 @@ function RadioEditor({ row, onChanged }: { row: RadioRow; onChanged: () => void 
     setSaving(true);
     const r = await meshDataService.updateRadio(row.radio_id, {
       long_name: longName,
+      transport,
+      target,
       network_label: networkLabel || null,
       color_hex: colorHex,
       enabled,
     });
     setSaving(false);
     if (r.ok) onChanged();
+  };
+
+  /** Open a transient connection on the entered transport+target to confirm
+   *  the radio is reachable + read its identity. Useful when switching
+   *  transport (e.g. serial→tcp after moving the radio to WiFi). Does NOT
+   *  modify the saved radio row — operator clicks Save Metadata afterward. */
+  const detectIdentity = async () => {
+    if (transport === 'ble') { setDetectMsg('BLE detection not implemented yet (Phase 5)'); return; }
+    if (!target.trim()) { setDetectMsg('Enter a target first.'); return; }
+    setDetectMsg(null);
+    setDetecting(true);
+    const r = await meshDataService.testRadioConnection({
+      transport: transport as 'serial' | 'tcp',
+      target: target.trim(),
+      timeout_ms: 5000,
+    });
+    setDetecting(false);
+    if (!r.ok) { setDetectMsg(`✗ ${(r as { ok: false; error: string }).error}`); return; }
+    if (!r.identity) { setDetectMsg('Connected but radio did not report identity in time.'); return; }
+    const loraStr = r.lora ? ` · slot ${r.lora.frequencySlot}, ${r.lora.hopLimit} hops` : '';
+    const prefix = r.alreadyConnectedAs
+      ? `⚠ already connected as ${r.alreadyConnectedAs} — live state shown`
+      : `✓ ${r.identity.shortName} (${r.identity.longName || r.identity.nodeId})`;
+    setDetectMsg(`${prefix}${loraStr}`);
+    setTimeout(() => setDetectMsg(null), 10_000);
   };
 
   const testConnection = async () => {
@@ -726,6 +761,44 @@ function RadioEditor({ row, onChanged }: { row: RadioRow; onChanged: () => void 
             className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs text-brand-ink"
           />
         </div>
+        <div>
+          <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Transport</label>
+          <select
+            value={transport}
+            onChange={e => setTransport(e.target.value as 'serial' | 'tcp' | 'ble')}
+            className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs text-brand-ink"
+          >
+            <option value="serial">serial</option>
+            <option value="tcp">tcp</option>
+            <option value="ble" disabled>ble (Phase 5)</option>
+          </select>
+        </div>
+        <div>
+          <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Target</label>
+          <input
+            type="text"
+            value={target}
+            onChange={e => setTarget(e.target.value)}
+            placeholder={transport === 'tcp' ? '192.168.1.50:4403' : '/dev/ttyUSB0'}
+            className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs mono-text text-brand-ink"
+          />
+        </div>
+        <div className="sm:col-span-2 flex items-center gap-2 flex-wrap">
+          <button
+            onClick={detectIdentity}
+            disabled={detecting || !target.trim()}
+            className="bg-brand-line hover:bg-brand-line/70 disabled:opacity-40 border border-brand-line text-brand-ink text-[10px] font-bold uppercase tracking-widest rounded px-3 py-1.5"
+            title="Open a temporary connection on the entered transport+target to verify it reaches the radio. Does not save."
+          >
+            {detecting ? <Loader2 size={11} className="animate-spin inline" /> : 'Detect Identity'}
+          </button>
+          {detectMsg && <span className="text-[11px] text-brand-muted">{detectMsg}</span>}
+        </div>
+        {(transport !== row.transport || target !== row.target) && (
+          <div className="sm:col-span-2 text-[11px] text-brand-warning bg-brand-warning/10 border border-brand-warning/30 rounded px-3 py-2">
+            ⚠ Transport / target changed. After clicking Save Metadata, you'll need to disconnect + reconnect this radio for the new transport to take effect. If it's the default radio, use Make Primary on another radio first, then Make Primary back to apply the new transport.
+          </div>
+        )}
         <div className="sm:col-span-2">
           <label className="block text-[10px] font-bold uppercase tracking-widest text-brand-muted mb-1">Color</label>
           <div className="flex items-center gap-1.5">
