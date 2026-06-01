@@ -609,6 +609,20 @@ export function MessagesView({
                 if (selectedRadioId && !(n.heardByRadios ?? []).includes(selectedRadioId)) return false;
                 return true;
               })
+              // v2.0 Beta 3: sort unread chats to the TOP so the unread
+              // badge is always above the scroll fold. Before this, the
+              // "2" badge on the radio pill could point at a chat sitting
+              // 4 rows down — invisible without scrolling, so the operator
+              // couldn't find the message even though the indicator
+              // promised one. Tiebreak by lastSeen (recent first) so the
+              // active chat naturally floats up too.
+              .slice()
+              .sort((a, b) => {
+                const ua = unreadCounts[a.id] ?? 0;
+                const ub = unreadCounts[b.id] ?? 0;
+                if (ua !== ub) return ub - ua;
+                return (b.lastSeen ?? 0) - (a.lastSeen ?? 0);
+              })
               .map(n => (
               <ChannelItem
                 key={n.id}
