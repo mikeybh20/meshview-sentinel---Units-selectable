@@ -356,21 +356,28 @@ app.get('/api/mesh/discover/mdns', (_req, res) => {
 // Status: is the radio connected?
 app.get('/api/mesh/status', (_req, res) => {
   const device = serialDiscovery.getDevice();
+  // v2.0 Beta 3: same fix as /api/mesh/snapshot — route local-radio fields
+  // through the default-radio bridge in BridgeManager rather than reading
+  // meshBridge directly. The singleton can be silently rebound by
+  // /api/mesh/connect/tcp, leaving its `.connected` / .getLocalNodeId()
+  // stale while contexts[defaultRadioId].bridge holds the real state.
+  // The "RADIO OFFLINE" indicator in the left rail polls this endpoint.
+  const defaultBridge = bridgeManager.getDefault()?.bridge ?? meshBridge;
   return res.json({
     systemVersion: SYSTEM_VERSION,
-    radioConnected: meshBridge.connected,
-    transport: meshBridge.getTransport(),
+    radioConnected: defaultBridge.connected,
+    transport: defaultBridge.getTransport(),
     serialDevice: device ? {
       port: device.port,
       vendor: device.vendor,
       product: device.product,
       isLoRa: device.isLoRa,
     } : null,
-    nodeCount: meshBridge.getNodes().length,
-    messageCount: meshBridge.getMessages().length,
-    localNodeId: meshBridge.getLocalNodeId(),
-    firmwareVersion: meshBridge.getLocalFirmwareVersion(),
-    rebootCount: meshBridge.getLocalRebootCount(),
+    nodeCount: defaultBridge.getNodes().length,
+    messageCount: defaultBridge.getMessages().length,
+    localNodeId: defaultBridge.getLocalNodeId(),
+    firmwareVersion: defaultBridge.getLocalFirmwareVersion(),
+    rebootCount: defaultBridge.getLocalRebootCount(),
     defaultRadioId: bridgeManager.getDefaultRadioId(),
   });
 });
