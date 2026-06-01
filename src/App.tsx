@@ -320,17 +320,38 @@ export default function App() {
     [nodes, activeChatId]
   );
 
+  // v2.0 Beta 3: per-radio channels override. The default `channels` state
+  // tracks the singleton bridge's channel list via SSE. When the operator
+  // selects a non-default radio in the top bar, fetch THAT radio's channels
+  // so activeChannel (used to filter the message stream by channel-name)
+  // resolves correctly. Without this, chan:N on a secondary radio would
+  // look up the singleton's channel-at-index-N — different name, different
+  // PSK, and messages filtered against the wrong channel name vanish.
+  const [secondaryChannels, setSecondaryChannels] = React.useState<Channel[] | null>(null);
+  React.useEffect(() => {
+    if (!selectedRadioId || selectedRadioId === defaultRadioId) {
+      setSecondaryChannels(null);
+      return;
+    }
+    let cancelled = false;
+    meshDataService.fetchChannelsForRadio(selectedRadioId).then(list => {
+      if (!cancelled) setSecondaryChannels(list ?? []);
+    });
+    return () => { cancelled = true; };
+  }, [selectedRadioId, defaultRadioId]);
+  const effectiveChannels = secondaryChannels ?? channels;
+
   const activeChannel = React.useMemo<Channel | undefined>(() => {
     if (!activeChatId.startsWith('chan:')) return undefined;
     const idx = parseInt(activeChatId.slice(5), 10);
-    const found = channels.find(c => c.index === idx);
+    const found = effectiveChannels.find(c => c.index === idx);
     if (found) return found;
     // Fallback synthetic primary so simulator/empty state still works.
     if (idx === 0) {
       return { index: 0, name: '', role: 'PRIMARY', pskBase64: '', uplinkEnabled: true, downlinkEnabled: true };
     }
     return undefined;
-  }, [activeChatId, channels]);
+  }, [activeChatId, effectiveChannels]);
 
   const filteredMessages = React.useMemo(() => {
     const applyAck = (m: Message): Message => {
@@ -1091,7 +1112,7 @@ export default function App() {
                 <MessagesView
                   nodes={nodes}
                   messages={messages}
-                  channels={channels}
+                  channels={effectiveChannels}
                   filteredMessages={filteredMessages}
                   activeChatId={activeChatId}
                   setActiveChatId={setActiveChatId}
