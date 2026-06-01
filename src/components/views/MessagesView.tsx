@@ -520,11 +520,21 @@ export function MessagesView({
               // the local node itself. The local node can't be DMed —
               // self-DMs don't actually transmit, they just consume rate-
               // limit budget — so we don't show it as a target at all.
+              //
+              // v2.0 Beta 3: when a specific radio is selected in the top
+              // bar, also filter to nodes that radio has heard. Otherwise a
+              // DM partner only reachable on the other radio would appear
+              // in this list but no messages would show in the thread
+              // (filteredMessages would empty it out by radioId), and the
+              // operator might think their reply is going somewhere
+              // useful when it can't actually reach the peer through the
+              // selected radio's mesh.
               .filter(n =>
                 n.online
                 && n.id !== '!abcdef01'
                 && n.id !== localNodeId
                 && !blockedNodeIds.has(n.id)
+                && (!selectedRadioId || (n.heardByRadios ?? []).includes(selectedRadioId))
               )
               .map(n => (
               <ChannelItem
@@ -535,7 +545,12 @@ export function MessagesView({
                 active={activeChatId === n.id}
                 count={unreadCounts[n.id]}
                 onClick={() => setActiveChatId(n.id)}
-                lastMsg={messages.find(m => m.from === n.id || m.to === n.id)?.text || 'No messages'}
+                // lastMsg preview also follows the selected radio so it
+                // matches what the operator would see in the thread.
+                lastMsg={messages.find(m =>
+                  (m.from === n.id || m.to === n.id) &&
+                  (!selectedRadioId || m.radioId === selectedRadioId)
+                )?.text || 'No messages'}
               />
             ))}
           </div>
