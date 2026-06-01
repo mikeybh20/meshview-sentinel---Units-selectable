@@ -1358,8 +1358,21 @@ app.post('/api/mesh/nodes/:id/favorite', (req, res) => {
   const id = req.params.id;
   const favorite = !!(req.body?.favorite);
   if (!id.startsWith('!')) return res.status(400).json({ error: 'id must be a !hex node id' });
-  const ok = meshBridge.setFavorite(id, favorite);
-  if (!ok) return res.status(404).json({ error: 'Node not found' });
+  // v2.0 Beta 3: try the default bridge first, then fall back to any bridge
+  // that has this node. meshBridge can be detached from the actual default
+  // radio's in-memory NodeDB; the Dashboard's star button silently no-op'd
+  // because meshBridge.setFavorite returned false (node not in *that*
+  // bridge's map) and the operator saw nothing happen. Walking the contexts
+  // covers the case where a node was only heard by a secondary too.
+  const tryBridges = [
+    bridgeManager.getDefault()?.bridge,
+    ...bridgeManager.list().map(c => c.bridge),
+  ].filter(Boolean);
+  let ok = false;
+  for (const b of tryBridges) {
+    if (b!.setFavorite(id, favorite)) { ok = true; break; }
+  }
+  if (!ok) return res.status(404).json({ error: 'Node not found on any connected radio' });
   return res.json({ ok: true, id, favorite });
 });
 
