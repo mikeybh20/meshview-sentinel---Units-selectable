@@ -1331,6 +1331,7 @@ interface BbsConfigShape {
   retentionDays: number;
   replyPaceMs: number;
   homeZipCode: string;
+  dailyForecastTime: string;
 }
 
 function BbsSection() {
@@ -1366,8 +1367,12 @@ function BbsSection() {
   const zipErr = cfg && cfg.homeZipCode && !/^\d{5}$/.test(cfg.homeZipCode)
     ? 'Must be exactly 5 digits (or empty)'
     : null;
+  // Daily forecast time: HH:MM 24-hour, or empty to disable.
+  const timeErr = cfg && cfg.dailyForecastTime && !/^([01]?\d|2[0-3]):[0-5]\d$/.test(cfg.dailyForecastTime)
+    ? 'Use HH:MM (24-hour) or leave empty to disable'
+    : null;
 
-  const canSave = cfg && !mailErr && !weatherErr && !triggersIdentical && !zipErr;
+  const canSave = cfg && !mailErr && !weatherErr && !triggersIdentical && !zipErr && !timeErr;
 
   const handleSave = async () => {
     if (!cfg || !canSave) return;
@@ -1536,6 +1541,54 @@ function BbsSection() {
             trigger a browser notification if you've granted permission, AND get pushed to every node that
             subscribed via <code className="text-brand-accent">:weather subscribe</code>. Leave empty to disable.
             The on-demand <code className="text-brand-accent">:weather</code> command works regardless.
+          </p>
+        </div>
+
+        {/* Daily forecast push */}
+        <div className="space-y-1 pt-2 border-t border-brand-line/40">
+          <label className="text-[10px] uppercase font-bold tracking-widest text-brand-muted">Daily forecast push time</label>
+          <div className="flex items-center gap-2 flex-wrap">
+            <input
+              type="text"
+              value={cfg.dailyForecastTime}
+              onChange={e => update('dailyForecastTime', e.target.value.trim())}
+              placeholder="07:30"
+              className={cn(
+                "w-24 bg-brand-line/50 border rounded px-2 py-1.5 text-sm mono-text focus:outline-none",
+                timeErr ? "border-brand-error" : "border-brand-line focus:border-brand-accent"
+              )}
+            />
+            <button
+              type="button"
+              onClick={async () => {
+                try {
+                  const r = await fetch(`${API_BASE}/api/mesh/bbs/weather/test-forecast`, { method: 'POST' });
+                  const b = await r.json().catch(() => ({}));
+                  if (!r.ok) {
+                    setError(b.error || `HTTP ${r.status}`);
+                  } else {
+                    setError('');
+                    setSaved(true);
+                    setTimeout(() => setSaved(false), 3000);
+                  }
+                } catch (err: any) {
+                  setError(err?.message || 'Test send failed');
+                }
+              }}
+              disabled={!cfg.homeZipCode || !cfg.enabled}
+              title={cfg.homeZipCode ? 'Send the daily forecast to all subscribers now' : 'Set a home ZIP first'}
+              className="text-[10px] font-bold uppercase tracking-widest px-2 py-1.5 rounded border border-brand-accent/40 text-brand-accent hover:bg-brand-accent/10 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              Send test
+            </button>
+          </div>
+          {timeErr && <div className="text-[10px] text-brand-error">{timeErr}</div>}
+          <p className="text-[10px] text-brand-muted leading-snug pt-1">
+            <code className="text-brand-accent">HH:MM</code> in 24-hour <strong>server-local time</strong> (set via <code className="text-brand-accent">TZ</code> in docker-compose).
+            Fires once per day, fetches the current NWS forecast for your home ZIP, and DMs it to every
+            <code className="text-brand-accent"> :weather subscribe</code>d node — same delivery path as alerts
+            (DM + persistent mail row, sender shown as <code className="text-brand-accent">FX</code> for forecast vs <code className="text-brand-accent">WX</code> for alert).
+            Leave empty to disable. Requires Home ZIP above to be set.
           </p>
         </div>
       </div>

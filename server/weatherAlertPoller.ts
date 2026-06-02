@@ -37,6 +37,16 @@ const ALERT_SENDER_SHORT = 'WX';
 const POLL_INTERVAL_MS = parseInt(process.env.MESHVIEW_WEATHER_POLL_MS || '', 10) || (20 * 60_000);
 const FIRST_POLL_DELAY_MS = 10_000; // wait for radio to settle before first poll
 
+/** Daily-forecast scheduler tick interval. 60s is fine — we only fire when
+ *  the wall clock crosses the configured HH:MM target, and we dedupe per
+ *  day so missing the exact minute by a few seconds doesn't double-fire. */
+const DAILY_TICK_MS = 60_000;
+
+/** Synthetic short name for the daily forecast sender. Distinct from the
+ *  alert sender (WX) so subscribers see which mail rows are routine
+ *  morning forecasts vs. urgent alerts. */
+const FORECAST_SENDER_SHORT = 'FX';
+
 export class WeatherAlertPoller {
   private bm: BridgeManagerLike;
   private getConfig: () => BbsConfig;
@@ -45,6 +55,13 @@ export class WeatherAlertPoller {
   private seenAlertIds = new Set<string>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private firstRun = true;
+
+  /** Daily-forecast scheduler state. */
+  private dailyTimer: ReturnType<typeof setInterval> | null = null;
+  /** Date key (YYYY-MM-DD in server-local time) for the last day we sent
+   *  the daily forecast. Prevents double-fire when the minute tick
+   *  straddles the target time. */
+  private lastDailySentDay: string | null = null;
 
   constructor(bm: BridgeManagerLike, getConfig: () => BbsConfig) {
     this.bm = bm;
@@ -58,12 +75,30 @@ export class WeatherAlertPoller {
     setTimeout(() => this.tick(), FIRST_POLL_DELAY_MS);
     this.timer = setInterval(() => this.tick(), POLL_INTERVAL_MS);
     this.timer.unref?.();
+
+    // Daily forecast scheduler — independent from the alert poller so a
+    // 7:30am morning push doesn't block on the 20-minute alert cadence.
+    if (!this.dailyTimer) {
+      console.log(`[WeatherPoller] Daily forecast scheduler enabled (tick=${Math.round(DAILY_TICK_MS / 1000)}s)`);
+      // Seed lastDailySentDay to "today" so if we boot AFTER the target
+      // time we don't immediately fire a stale forecast at startup —
+      // operator gets it tomorrow morning instead. Boot-time push is
+      // the wrong behavior: subscribers got their morning fresh, they
+      // don't need it again at 2pm.
+      this.lastDailySentDay = this.todayKey();
+      this.dailyTimer = setInterval(() => this.dailyTick(), DAILY_TICK_MS);
+      this.dailyTimer.unref?.();
+    }
   }
 
   stop(): void {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
+    }
+    if (this.dailyTimer) {
+      clearInterval(this.dailyTimer);
+      this.dailyTimer = null;
     }
   }
 
@@ -72,6 +107,71 @@ export class WeatherAlertPoller {
    *  20 minutes. */
   async pollNow(): Promise<void> {
     return this.tick();
+  }
+
+  /** Force the daily forecast push to fire NOW, regardless of clock. Used
+   *  by the "Send test" button in the BBS settings panel so the operator
+   *  can verify subscriber delivery without waiting until tomorrow's 7:30. */
+  async sendDailyForecastNow(): Promise<{ ok: true; subscribers: number; summary: string } | { ok: false; error: string }> {
+    const cfg = this.getConfig();
+    if (!cfg.enabled) return { ok: false, error: 'BBS is disabled' };
+    if (!cfg.homeZipCode) return { ok: false, error: 'homeZipCode is not set' };
+    try {
+      const summary = await weatherService.getCurrentSummary(cfg.homeZipCode);
+      const subs = meshDb.listWeatherSubscribers();
+      await this.deliverToSubscribers(summary, FORECAST_SENDER_SHORT);
+      return { ok: true, subscribers: subs.length, summary };
+    } catch (err: any) {
+      return { ok: false, error: err?.message ?? 'forecast fetch failed' };
+    }
+  }
+
+  /** "YYYY-MM-DD" in server-local time. The container's TZ environment
+   *  variable controls what "local" means — operators set TZ in
+   *  docker-compose to align with their region. */
+  private todayKey(): string {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+
+  /** Minute-resolution scheduler tick. Fires the daily forecast when the
+   *  wall clock crosses the configured HH:MM and we haven't sent today
+   *  yet. Per-minute polling instead of next-fire setTimeout because
+   *  timeout drift over a 24h window is unreliable (system sleep, NTP
+   *  steps, container restarts) — a minute tick is robust and cheap. */
+  private async dailyTick(): Promise<void> {
+    const cfg = this.getConfig();
+    if (!cfg.enabled || !cfg.homeZipCode || !cfg.dailyForecastTime) return;
+
+    const now = new Date();
+    const hh = String(now.getHours()).padStart(2, '0');
+    const mm = String(now.getMinutes()).padStart(2, '0');
+    const clock = `${hh}:${mm}`;
+    if (clock !== cfg.dailyForecastTime) return;
+
+    const dayKey = this.todayKey();
+    if (this.lastDailySentDay === dayKey) return;
+    this.lastDailySentDay = dayKey;
+
+    const subs = meshDb.listWeatherSubscribers();
+    if (subs.length === 0) {
+      console.log(`[WeatherPoller] Daily forecast time reached (${clock}) but 0 subscribers — skipping`);
+      return;
+    }
+
+    let summary: string;
+    try {
+      summary = await weatherService.getCurrentSummary(cfg.homeZipCode);
+    } catch (err: any) {
+      console.warn(`[WeatherPoller] daily forecast fetch failed: ${err?.message}`);
+      // Roll back the dayKey so we'll retry on the next tick. NWS hiccups
+      // shouldn't cost the operator a day of forecasts.
+      this.lastDailySentDay = null;
+      return;
+    }
+
+    console.log(`[WeatherPoller] Daily forecast (${clock}): "${summary}" → ${subs.length} subscriber(s)`);
+    await this.deliverToSubscribers(summary, FORECAST_SENDER_SHORT);
   }
 
   private async tick(): Promise<void> {
@@ -134,7 +234,7 @@ export class WeatherAlertPoller {
       // Fan out to subscribers. DM goes out over the radio (best-effort — may
       // bounce if recipient is offline); mail row is persisted unconditionally
       // so subscribers can pull it later via :mail R.
-      await this.deliverToSubscribers(compact);
+      await this.deliverToSubscribers(compact, ALERT_SENDER_SHORT);
     }
 
     if (this.firstRun) {
@@ -157,7 +257,7 @@ export class WeatherAlertPoller {
    * we DO wait briefly between subscribers to avoid hitting the firmware's
    * global TX queue limit when many are subscribed.
    */
-  private async deliverToSubscribers(compact: string): Promise<void> {
+  private async deliverToSubscribers(compact: string, senderShort: string): Promise<void> {
     // v2.0 multi-radio: each subscriber row knows which radio they
     // subscribed via. Route the DM back through that radio's bridge so
     // multi-mesh operators reach the right peers. Subscribers with a NULL
@@ -190,7 +290,7 @@ export class WeatherAlertPoller {
         if (localNodeId) {
           mailId = meshDb.insertMail({
             sender_node_id: localNodeId,
-            sender_short_name: ALERT_SENDER_SHORT,
+            sender_short_name: senderShort,
             recipient_node_id: sub.nodeId,
             posted_at: Date.now(),
             body: compact,

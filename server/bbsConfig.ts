@@ -46,6 +46,13 @@ export interface BbsConfig {
   /** 5-digit US ZIP for home-area weather alert polling. Empty disables the
    *  alert poller (the :weather command is unaffected). */
   homeZipCode: string;
+  /** Daily forecast push to weather subscribers, "HH:MM" 24-hour local time.
+   *  Empty disables the daily push (subscribers still get NWS alerts).
+   *  Default "07:30" — matches operator request for morning weather. The
+   *  scheduler uses the server's local timezone (set via `TZ` in
+   *  docker-compose); subscribers see the forecast in the operator's
+   *  zone, not their own. Skipped when homeZipCode is empty. */
+  dailyForecastTime: string;
 }
 
 const DEFAULTS: BbsConfig = {
@@ -57,6 +64,7 @@ const DEFAULTS: BbsConfig = {
   replyPaceMs: 2_000,
   sessionTimeoutSecs: 300,
   homeZipCode: '',
+  dailyForecastTime: '07:30',
 };
 
 /** Validate + clamp config inputs to safe ranges so a bad POST body can't
@@ -94,6 +102,22 @@ export function normalizeBbsConfig(partial: Partial<BbsConfig>): BbsConfig {
   // ZIP: 5 digits or empty.
   const zip = String(merged.homeZipCode ?? '').trim();
   merged.homeZipCode = /^\d{5}$/.test(zip) ? zip : '';
+
+  // Daily-forecast time: "HH:MM" 24h, or empty to disable. Reject anything
+  // that's not a valid clock time so a bad value can't silently DOS the
+  // scheduler with "never fires" or fire at 99:99.
+  const t = String(merged.dailyForecastTime ?? '').trim();
+  if (t === '') {
+    merged.dailyForecastTime = '';
+  } else {
+    const m = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(t);
+    if (m) {
+      // Normalize "7:30" → "07:30" so equality checks downstream are simpler.
+      merged.dailyForecastTime = `${m[1].padStart(2, '0')}:${m[2]}`;
+    } else {
+      merged.dailyForecastTime = DEFAULTS.dailyForecastTime;
+    }
+  }
 
   return merged;
 }

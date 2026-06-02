@@ -35,6 +35,15 @@ services:
       # a remote sidecar — useful when the Sentinel host has no GPU but a
       # nearby NVIDIA box does.
       - MESHVIEW_GPU_URL=http://meshview-gpu:7100
+      # v2.0 Beta 4: container timezone. Passes through TZ from the host's
+      # docker-compose shell (e.g., `TZ=America/New_York docker compose up`);
+      # falls back to the IANA zone after the colon if the host doesn't set
+      # one. Adjust the fallback for your region. Without this, the container
+      # runs UTC and the BBS daily-forecast scheduler fires at HH:MM-UTC
+      # instead of the operator's local time. Common zones:
+      # America/New_York | America/Chicago | America/Denver | America/Los_Angeles
+      # Europe/London | Europe/Berlin | Asia/Tokyo | Australia/Sydney
+      - TZ=${TZ:-America/New_York}
     # `host.docker.internal` works on Docker Desktop (mac/windows) out of the
     # box, but on Linux you have to alias it to the host gateway explicitly.
     # This lets the in-container API reach a host-side Ollama at

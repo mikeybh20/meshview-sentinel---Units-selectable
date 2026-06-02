@@ -2970,6 +2970,17 @@ app.post('/api/mesh/bbs/config', (req, res) => {
   }
 });
 
+/** POST /api/mesh/bbs/weather/test-forecast — fire the daily forecast push
+ *  RIGHT NOW. Useful from the BBS settings panel so an operator can confirm
+ *  subscriber delivery without waiting until tomorrow's scheduled HH:MM.
+ *  Same path as the scheduled fire — fetches getCurrentSummary(homeZip),
+ *  fans out to every subscriber via DM + mail row. */
+app.post('/api/mesh/bbs/weather/test-forecast', async (_req, res) => {
+  const r = await weatherPoller.sendDailyForecastNow();
+  if (!r.ok) return res.status(400).json({ error: (r as { ok: false; error: string }).error });
+  return res.json(r);
+});
+
 /** GET /api/mesh/bbs/inbox?nodeId=<hex>&radio_id=<short>  — defaults to local node + all radios */
 app.get('/api/mesh/bbs/inbox', (req, res) => {
   const localNodeId = (meshBridge as any).localNodeId as string | null;
