@@ -517,6 +517,134 @@ export class MeshDataService {
   }
 
   // -------------------------------------------------------------------
+  // v2.0 Beta 5 Workspaces (Phase 1B + Phase 1C management)
+  // -------------------------------------------------------------------
+
+  async listWorkspaces(): Promise<{ workspaces: any[]; currentWorkspaceId: number | null } | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/workspaces`, { credentials: 'include' });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  }
+
+  async getWorkspaceDetail(id: number): Promise<{ workspace: any; members: any[]; radios: any[] } | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/workspaces/${id}`, { credentials: 'include' });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  }
+
+  async createWorkspace(name: string): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/workspaces`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ name }),
+      });
+      const b = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: b.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'Network error' };
+    }
+  }
+
+  async renameWorkspace(id: number, name: string): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/workspaces/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ name }),
+      });
+      const b = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: b.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'Network error' };
+    }
+  }
+
+  async setWorkspaceOwner(id: number, ownerUserId: number | null): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/workspaces/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ ownerUserId }),
+      });
+      const b = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: b.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'Network error' };
+    }
+  }
+
+  async deleteWorkspace(id: number): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/workspaces/${id}`, {
+        method: 'DELETE',
+        credentials: 'include',
+      });
+      const b = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: b.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'Network error' };
+    }
+  }
+
+  async addWorkspaceMember(workspaceId: number, userId: number): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/workspaces/${workspaceId}/members`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ userId }),
+      });
+      const b = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: b.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'Network error' };
+    }
+  }
+
+  async removeWorkspaceMember(workspaceId: number, userId: number): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/workspaces/${workspaceId}/members/${userId}`, {
+        method: 'DELETE',
+        credentials: 'include',
+      });
+      const b = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: b.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'Network error' };
+    }
+  }
+
+  /** Move a radio into a workspace. Source workspace doesn't need to
+   *  be specified — server overwrites whatever was there. */
+  async assignRadioToWorkspace(workspaceId: number, radioId: string): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/workspaces/${workspaceId}/radios/${encodeURIComponent(radioId)}`, {
+        method: 'POST',
+        credentials: 'include',
+      });
+      const b = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: b.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'Network error' };
+    }
+  }
+
+  // -------------------------------------------------------------------
   // v2.0 Beta 5 Phase 3: user management (admin-only)
   // -------------------------------------------------------------------
 

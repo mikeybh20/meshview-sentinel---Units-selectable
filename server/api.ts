@@ -443,6 +443,154 @@ app.get('/api/workspaces', requireAuth, (req, res) => {
   });
 });
 
+/**
+ * Slug normalizer for workspace creation. Lowercases, replaces runs of
+ * non-[a-z0-9] with a single dash, trims dashes from the ends. Returns
+ * null on empty result (caller should reject).
+ */
+function slugifyWorkspaceName(name: string): string | null {
+  const s = name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  if (!s) return null;
+  return s.slice(0, 64);
+}
+
+/** POST /api/workspaces — admin creates a new workspace. The creating
+ *  admin auto-joins as both member and owner. Slug is derived from the
+ *  name; on collision, a numeric suffix is appended (-2, -3, …). */
+app.post('/api/workspaces', requireAdmin, (req, res) => {
+  const name = String(req.body?.name ?? '').trim();
+  if (name.length < 1 || name.length > 64) {
+    return res.status(400).json({ error: 'name must be 1..64 chars' });
+  }
+  const baseSlug = slugifyWorkspaceName(name);
+  if (!baseSlug) return res.status(400).json({ error: 'name must contain letters or digits' });
+
+  // De-collide slug. Most installs will have <10 workspaces so a
+  // linear probe is cheap and predictable.
+  let slug = baseSlug;
+  let attempt = 2;
+  while (meshDb().listWorkspaces().some(w => w.slug === slug) && attempt < 100) {
+    slug = `${baseSlug}-${attempt++}`;
+  }
+
+  try {
+    const id = meshDb().createWorkspace({
+      name,
+      slug,
+      ownerUserId: req.user!.id,
+    });
+    meshDb().addWorkspaceMember(id, req.user!.id);
+    return res.status(201).json({ workspace: meshDb().getWorkspace(id) });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message ?? 'create failed' });
+  }
+});
+
+/** PATCH /api/workspaces/:id — admin updates name and/or owner. Only
+ *  the displayable name is editable; slug stays stable (it's used in
+ *  any external links once we add them). */
+app.patch('/api/workspaces/:id', requireAdmin, (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'id must be an integer' });
+  const ws = meshDb().getWorkspace(id);
+  if (!ws) return res.status(404).json({ error: 'workspace not found' });
+
+  if (req.body?.name !== undefined) {
+    const name = String(req.body.name).trim();
+    if (name.length < 1 || name.length > 64) {
+      return res.status(400).json({ error: 'name must be 1..64 chars' });
+    }
+    meshDb().updateWorkspaceName(id, name);
+  }
+  if (req.body?.ownerUserId !== undefined) {
+    const newOwner = req.body.ownerUserId === null ? null : Number(req.body.ownerUserId);
+    if (newOwner !== null && !Number.isInteger(newOwner)) {
+      return res.status(400).json({ error: 'ownerUserId must be an integer or null' });
+    }
+    if (newOwner !== null && !meshDb().isWorkspaceMember(id, newOwner)) {
+      return res.status(409).json({ error: 'new owner must already be a member of this workspace' });
+    }
+    meshDb().setWorkspaceOwner(id, newOwner);
+  }
+  return res.json({ workspace: meshDb().getWorkspace(id) });
+});
+
+/** DELETE /api/workspaces/:id — admin removes a workspace. Refuses to
+ *  delete the last one (would leave radios homeless + every user
+ *  workspace-less). Radios in the deleted workspace get reassigned to
+ *  the first remaining workspace so they stay visible somewhere
+ *  rather than orphaning. */
+app.delete('/api/workspaces/:id', requireAdmin, (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'id must be an integer' });
+  if (meshDb().countWorkspaces() <= 1) {
+    return res.status(409).json({ error: 'Cannot delete the last workspace' });
+  }
+  const ws = meshDb().getWorkspace(id);
+  if (!ws) return res.status(404).json({ error: 'workspace not found' });
+
+  // Find the first remaining workspace and migrate radios over so they
+  // don't end up with workspace_id = NULL (the schema FK has ON
+  // DELETE SET NULL — without this rehoming, orphaned radios disappear
+  // from every operator's dashboard until admin reassigns by hand).
+  const fallback = meshDb().listWorkspaces().find(w => w.id !== id);
+  if (fallback) {
+    const radiosToMigrate = meshDb().listRadios().filter(r => r.workspace_id === id);
+    for (const r of radiosToMigrate) {
+      meshDb().setRadioWorkspace(r.radio_id, fallback.id);
+    }
+  }
+  meshDb().deleteWorkspace(id);
+  return res.json({ ok: true, migratedRadiosTo: fallback?.id ?? null });
+});
+
+/** POST /api/workspaces/:id/members — admin adds a user as a member.
+ *  Idempotent; returns 200 with `alreadyMember: true` if the user
+ *  was already in. */
+app.post('/api/workspaces/:id/members', requireAdmin, (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'id must be an integer' });
+  const userId = Number(req.body?.userId);
+  if (!Number.isInteger(userId)) return res.status(400).json({ error: 'userId must be an integer' });
+  if (!meshDb().getWorkspace(id)) return res.status(404).json({ error: 'workspace not found' });
+  if (!meshDb().getUserById(userId)) return res.status(404).json({ error: 'user not found' });
+  const added = meshDb().addWorkspaceMember(id, userId);
+  return res.json({ ok: true, alreadyMember: !added });
+});
+
+/** DELETE /api/workspaces/:id/members/:userId — admin removes a
+ *  member. Refuses to remove the workspace's current owner (admin
+ *  must reassign ownership first). */
+app.delete('/api/workspaces/:id/members/:userId', requireAdmin, (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const userId = parseInt(req.params.userId, 10);
+  if (!Number.isInteger(id) || !Number.isInteger(userId)) {
+    return res.status(400).json({ error: 'id and userId must be integers' });
+  }
+  const ws = meshDb().getWorkspace(id);
+  if (!ws) return res.status(404).json({ error: 'workspace not found' });
+  if (ws.ownerUserId === userId) {
+    return res.status(409).json({ error: 'Cannot remove the workspace owner — reassign ownership first' });
+  }
+  meshDb().removeWorkspaceMember(id, userId);
+  return res.json({ ok: true });
+});
+
+/** POST /api/workspaces/:id/radios/:radioId — admin reassigns a radio
+ *  into this workspace. Source workspace doesn't need to be specified;
+ *  setRadioWorkspace overwrites whatever was there. */
+app.post('/api/workspaces/:id/radios/:radioId', requireAdmin, (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'id must be an integer' });
+  if (!meshDb().getWorkspace(id)) return res.status(404).json({ error: 'workspace not found' });
+  if (!meshDb().getRadio(req.params.radioId)) return res.status(404).json({ error: 'radio not found' });
+  meshDb().setRadioWorkspace(req.params.radioId, id);
+  return res.json({ ok: true });
+});
+
 /** GET /api/workspaces/:id — single workspace + members + assigned
  *  radios. Only accessible to members + admins. Used by Phase 1C's
  *  management UI. */
