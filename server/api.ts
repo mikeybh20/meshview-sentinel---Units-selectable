@@ -55,6 +55,135 @@ if (existsSync(distPath)) {
 }
 
 // =============================================
+// v2.0 Beta 5: authentication wiring
+// =============================================
+// `attachUser` resolves the signed session cookie (if any) and sets
+// req.user. It runs on every request and does NOT enforce — endpoints
+// pick which gate to apply: requireAuth (any logged-in user) or
+// requireAdmin. This split lets us mount the auth endpoints themselves
+// (login / bootstrap) without auth and gate the rest cleanly.
+//
+// The blanket /api/* gate below is added AFTER we register the
+// /api/auth/* endpoints, so login/bootstrap remain reachable without
+// a session.
+import { attachUser, requireAuth, requireAdmin, hashPassword, verifyPassword,
+         createSession, destroySession, sessionCookieAttrs, clearSessionCookieHeader,
+         getSessionCookieValue, validateUsername, validatePassword, isValidRole,
+         type SessionUser } from './auth.js';
+app.use(attachUser);
+
+/** Format the Set-Cookie value with the session token interpolated in. */
+function buildSessionSetCookie(cookieValue: string, expiresAt: number): string {
+  return sessionCookieAttrs(expiresAt).replace('__VALUE__', encodeURIComponent(cookieValue));
+}
+
+/** Extract the requester IP for the sessions.ip_first_seen audit field.
+ *  Reads X-Forwarded-For if present (for operators with a reverse proxy)
+ *  and falls back to the socket remote address. Trusts the FIRST hop only —
+ *  Sentinel's behind your own infra, not a public CDN. */
+function requesterIp(req: express.Request): string | null {
+  const xff = req.headers['x-forwarded-for'];
+  if (typeof xff === 'string' && xff.length > 0) return xff.split(',')[0].trim();
+  return req.socket.remoteAddress ?? null;
+}
+
+// ---- /api/auth/* (unauthenticated endpoints) ----
+
+/**
+ * Bootstrap probe — returns { needsBootstrap: true } when the users table
+ * is empty so the frontend can render the "create first admin" form
+ * instead of the login page. Once any user exists, returns false.
+ */
+app.get('/api/auth/bootstrap', (_req, res) => {
+  const userCount = meshDb().countUsers();
+  return res.json({ needsBootstrap: userCount === 0 });
+});
+
+/**
+ * Create the very first admin. Refuses if any user already exists
+ * (prevents an unauthenticated takeover after the install is in use).
+ * Logs the new admin in immediately by setting a session cookie.
+ */
+app.post('/api/auth/bootstrap', (req, res) => {
+  if (meshDb().countUsers() > 0) {
+    return res.status(409).json({ error: 'Bootstrap already complete — log in or use Settings → Users to manage accounts' });
+  }
+  const usernameResult = validateUsername(req.body?.username);
+  if (typeof usernameResult !== 'string') return res.status(400).json(usernameResult);
+  const passwordResult = validatePassword(req.body?.password);
+  if (typeof passwordResult !== 'string') return res.status(400).json(passwordResult);
+
+  try {
+    const userId = meshDb().createUser({
+      username: usernameResult,
+      passwordHash: hashPassword(passwordResult),
+      role: 'admin',
+    });
+    meshDb().touchUserLogin(userId);
+    const { cookie, expiresAt } = createSession(userId, requesterIp(req));
+    res.setHeader('Set-Cookie', buildSessionSetCookie(cookie, expiresAt));
+    return res.json({
+      ok: true,
+      user: { id: userId, username: usernameResult, role: 'admin' as const },
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message ?? 'bootstrap failed' });
+  }
+});
+
+/**
+ * Log in. Returns 401 for any "no such user / wrong password / locked
+ * account" case — never differentiates so a probe can't enumerate
+ * accounts. On success sets the session cookie and returns the user.
+ */
+app.post('/api/auth/login', (req, res) => {
+  const { username, password } = req.body ?? {};
+  if (typeof username !== 'string' || typeof password !== 'string') {
+    return res.status(400).json({ error: 'username and password are required' });
+  }
+  const user = meshDb().getUserByUsername(username.trim());
+  if (!user || user.locked || !verifyPassword(password, user.passwordHash)) {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+  meshDb().touchUserLogin(user.id);
+  const { cookie, expiresAt } = createSession(user.id, requesterIp(req));
+  res.setHeader('Set-Cookie', buildSessionSetCookie(cookie, expiresAt));
+  return res.json({
+    ok: true,
+    user: { id: user.id, username: user.username, role: user.role } satisfies SessionUser,
+  });
+});
+
+/** Whoami — returns the current user (200) or 401 if unauthenticated.
+ *  Frontend uses this on first paint to decide login vs dashboard. */
+app.get('/api/auth/me', (req, res) => {
+  if (!req.user) return res.status(401).json({ error: 'Not authenticated' });
+  return res.json({ user: req.user });
+});
+
+/** Drop the session both server-side and on the client. Idempotent. */
+app.post('/api/auth/logout', (req, res) => {
+  const cookie = getSessionCookieValue(req);
+  destroySession(cookie);
+  res.setHeader('Set-Cookie', clearSessionCookieHeader());
+  return res.json({ ok: true });
+});
+
+// ---- Blanket gate for everything else under /api/* ----
+//
+// Mounted AFTER /api/auth/* so login + bootstrap stay reachable. Static
+// assets (the SPA bundle) live OUTSIDE /api so they're served without
+// auth — the login screen has to load somehow.
+//
+// Path matching: inside this mount, req.path is RELATIVE to '/api', so
+// /api/auth/me arrives as '/auth/me'. Allowlist the auth subtree
+// explicitly; everything else needs a valid session.
+app.use('/api', (req, res, next) => {
+  if (req.path === '/auth' || req.path.startsWith('/auth/')) return next();
+  return requireAuth(req, res, next);
+});
+
+// =============================================
 // AI Provider Configuration (persisted to file)
 // =============================================
 type AIProvider = 'anthropic' | 'gemini' | 'ollama';

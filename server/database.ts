@@ -317,6 +317,40 @@ export class MeshDatabase {
       );
 
       CREATE INDEX IF NOT EXISTS idx_radios_enabled ON radios(enabled);
+
+      -- v2.0 Beta 5: multi-user authentication.
+      --
+      -- users table = the local-account directory. password_hash is the
+      -- full "scrypt$<salt-b64>$<hash-b64>" form produced by auth.ts;
+      -- algorithm prefix lets us migrate to a stronger KDF later
+      -- without a schema break. role is checked at the API layer.
+      --
+      -- sessions table is keyed by an opaque random token. The cookie
+      -- sent to the client is a signed wrapper around this token (HMAC
+      -- over AUTH_SECRET) so tampering is detected without a DB lookup.
+      -- expires_at is renewed by resolveSession via the sliding-expiry
+      -- rule (refresh if within 24h of expiring).
+      CREATE TABLE IF NOT EXISTS users (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        username        TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        password_hash   TEXT NOT NULL,
+        role            TEXT NOT NULL CHECK(role IN ('admin', 'viewer')),
+        created_at      INTEGER NOT NULL,
+        last_login_at   INTEGER,
+        locked          INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_users_username ON users(username COLLATE NOCASE);
+
+      CREATE TABLE IF NOT EXISTS sessions (
+        token           TEXT PRIMARY KEY,
+        user_id         INTEGER NOT NULL,
+        created_at      INTEGER NOT NULL,
+        expires_at      INTEGER NOT NULL,
+        ip_first_seen   TEXT,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+      CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
     `);
 
     // Additive migrations for older DBs. SQLite throws if the column already
@@ -2102,6 +2136,160 @@ export class MeshDatabase {
       `UPDATE radios SET bbs_only = ?, updated_at = ? WHERE radio_id = ?`
     ).run(on ? 1 : 0, Date.now(), radioId);
     return r.changes > 0;
+  }
+
+  // ---------------------------------------------------------------------
+  // v2.0 Beta 5: users + sessions
+  // ---------------------------------------------------------------------
+
+  /** Count rows in the users table. Used by /api/auth/bootstrap to detect
+   *  the "first boot, no admin yet" state where we need to surface the
+   *  bootstrap UI instead of the login form. */
+  countUsers(): number {
+    const row = this.db.prepare(`SELECT COUNT(*) AS c FROM users`).get() as { c: number } | undefined;
+    return row?.c ?? 0;
+  }
+
+  countAdmins(): number {
+    const row = this.db.prepare(
+      `SELECT COUNT(*) AS c FROM users WHERE role = 'admin' AND locked = 0`
+    ).get() as { c: number } | undefined;
+    return row?.c ?? 0;
+  }
+
+  createUser(input: {
+    username: string;
+    passwordHash: string;
+    role: 'admin' | 'viewer';
+    createdAt?: number;
+  }): number {
+    const now = input.createdAt ?? Date.now();
+    const r = this.db.prepare(`
+      INSERT INTO users (username, password_hash, role, created_at)
+      VALUES (?, ?, ?, ?)
+    `).run(input.username, input.passwordHash, input.role, now);
+    return Number(r.lastInsertRowid);
+  }
+
+  getUserById(id: number): {
+    id: number; username: string; passwordHash: string;
+    role: 'admin' | 'viewer'; createdAt: number; lastLoginAt: number | null; locked: number;
+  } | null {
+    const row = this.db.prepare(`
+      SELECT id, username, password_hash AS passwordHash, role,
+             created_at AS createdAt, last_login_at AS lastLoginAt, locked
+      FROM users WHERE id = ?
+    `).get(id) as any;
+    return row ?? null;
+  }
+
+  getUserByUsername(username: string): {
+    id: number; username: string; passwordHash: string;
+    role: 'admin' | 'viewer'; createdAt: number; lastLoginAt: number | null; locked: number;
+  } | null {
+    // Username collation is NOCASE so case-insensitive match comes from
+    // the schema. No need for LOWER() here.
+    const row = this.db.prepare(`
+      SELECT id, username, password_hash AS passwordHash, role,
+             created_at AS createdAt, last_login_at AS lastLoginAt, locked
+      FROM users WHERE username = ?
+    `).get(username) as any;
+    return row ?? null;
+  }
+
+  listUsers(): Array<{
+    id: number; username: string; role: 'admin' | 'viewer';
+    createdAt: number; lastLoginAt: number | null; locked: number;
+  }> {
+    return this.db.prepare(`
+      SELECT id, username, role, created_at AS createdAt,
+             last_login_at AS lastLoginAt, locked
+      FROM users
+      ORDER BY created_at ASC
+    `).all() as any;
+  }
+
+  updateUserPassword(id: number, passwordHash: string): boolean {
+    const r = this.db.prepare(
+      `UPDATE users SET password_hash = ? WHERE id = ?`
+    ).run(passwordHash, id);
+    return r.changes > 0;
+  }
+
+  updateUserRole(id: number, role: 'admin' | 'viewer'): boolean {
+    const r = this.db.prepare(
+      `UPDATE users SET role = ? WHERE id = ?`
+    ).run(role, id);
+    return r.changes > 0;
+  }
+
+  updateUserLocked(id: number, locked: boolean): boolean {
+    const r = this.db.prepare(
+      `UPDATE users SET locked = ? WHERE id = ?`
+    ).run(locked ? 1 : 0, id);
+    return r.changes > 0;
+  }
+
+  touchUserLogin(id: number, now: number = Date.now()): void {
+    this.db.prepare(`UPDATE users SET last_login_at = ? WHERE id = ?`).run(now, id);
+  }
+
+  deleteUser(id: number): boolean {
+    // ON DELETE CASCADE on the sessions FK takes care of the user's sessions.
+    const r = this.db.prepare(`DELETE FROM users WHERE id = ?`).run(id);
+    return r.changes > 0;
+  }
+
+  // -- sessions --
+
+  createSession(input: {
+    token: string; userId: number; createdAt: number;
+    expiresAt: number; ipFirstSeen: string | null;
+  }): void {
+    this.db.prepare(`
+      INSERT INTO sessions (token, user_id, created_at, expires_at, ip_first_seen)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(input.token, input.userId, input.createdAt, input.expiresAt, input.ipFirstSeen);
+  }
+
+  /** Returns the session joined with the user — auth path needs both. */
+  getSession(token: string): {
+    token: string; userId: number; createdAt: number; expiresAt: number;
+    username: string; role: 'admin' | 'viewer'; locked: number;
+  } | null {
+    const row = this.db.prepare(`
+      SELECT s.token, s.user_id AS userId, s.created_at AS createdAt, s.expires_at AS expiresAt,
+             u.username, u.role, u.locked
+      FROM sessions s
+      JOIN users u ON u.id = s.user_id
+      WHERE s.token = ?
+    `).get(token) as any;
+    if (!row) return null;
+    // Locked users get rejected even with a valid session — admin can lock
+    // an account without forcing every session token to be deleted.
+    if (row.locked) return null;
+    return row;
+  }
+
+  updateSessionExpiry(token: string, expiresAt: number): void {
+    this.db.prepare(`UPDATE sessions SET expires_at = ? WHERE token = ?`).run(expiresAt, token);
+  }
+
+  deleteSession(token: string): boolean {
+    const r = this.db.prepare(`DELETE FROM sessions WHERE token = ?`).run(token);
+    return r.changes > 0;
+  }
+
+  /** Used when an admin locks/deletes a user — drop all their sessions
+   *  too so existing tabs get bounced to the login screen on next request. */
+  deleteSessionsForUser(userId: number): number {
+    const r = this.db.prepare(`DELETE FROM sessions WHERE user_id = ?`).run(userId);
+    return Number(r.changes ?? 0);
+  }
+
+  pruneExpiredSessions(now: number = Date.now()): number {
+    const r = this.db.prepare(`DELETE FROM sessions WHERE expires_at < ?`).run(now);
+    return Number(r.changes ?? 0);
   }
 
   /**

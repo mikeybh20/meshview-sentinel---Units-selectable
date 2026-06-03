@@ -44,6 +44,8 @@ import { RefreshSplitButton } from './components/RefreshSplitButton';
 import { RadiosView } from './components/views/RadiosView';
 import { ViaFilter, ViaFilterValue } from './components/ViaFilter';
 import { useRadios } from './hooks/useRadios';
+import { useAuth } from './hooks/useAuth';
+import { LogOut, User as UserIcon } from 'lucide-react';
 // RecipeView moved into SettingsModal as the "Install Guide" tab; the standalone
 // dashboard page was removed per operator request to keep the main nav focused
 // on operational views.
@@ -941,6 +943,11 @@ export default function App() {
                 </div>
               );
             })()}
+            {/* v2.0 Beta 5: user badge + logout. Shows current username +
+                role chip. Click to log out (confirm dialog gates the
+                action so a stray click doesn't bounce you to the login
+                screen). */}
+            <UserBadge />
           </div>
         </header>
 
@@ -1383,3 +1390,39 @@ export default function App() {
   );
 }
 
+
+/**
+ * v2.0 Beta 5: top-bar user badge.
+ *
+ * Shows the current user's name + role chip, with a Logout button.
+ * Confirm dialog gates the logout so a stray click doesn't drop the
+ * operator back to the login screen.
+ */
+function UserBadge() {
+  const { user, logout } = useAuth();
+  if (!user) return null;
+  return (
+    <div
+      className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-brand-line/30 border border-brand-line text-xs"
+      title={`Signed in as ${user.username} (${user.role})`}
+    >
+      <UserIcon size={12} className="text-brand-muted" />
+      <span className="mono-text text-brand-ink">{user.username}</span>
+      <span className={cn(
+        'text-[9px] uppercase tracking-widest font-bold px-1.5 py-0.5 rounded',
+        user.role === 'admin'
+          ? 'bg-brand-accent/20 text-brand-accent border border-brand-accent/40'
+          : 'bg-brand-line text-brand-muted border border-brand-line',
+      )}>
+        {user.role}
+      </span>
+      <button
+        onClick={() => { if (confirm('Sign out?')) logout(); }}
+        title="Sign out"
+        className="ml-1 p-1 rounded hover:bg-brand-line/60 text-brand-muted hover:text-brand-error transition-colors"
+      >
+        <LogOut size={12} />
+      </button>
+    </div>
+  );
+}
