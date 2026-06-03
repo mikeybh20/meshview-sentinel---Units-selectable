@@ -97,6 +97,32 @@ export class BbsService {
     return this.config;
   }
 
+  /** v2.0 Beta 4: when on, this BBS auto-replies to any DM that isn't a
+   *  BBS command with the :cmd index. Per-radio, set by BridgeManager
+   *  from the radios.bbs_only column. */
+  private bbsOnlyMode = false;
+  setBbsOnlyMode(on: boolean): void { this.bbsOnlyMode = on; }
+  isBbsOnly(): boolean { return this.bbsOnlyMode; }
+
+  /** Called from meshtasticSerial's TEXT handler AFTER isCommand returns
+   *  false, when the DM is addressed to the local node and we're in
+   *  bbs-only mode. Sends the command index back as an auto-reply.
+   *  The original DM still flows through to normal storage; only this
+   *  reply is new. Best-effort — sender retry covers transient drops. */
+  async maybeAutoReplyForBbsOnly(fromId: string, channelIndex: number): Promise<boolean> {
+    if (!this.bbsOnlyMode) return false;
+    if (!this.config.enabled) return false;
+    // Don't auto-reply to ourselves (covers loopback if the firmware ever
+    // delivers a self-DM) and don't auto-reply if a session is in flight
+    // (the dispatcher will respond on its own — we'd double-up).
+    const localNodeId = (this.bridge as any).localNodeId as string | null;
+    if (localNodeId && fromId === localNodeId) return false;
+    if (this.sessions.has(fromId) || this.weatherSessions.has(fromId)) return false;
+    const triggers = [this.config.mailTrigger, this.config.weatherTrigger, this.config.cmdTrigger];
+    await this.reply(fromId, `BBS node. Cmds: ${triggers.join(' ')}`, channelIndex);
+    return true;
+  }
+
   /** Test whether this text is one of our configured triggers OR continues an
    *  active session. Replaces the standalone isBbsCommand() function so the
    *  trigger isn't a module const. */
@@ -106,6 +132,7 @@ export class BbsService {
     const t = text.trim().toLowerCase();
     if (t.startsWith(this.config.mailTrigger)) return true;
     if (t.startsWith(this.config.weatherTrigger)) return true;
+    if (t === this.config.cmdTrigger) return true;
     // Mid-flow continuation — anything goes if they're in a session.
     if (this.sessions.has(fromId) || this.weatherSessions.has(fromId)) return true;
     return false;
@@ -132,6 +159,7 @@ export class BbsService {
     const senderShortName = senderNode?.shortName || fromId.slice(-4);
     const mailTrigger = this.config.mailTrigger;
     const weatherTrigger = this.config.weatherTrigger;
+    const cmdTrigger = this.config.cmdTrigger;
 
     // Cancellation always wins, regardless of current state.
     if (/^(x|cancel|exit|quit)$/i.test(trimmed)) {
@@ -165,6 +193,13 @@ export class BbsService {
 
     // No active session — match against configured triggers.
     const lower = trimmed.toLowerCase();
+
+    // Command index — :cmd lists every root trigger this BBS responds to,
+    // in classic BBS tradition. No descriptions, just the names so the
+    // packet fits comfortably regardless of how many subsystems we add.
+    if (lower === cmdTrigger) {
+      return this.handleCmdIndex(fromId, channelIndex);
+    }
 
     if (lower === mailTrigger) {
       return this.openMenu(fromId, channelIndex);
@@ -218,9 +253,9 @@ export class BbsService {
     }
 
     // Anything else with the `:` prefix — politely reject so the AI assistant
-    // doesn't also try to handle it.
+    // doesn't also try to handle it. Point at the command index for discovery.
     if (trimmed.startsWith(':')) {
-      await this.reply(fromId, `Unknown command. Try ${mailTrigger} or ${weatherTrigger}`, channelIndex);
+      await this.reply(fromId, `Unknown command. Send ${cmdTrigger} for available commands.`, channelIndex);
       return true;
     }
 
@@ -228,6 +263,16 @@ export class BbsService {
   }
 
   // ---- State entry points ----
+
+  /** v2.0 Beta 4: classic BBS command index. DMing :cmd returns the active
+   *  trigger roots only — names, no descriptions — so the message stays
+   *  tiny regardless of how many subsystems we add. Subscribers chase the
+   *  subsystem's own `help` for usage (e.g., `:wx help`). */
+  private async handleCmdIndex(fromId: string, channelIndex: number): Promise<boolean> {
+    const triggers = [this.config.mailTrigger, this.config.weatherTrigger, this.config.cmdTrigger];
+    await this.reply(fromId, `Cmds: ${triggers.join(' ')}`, channelIndex);
+    return true;
+  }
 
   private async openMenu(fromId: string, channelIndex: number): Promise<boolean> {
     const unread = meshDb.countUnread(fromId, this.radioId);

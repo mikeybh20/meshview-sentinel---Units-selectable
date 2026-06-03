@@ -839,6 +839,10 @@ function RadioEditor({ row, onChanged }: { row: RadioRow; onChanged: () => void 
   const [networkLabel, setNetworkLabel] = React.useState(row.network_label ?? '');
   const [colorHex, setColorHex] = React.useState(row.color_hex ?? RADIO_COLOR_PALETTE[0]);
   const [enabled, setEnabled] = React.useState(!!row.enabled);
+  // v2.0 Beta 4: per-radio BBS-only mode. When on, this radio auto-replies
+  // to non-BBS DMs with the command index. Effect is applied immediately
+  // via BridgeManager.updateRadioBbsOnly on save — no reconnect needed.
+  const [bbsOnly, setBbsOnly] = React.useState(!!row.bbs_only);
   // v2.0 Beta 3: transport + target are now editable from the Edit form so the
   // operator can switch a radio between serial / TCP without having to delete
   // and re-add. Common case: switching from serial → tcp once the radio has
@@ -885,6 +889,7 @@ function RadioEditor({ row, onChanged }: { row: RadioRow; onChanged: () => void 
       network_label: networkLabel || null,
       color_hex: colorHex,
       enabled,
+      bbs_only: bbsOnly,
     });
     setSaving(false);
     if (r.ok) onChanged();
@@ -1064,6 +1069,26 @@ function RadioEditor({ row, onChanged }: { row: RadioRow; onChanged: () => void 
           <span>Enabled</span>
           <span className="text-[10px] text-brand-muted normal-case font-normal">
             — disabled radios stay in the registry but are skipped by Refresh and won't auto-connect
+          </span>
+        </label>
+        {/* v2.0 Beta 4: BBS-only mode. Independent from the global BBS
+            enable in Settings — this scopes WHICH radio acts like a BBS
+            kiosk vs. a chat node. */}
+        <label className="sm:col-span-2 flex items-start gap-2 text-xs text-brand-ink select-none cursor-pointer">
+          <input
+            type="checkbox"
+            checked={bbsOnly}
+            onChange={e => setBbsOnly(e.target.checked)}
+            className="mt-0.5"
+          />
+          <span className="flex-1">
+            <span className="font-bold">BBS-only mode</span>
+            <span className="text-[10px] text-brand-muted normal-case font-normal block mt-0.5">
+              Auto-reply to any DM that isn't a BBS command with the command index (<code className="text-brand-accent">:cmd</code>).
+              Lets you dedicate this radio as a BBS endpoint while another stays a general chat node.
+              The original DM still gets stored so you can see who's pinging the BBS — only the auto-reply behavior is new.
+              Effect applies immediately on save; no reconnect needed.
+            </span>
           </span>
         </label>
       </div>

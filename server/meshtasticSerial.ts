@@ -3445,6 +3445,24 @@ export class MeshtasticSerialBridge extends EventEmitter {
       );
     }
 
+    // v2.0 Beta 4: BBS-only mode. When this radio is designated as a BBS
+    // node (radios.bbs_only=1, propagated via BridgeManager.attachBbs and
+    // updateRadioBbsOnly), any DM that ISN'T a BBS command gets an
+    // auto-reply with the command index. The original DM still flows
+    // through to normal DM storage below so the operator can see who's
+    // pinging the BBS. The check is cheap — bbsOnlyMode false short-
+    // circuits in maybeAutoReplyForBbsOnly before touching the wire.
+    if (
+      !isReaction &&
+      toId === this.localNodeId &&
+      this.bbs &&
+      this.bbs.isBbsOnly()
+    ) {
+      this.bbs.maybeAutoReplyForBbsOnly(fromId, channelIndex).catch(err =>
+        console.error('[MeshtasticSerial] BBS auto-reply failed:', err?.message)
+      );
+    }
+
     // Resolve the channel name so incoming messages appear in the right chat pane.
     // Fall back progressively: channel map → channel index string → primary default.
     const channelName = this.resolveChannelName(channelIndex, toId);

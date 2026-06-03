@@ -549,6 +549,9 @@ export class MeshDataService {
     color_hex: string | null;
     network_label: string | null;
     enabled: boolean;
+    /** v2.0 Beta 4: BBS-only mode toggle. When true, the radio's BbsService
+     *  auto-replies to non-BBS DMs with the command index. */
+    bbs_only: boolean;
   }>): Promise<{ ok: boolean; row?: any; error?: string }> {
     try {
       const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}`, {

@@ -305,6 +305,13 @@ export class MeshDatabase {
         color_hex       TEXT,
         network_label   TEXT,
         is_default      INTEGER NOT NULL DEFAULT 0,
+        -- v2.0 Beta 4: BBS-only mode. When 1, this radio auto-replies to
+        -- any DM that ISN'T a BBS command with the command index. Lets a
+        -- multi-radio operator dedicate one radio as a BBS endpoint while
+        -- another stays a general chat node. The original DM still gets
+        -- stored so the operator can see who's pinging the BBS; only the
+        -- auto-reply behavior is new.
+        bbs_only        INTEGER NOT NULL DEFAULT 0,
         created_at      INTEGER NOT NULL,
         updated_at      INTEGER NOT NULL
       );
@@ -331,6 +338,7 @@ export class MeshDatabase {
     addColumnIfMissing('messages', 'delivery_ms INTEGER');
     addColumnIfMissing('channels', 'position_precision INTEGER');
     addColumnIfMissing('bbs_weather_subscribers', 'zip TEXT');
+    addColumnIfMissing('radios', 'bbs_only INTEGER NOT NULL DEFAULT 0');
 
     // v2.0 multi-radio additive migration. Every radio-scoped table gets a
     // radio_id column. Stays nullable for the migration window so existing
@@ -1897,7 +1905,7 @@ export class MeshDatabase {
     return this.db.prepare(`
       SELECT radio_id, long_name, transport, target, region, modem_preset,
              frequency_slot, primary_channel, num_hops, enabled, color_hex,
-             network_label, is_default, created_at, updated_at
+             network_label, is_default, bbs_only, created_at, updated_at
       FROM radios
       ORDER BY is_default DESC, created_at ASC
     `).all() as RadioRow[];
@@ -1907,7 +1915,7 @@ export class MeshDatabase {
     const row = this.db.prepare(`
       SELECT radio_id, long_name, transport, target, region, modem_preset,
              frequency_slot, primary_channel, num_hops, enabled, color_hex,
-             network_label, is_default, created_at, updated_at
+             network_label, is_default, bbs_only, created_at, updated_at
       FROM radios WHERE radio_id = ?
     `).get(radioId) as RadioRow | undefined;
     return row ?? null;
@@ -1917,7 +1925,7 @@ export class MeshDatabase {
     const row = this.db.prepare(`
       SELECT radio_id, long_name, transport, target, region, modem_preset,
              frequency_slot, primary_channel, num_hops, enabled, color_hex,
-             network_label, is_default, created_at, updated_at
+             network_label, is_default, bbs_only, created_at, updated_at
       FROM radios WHERE is_default = 1
       LIMIT 1
     `).get() as RadioRow | undefined;
@@ -1930,11 +1938,11 @@ export class MeshDatabase {
       INSERT INTO radios (
         radio_id, long_name, transport, target, region, modem_preset,
         frequency_slot, primary_channel, num_hops, enabled, color_hex,
-        network_label, is_default, created_at, updated_at
+        network_label, is_default, bbs_only, created_at, updated_at
       ) VALUES (
         @radio_id, @long_name, @transport, @target, @region, @modem_preset,
         @frequency_slot, @primary_channel, @num_hops, @enabled, @color_hex,
-        @network_label, @is_default, @created_at, @updated_at
+        @network_label, @is_default, @bbs_only, @created_at, @updated_at
       )
       ON CONFLICT(radio_id) DO UPDATE SET
         long_name       = excluded.long_name,
@@ -1949,6 +1957,7 @@ export class MeshDatabase {
         color_hex       = excluded.color_hex,
         network_label   = excluded.network_label,
         is_default      = excluded.is_default,
+        bbs_only        = excluded.bbs_only,
         updated_at      = excluded.updated_at
     `).run({
       radio_id:        r.radio_id,
@@ -1964,9 +1973,18 @@ export class MeshDatabase {
       color_hex:       r.color_hex ?? null,
       network_label:   r.network_label ?? null,
       is_default:      r.is_default ? 1 : 0,
+      bbs_only:        r.bbs_only ? 1 : 0,
       created_at:      r.created_at ?? now,
       updated_at:      now,
     });
+  }
+
+  /** Toggle a radio's BBS-only mode. Returns false if no row matches. */
+  setRadioBbsOnly(radioId: string, on: boolean): boolean {
+    const r = this.db.prepare(
+      `UPDATE radios SET bbs_only = ?, updated_at = ? WHERE radio_id = ?`
+    ).run(on ? 1 : 0, Date.now(), radioId);
+    return r.changes > 0;
   }
 
   /**
@@ -2034,6 +2052,10 @@ export interface RadioRow {
   color_hex: string | null;
   network_label: string | null;
   is_default: number;       // 0|1
+  /** v2.0 Beta 4: when 1, this radio auto-replies to non-BBS DMs with
+   *  the command index. Lets an operator dedicate one radio to BBS while
+   *  others stay general chat nodes. 0 = standard behavior. */
+  bbs_only: number;         // 0|1
   created_at: number;
   updated_at: number;
 }

@@ -107,8 +107,25 @@ class BridgeManager extends EventEmitter {
     const svc = new BbsService(ctx.bridge);
     svc.setRadioId(ctx.radioId);
     if (this.bbsConfig) svc.setConfig(this.bbsConfig);
+    // v2.0 Beta 4: per-radio BBS-only mode. Pulled from the radios row's
+    // bbs_only column so the operator's preference (set via the Radios UI)
+    // survives across reconnects. updateRadioBbsOnly() below re-applies it
+    // at runtime when the operator toggles.
+    svc.setBbsOnlyMode(!!ctx.meta.bbs_only);
     ctx.bridge.setBbs(svc);
     ctx.bbs = svc;
+  }
+
+  /** v2.0 Beta 4: flip the bbs-only flag on an already-attached radio.
+   *  Updates the in-memory BbsService + the cached meta on RadioContext so
+   *  a subsequent listRadios()/getRadio() reflects the change. The DB
+   *  write happens in the API layer. */
+  updateRadioBbsOnly(radioId: string, on: boolean): boolean {
+    const ctx = this.contexts.get(radioId);
+    if (!ctx) return false;
+    ctx.bbs?.setBbsOnlyMode(on);
+    ctx.meta = { ...ctx.meta, bbs_only: on ? 1 : 0 };
+    return true;
   }
 
   /** api.ts calls this once on boot + on every BBS settings save. */
@@ -240,6 +257,7 @@ class BridgeManager extends EventEmitter {
       color_hex:       null,
       network_label:   null,
       is_default:      1,
+      bbs_only:        0,
       created_at:      now,
       updated_at:      now,
     };

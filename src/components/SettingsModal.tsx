@@ -1327,6 +1327,7 @@ interface BbsConfigShape {
   enabled: boolean;
   mailTrigger: string;
   weatherTrigger: string;
+  cmdTrigger: string;
   bodyMaxChars: number;
   retentionDays: number;
   replyPaceMs: number;
@@ -1363,7 +1364,12 @@ function BbsSection() {
 
   const mailErr = cfg ? validateTrigger(cfg.mailTrigger) : null;
   const weatherErr = cfg ? validateTrigger(cfg.weatherTrigger) : null;
-  const triggersIdentical = cfg ? cfg.mailTrigger === cfg.weatherTrigger : false;
+  const cmdErr = cfg ? validateTrigger(cfg.cmdTrigger) : null;
+  const triggersIdentical = cfg
+    ? cfg.mailTrigger === cfg.weatherTrigger
+      || cfg.mailTrigger === cfg.cmdTrigger
+      || cfg.weatherTrigger === cfg.cmdTrigger
+    : false;
   const zipErr = cfg && cfg.homeZipCode && !/^\d{5}$/.test(cfg.homeZipCode)
     ? 'Must be exactly 5 digits (or empty)'
     : null;
@@ -1372,7 +1378,7 @@ function BbsSection() {
     ? 'Use HH:MM (24-hour) or leave empty to disable'
     : null;
 
-  const canSave = cfg && !mailErr && !weatherErr && !triggersIdentical && !zipErr && !timeErr;
+  const canSave = cfg && !mailErr && !weatherErr && !cmdErr && !triggersIdentical && !zipErr && !timeErr;
 
   const handleSave = async () => {
     if (!cfg || !canSave) return;
@@ -1449,7 +1455,7 @@ function BbsSection() {
       {/* Triggers */}
       <div className="space-y-3">
         <h4 className="text-xs font-bold uppercase tracking-widest text-brand-muted">Trigger Keywords</h4>
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-3 gap-3">
           <div className="space-y-1">
             <label className="text-[10px] uppercase font-bold tracking-widest text-brand-muted">Mail trigger</label>
             <input
@@ -1470,7 +1476,7 @@ function BbsSection() {
               type="text"
               value={cfg.weatherTrigger}
               onChange={e => update('weatherTrigger', e.target.value.toLowerCase())}
-              placeholder=":weather"
+              placeholder=":wx"
               className={cn(
                 "w-full bg-brand-line/50 border rounded px-2 py-1.5 text-sm mono-text focus:outline-none",
                 weatherErr ? "border-brand-error" : "border-brand-line focus:border-brand-accent"
@@ -1478,12 +1484,30 @@ function BbsSection() {
             />
             {weatherErr && <div className="text-[10px] text-brand-error">{weatherErr}</div>}
           </div>
+          <div className="space-y-1">
+            <label className="text-[10px] uppercase font-bold tracking-widest text-brand-muted">Command index</label>
+            <input
+              type="text"
+              value={cfg.cmdTrigger}
+              onChange={e => update('cmdTrigger', e.target.value.toLowerCase())}
+              placeholder=":cmd"
+              className={cn(
+                "w-full bg-brand-line/50 border rounded px-2 py-1.5 text-sm mono-text focus:outline-none",
+                cmdErr ? "border-brand-error" : "border-brand-line focus:border-brand-accent"
+              )}
+            />
+            {cmdErr && <div className="text-[10px] text-brand-error">{cmdErr}</div>}
+          </div>
         </div>
         {triggersIdentical && (
           <div className="text-[11px] text-brand-error flex items-center gap-1.5">
-            <AlertCircle size={11} /> Mail and weather triggers must be different.
+            <AlertCircle size={11} /> Triggers must all be different.
           </div>
         )}
+        <p className="text-[10px] text-brand-muted leading-snug">
+          DMing the command-index trigger returns a one-packet list of every
+          active root (e.g. <code className="text-brand-accent">{cfg.cmdTrigger}</code> → <code className="text-brand-accent">Cmds: {cfg.mailTrigger} {cfg.weatherTrigger} {cfg.cmdTrigger}</code>) — classic BBS discoverability.
+        </p>
       </div>
 
       {/* Limits */}

@@ -26,8 +26,17 @@ export interface BbsConfig {
   enabled: boolean;
   /** Trigger keyword for the mail subsystem. Must start with `:`. */
   mailTrigger: string;
-  /** Trigger keyword for the weather subsystem. Must start with `:`. */
+  /** Trigger keyword for the weather subsystem. Must start with `:`.
+   *  v2.0 Beta 4: default changed from ":weather" → ":wx" so the help
+   *  menu (`:wx` with no args) fits comfortably under the 200-char
+   *  Meshtastic packet cap. Existing installs keep their saved trigger;
+   *  only fresh defaults pick up ":wx". Operator can rename in Settings. */
   weatherTrigger: string;
+  /** Trigger keyword for the global command-index handler. DMing this
+   *  returns a one-packet list of every active root trigger so subscribers
+   *  can discover what's available without remembering each subcommand.
+   *  Must start with `:`. Default ":cmd". */
+  cmdTrigger: string;
   /** Hard cap on mail body length, in chars. Meshtastic packet payload tops
    *  out at ~228 bytes after framing; 200 leaves headroom for protocol overhead. */
   bodyMaxChars: number;
@@ -58,7 +67,8 @@ export interface BbsConfig {
 const DEFAULTS: BbsConfig = {
   enabled: true,
   mailTrigger: ':mail',
-  weatherTrigger: ':weather',
+  weatherTrigger: ':wx',
+  cmdTrigger: ':cmd',
   bodyMaxChars: 200,
   retentionDays: 30,
   replyPaceMs: 2_000,
@@ -84,10 +94,15 @@ export function normalizeBbsConfig(partial: Partial<BbsConfig>): BbsConfig {
 
   merged.mailTrigger = sanitizeTrigger(merged.mailTrigger, DEFAULTS.mailTrigger);
   merged.weatherTrigger = sanitizeTrigger(merged.weatherTrigger, DEFAULTS.weatherTrigger);
+  merged.cmdTrigger = sanitizeTrigger(merged.cmdTrigger, DEFAULTS.cmdTrigger);
 
-  // Prevent identical triggers (would route everything to whichever check runs first).
+  // Prevent identical triggers (would route everything to whichever check
+  // runs first). Collisions snap the colliding trigger back to its default.
   if (merged.mailTrigger === merged.weatherTrigger) {
     merged.weatherTrigger = DEFAULTS.weatherTrigger;
+  }
+  if (merged.cmdTrigger === merged.mailTrigger || merged.cmdTrigger === merged.weatherTrigger) {
+    merged.cmdTrigger = DEFAULTS.cmdTrigger;
   }
 
   merged.enabled = !!merged.enabled;

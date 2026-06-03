@@ -504,6 +504,7 @@ app.post('/api/mesh/radios', (req, res) => {
     network_label:   body.network_label ?? null,
     // First radio added becomes default if no default exists yet.
     is_default:      db.getDefaultRadio() ? 0 : 1,
+    bbs_only:        body.bbs_only ? 1 : 0,
     created_at:      now,
     updated_at:      now,
   });
@@ -530,7 +531,15 @@ app.put('/api/mesh/radios/:radioId', (req, res) => {
     enabled:         body.enabled !== undefined ? (body.enabled ? 1 : 0) : existing.enabled,
     color_hex:       body.color_hex       !== undefined ? body.color_hex       : existing.color_hex,
     network_label:   body.network_label   !== undefined ? body.network_label   : existing.network_label,
+    // v2.0 Beta 4: bbs_only flag — when set, the BbsService on this radio
+    // auto-replies to non-BBS DMs with the command index. Propagate to the
+    // live BbsService instance so the toggle takes effect immediately
+    // (otherwise the operator would have to wait for a reconnect).
+    bbs_only:        body.bbs_only        !== undefined ? (body.bbs_only ? 1 : 0) : existing.bbs_only,
   });
+  if (body.bbs_only !== undefined) {
+    bridgeManager.updateRadioBbsOnly(radioId, !!body.bbs_only);
+  }
   return res.json(db.getRadio(radioId));
 });
 

@@ -491,6 +491,10 @@ export interface RadioRow {
   color_hex: string | null;
   network_label: string | null;
   is_default: number;
+  /** v2.0 Beta 4: when 1, this radio auto-replies to non-BBS DMs with the
+   *  command index. Lets an operator dedicate one radio to BBS while
+   *  others stay general chat nodes. */
+  bbs_only: number;
   created_at: number;
   updated_at: number;
 }
