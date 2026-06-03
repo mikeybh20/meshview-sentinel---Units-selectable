@@ -256,14 +256,17 @@ export class MeshDatabase {
       CREATE INDEX IF NOT EXISTS idx_bbs_mail_sender ON bbs_mail(sender_node_id, posted_at DESC);
 
       -- Weather alert subscribers. Each row is a node that has DM'd
-      -- ":weather subscribe" to opt into proactive alerts for the operator's
-      -- configured home ZIP. channel_index is remembered so we reply on the
-      -- same channel they subscribed on (encryption parity).
+      -- ":weather subscribe [ZIP]" to opt into proactive alerts. zip is the
+      -- 5-digit ZIP the subscriber asked to be alerted for; NULL falls back
+      -- to the operator's homeZipCode (preserves the original behavior for
+      -- pre-Beta-4 subscribers). channel_index is remembered so we reply on
+      -- the same channel they subscribed on (encryption parity).
       CREATE TABLE IF NOT EXISTS bbs_weather_subscribers (
         node_id        TEXT PRIMARY KEY,
         subscribed_at  INTEGER NOT NULL,
         channel_index  INTEGER NOT NULL DEFAULT 0,
-        last_alert_at  INTEGER
+        last_alert_at  INTEGER,
+        zip            TEXT
       );
 
       -- Per-node position history. Backs the iOS-style "Position Log" view in
@@ -327,6 +330,7 @@ export class MeshDatabase {
     addColumnIfMissing('messages', 'is_reaction INTEGER NOT NULL DEFAULT 0');
     addColumnIfMissing('messages', 'delivery_ms INTEGER');
     addColumnIfMissing('channels', 'position_precision INTEGER');
+    addColumnIfMissing('bbs_weather_subscribers', 'zip TEXT');
 
     // v2.0 multi-radio additive migration. Every radio-scoped table gets a
     // radio_id column. Stays nullable for the migration window so existing
@@ -1632,17 +1636,27 @@ export class MeshDatabase {
    * through the same bridge the node first contacted us on. Returns true if
    * this is a NEW subscription, false if refreshing an existing one.
    */
-  addWeatherSubscriber(nodeId: string, channelIndex: number, radioId?: string | null, now: number = Date.now()): boolean {
+  addWeatherSubscriber(
+    nodeId: string,
+    channelIndex: number,
+    radioId?: string | null,
+    zip?: string | null,
+    now: number = Date.now(),
+  ): boolean {
     const existing = this.db.prepare(
       `SELECT 1 FROM bbs_weather_subscribers WHERE node_id = ?`
     ).get(nodeId);
+    // v2.0 Beta 4: zip nullable — null means "follow operator's home ZIP."
+    // Validated at the caller (BBS command parser), stored verbatim here.
+    const normalizedZip = (typeof zip === 'string' && /^\d{5}$/.test(zip)) ? zip : null;
     this.db.prepare(`
-      INSERT INTO bbs_weather_subscribers (node_id, subscribed_at, channel_index, radio_id)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO bbs_weather_subscribers (node_id, subscribed_at, channel_index, radio_id, zip)
+      VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(node_id) DO UPDATE SET
         channel_index = excluded.channel_index,
-        radio_id      = excluded.radio_id
-    `).run(nodeId, now, channelIndex, radioId ?? null);
+        radio_id      = excluded.radio_id,
+        zip           = excluded.zip
+    `).run(nodeId, now, channelIndex, radioId ?? null, normalizedZip);
     return !existing;
   }
 
@@ -1667,19 +1681,19 @@ export class MeshDatabase {
    */
   listWeatherSubscribers(radioId?: string | null): Array<{
     nodeId: string; subscribedAt: number; channelIndex: number;
-    lastAlertAt: number | null; radioId: string | null;
+    lastAlertAt: number | null; radioId: string | null; zip: string | null;
   }> {
     const sql = radioId
-      ? `SELECT node_id, subscribed_at, channel_index, last_alert_at, radio_id
+      ? `SELECT node_id, subscribed_at, channel_index, last_alert_at, radio_id, zip
          FROM bbs_weather_subscribers
          WHERE radio_id = ? OR radio_id IS NULL
          ORDER BY subscribed_at DESC`
-      : `SELECT node_id, subscribed_at, channel_index, last_alert_at, radio_id
+      : `SELECT node_id, subscribed_at, channel_index, last_alert_at, radio_id, zip
          FROM bbs_weather_subscribers
          ORDER BY subscribed_at DESC`;
     const rows = this.db.prepare(sql).all(...(radioId ? [radioId] : [])) as Array<{
       node_id: string; subscribed_at: number; channel_index: number;
-      last_alert_at: number | null; radio_id: string | null;
+      last_alert_at: number | null; radio_id: string | null; zip: string | null;
     }>;
     return rows.map(r => ({
       nodeId: r.node_id,
@@ -1687,6 +1701,7 @@ export class MeshDatabase {
       channelIndex: r.channel_index,
       lastAlertAt: r.last_alert_at,
       radioId: r.radio_id,
+      zip: r.zip,
     }));
   }
 

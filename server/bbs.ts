@@ -176,15 +176,28 @@ export class BbsService {
       return this.startRead(fromId, channelIndex);
     }
 
-    // Weather trigger — open the ZIP prompt.
+    // Weather trigger (no args) — return the command menu. v2.0 Beta 4:
+    // replaces the old "send a ZIP" prompt flow with a help message so
+    // subscribers can discover what's actually available. The prompt path
+    // wasn't discoverable and operators had to remember the subcommands.
     if (lower === weatherTrigger) {
-      return this.startWeather(fromId, channelIndex);
+      return this.handleWeatherHelp(fromId, channelIndex);
+    }
+    if (lower === `${weatherTrigger} help` || lower === `${weatherTrigger} ?`) {
+      return this.handleWeatherHelp(fromId, channelIndex);
     }
     // Subcommand: subscribe / unsubscribe / stop / off / status.
     // Recognized BEFORE the generic `<trigger> <zip>` shortcut so e.g.
     // ":weather subscribe" doesn't get treated as ZIP=subscribe.
     if (lower === `${weatherTrigger} subscribe`) {
-      return this.handleWeatherSubscribe(fromId, channelIndex);
+      // No ZIP given — subscribe to the operator's home ZIP (back-compat).
+      return this.handleWeatherSubscribe(fromId, channelIndex, null);
+    }
+    if (lower.startsWith(`${weatherTrigger} subscribe `)) {
+      // v2.0 Beta 4: per-subscriber ZIP. `:weather subscribe 21701` opts
+      // into alerts for that ZIP specifically (not the operator's home).
+      const zip = trimmed.slice(`${weatherTrigger} subscribe `.length).trim();
+      return this.handleWeatherSubscribe(fromId, channelIndex, zip);
     }
     if (
       lower === `${weatherTrigger} unsubscribe` ||
@@ -196,8 +209,9 @@ export class BbsService {
     if (lower === `${weatherTrigger} status`) {
       return this.handleWeatherStatus(fromId, channelIndex);
     }
-    // Shortcut: `:weather <zip>` skips the prompt step. ZIP is always 5 digits;
-    // any non-digit subcommand has been handled above.
+    // Shortcut: `:weather <zip>` returns an on-demand forecast for that ZIP.
+    // Any non-digit subcommand has been handled above; what falls through
+    // here is treated as a ZIP lookup.
     if (lower.startsWith(`${weatherTrigger} `)) {
       const zip = trimmed.slice(weatherTrigger.length + 1).trim();
       return this.handleWeatherZip(fromId, zip, channelIndex);
@@ -552,49 +566,67 @@ export class BbsService {
 
   // ---- Weather flow ----
 
-  /** Park the sender in the weather state so their next message is treated
-   *  as the ZIP. Single-step flow — no further state after the ZIP arrives. */
-  private async startWeather(fromId: string, channelIndex: number): Promise<boolean> {
-    this.weatherSessions.set(fromId, { enteredAt: Date.now(), channelIndex });
-    await this.reply(fromId, 'WEATHER: send 5-digit US ZIP or X to cancel.', channelIndex);
+  /** v2.0 Beta 4: replaces the old "send ZIP" prompt with a discoverable
+   *  command menu. The prompt flow was a hidden two-step path operators
+   *  couldn't discover; help is one packet and lists every available
+   *  subcommand. ≤200 chars per Meshtastic packet — must stay compact. */
+  private async handleWeatherHelp(fromId: string, channelIndex: number): Promise<boolean> {
+    const t = this.config.weatherTrigger;
+    // Total = 197 chars when t = ":weather". Tight on the 200-char cap;
+    // shorter triggers buy headroom.
+    const msg =
+      `${t} <ZIP> = forecast | ` +
+      `${t} subscribe [ZIP] = alerts (default=home) | ` +
+      `${t} stop = unsub | ` +
+      `${t} status = check`;
+    await this.reply(fromId, msg, channelIndex);
     return true;
   }
 
-  /** Subscribe a node to alerts on the operator's home ZIP. Idempotent —
-   *  re-subscribing just updates the reply channel. */
-  private async handleWeatherSubscribe(fromId: string, channelIndex: number): Promise<boolean> {
-    const isNew = meshDb.addWeatherSubscriber(fromId, channelIndex, this.radioId);
-    const home = this.config.homeZipCode;
-    if (!home) {
+  /** Subscribe a node to alerts. v2.0 Beta 4: `zip` parameter — if null,
+   *  follows the operator's home ZIP (back-compat); if set, validated as
+   *  5 digits and stored on the subscriber row for per-ZIP alert routing.
+   *  Idempotent — re-subscribing updates channel + zip. */
+  private async handleWeatherSubscribe(fromId: string, channelIndex: number, zipRaw: string | null): Promise<boolean> {
+    let zip: string | null = null;
+    if (zipRaw) {
+      const trimmed = zipRaw.trim();
+      if (!/^\d{5}$/.test(trimmed)) {
+        await this.reply(fromId, `ZIP must be 5 digits, or omit it to follow the operator's home.`, channelIndex);
+        return true;
+      }
+      zip = trimmed;
+    }
+
+    const isNew = meshDb.addWeatherSubscriber(fromId, channelIndex, this.radioId, zip);
+    const effectiveZip = zip ?? this.config.homeZipCode;
+
+    if (!effectiveZip) {
       await this.reply(
         fromId,
         isNew
-          ? 'Subscribed. No home ZIP configured yet — you\'ll get alerts when the operator sets one.'
-          : 'Already subscribed (channel updated). No home ZIP configured yet — alerts inactive.',
+          ? 'Subscribed. No ZIP set yet (no home configured) — you\'ll get alerts once one is set.'
+          : 'Already subscribed. No ZIP set — alerts inactive until one is configured.',
         channelIndex,
       );
       this.bridge.emit('bbsSubscriber', { nodeId: fromId, action: 'subscribed' });
       return true;
     }
+
+    const scope = zip ? `ZIP ${zip}` : `home ZIP ${effectiveZip}`;
     try {
-      const loc = await weatherService.resolveZip(home);
+      const loc = await weatherService.resolveZip(effectiveZip);
       const where = `${loc.city}, ${loc.state}`;
+      const verb = isNew ? 'Subscribed to' : 'Already subscribed to';
       await this.reply(
         fromId,
-        isNew
-          ? `Subscribed to ${where} alerts. Reply :weather stop to unsubscribe.`
-          : `Already subscribed to ${where}. Reply :weather stop to unsubscribe.`,
+        `${verb} ${where} alerts (${scope}). :weather stop to unsubscribe.`,
         channelIndex,
       );
     } catch (err: any) {
-      console.warn(`[BBS] subscribe location lookup failed: ${err?.message}`);
-      await this.reply(
-        fromId,
-        isNew
-          ? `Subscribed. (Location lookup failed — will retry.)`
-          : `Already subscribed.`,
-        channelIndex,
-      );
+      console.warn(`[BBS] subscribe location lookup for ${effectiveZip} failed: ${err?.message}`);
+      const verb = isNew ? 'Subscribed to' : 'Already subscribed to';
+      await this.reply(fromId, `${verb} ${scope} alerts. (Location lookup will retry.)`, channelIndex);
     }
     this.bridge.emit('bbsSubscriber', { nodeId: fromId, action: 'subscribed' });
     return true;
@@ -612,21 +644,27 @@ export class BbsService {
   }
 
   private async handleWeatherStatus(fromId: string, channelIndex: number): Promise<boolean> {
-    const subscribed = meshDb.isWeatherSubscriber(fromId);
-    const home = this.config.homeZipCode;
-    if (!subscribed) {
+    if (!meshDb.isWeatherSubscriber(fromId)) {
       await this.reply(fromId, 'Not subscribed. Reply :weather subscribe to opt in.', channelIndex);
       return true;
     }
-    if (!home) {
-      await this.reply(fromId, 'Subscribed, but operator has no home ZIP set — alerts inactive.', channelIndex);
+    // v2.0 Beta 4: per-subscriber ZIP. Look up THIS subscriber's row to
+    // surface their effective ZIP — could be their own opt-in (`zip`
+    // column non-null) or the operator's home (zip column null).
+    const subs = meshDb.listWeatherSubscribers();
+    const me = subs.find(s => s.nodeId === fromId);
+    const subscriberZip = me?.zip ?? null;
+    const effectiveZip = subscriberZip ?? this.config.homeZipCode;
+    if (!effectiveZip) {
+      await this.reply(fromId, 'Subscribed, but no ZIP set (no home configured) — alerts inactive.', channelIndex);
       return true;
     }
+    const scopeNote = subscriberZip ? `your ZIP ${subscriberZip}` : `home ZIP ${effectiveZip}`;
     try {
-      const loc = await weatherService.resolveZip(home);
-      await this.reply(fromId, `Subscribed to ${loc.city}, ${loc.state} alerts. :weather stop to opt out.`, channelIndex);
+      const loc = await weatherService.resolveZip(effectiveZip);
+      await this.reply(fromId, `Subscribed to ${loc.city}, ${loc.state} alerts (${scopeNote}). :weather stop to opt out.`, channelIndex);
     } catch {
-      await this.reply(fromId, `Subscribed to ZIP ${home} alerts. :weather stop to opt out.`, channelIndex);
+      await this.reply(fromId, `Subscribed to ${scopeNote} alerts. :weather stop to opt out.`, channelIndex);
     }
     return true;
   }

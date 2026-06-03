@@ -376,6 +376,9 @@ export class MeshDataService {
       channelIndex: number;
       lastAlertAt: number | null;
       radioId: string | null;
+      /** v2.0 Beta 4: subscriber's requested ZIP (5 digits) or null
+       *  (follows operator's home ZIP). */
+      zip: string | null;
     }>;
     total: number;
     radioId: string | null;

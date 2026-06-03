@@ -30,6 +30,10 @@ interface SubscriberRow {
   channelIndex: number;
   lastAlertAt: number | null;
   radioId: string | null;
+  /** v2.0 Beta 4: subscriber's requested ZIP (5 digits), or null to follow
+   *  the operator's home ZIP. Displayed in the Zip column; the CSV export
+   *  also carries it. */
+  zip: string | null;
 }
 
 function relTime(ts: number | null): string {
@@ -149,6 +153,7 @@ export function WeatherView({ nodes }: WeatherViewProps) {
               <tr className="text-brand-muted">
                 <th className="text-left py-2 px-3 font-bold uppercase tracking-widest text-[10px]">Node</th>
                 <th className="text-left py-2 px-3 font-bold uppercase tracking-widest text-[10px]">Radio</th>
+                <th className="text-left py-2 px-3 font-bold uppercase tracking-widest text-[10px]" title="Subscriber's requested ZIP. Empty = follow operator's home ZIP.">Zip</th>
                 <th className="text-left py-2 px-3 font-bold uppercase tracking-widest text-[10px]">Channel</th>
                 <th className="text-left py-2 px-3 font-bold uppercase tracking-widest text-[10px]">Subscribed</th>
                 <th className="text-left py-2 px-3 font-bold uppercase tracking-widest text-[10px]">Last alert</th>
@@ -175,6 +180,11 @@ export function WeatherView({ nodes }: WeatherViewProps) {
                         {s.radioId}
                       </span>
                     ) : <span className="text-brand-muted text-[10px]">—</span>}
+                  </td>
+                  <td className="py-2 px-3 mono-text text-[10px]" title={s.zip ? 'Subscriber requested this ZIP' : 'Following operator home ZIP'}>
+                    {s.zip
+                      ? <span className="text-brand-ink">{s.zip}</span>
+                      : <span className="text-brand-muted italic">home</span>}
                   </td>
                   <td className="py-2 px-3 mono-text text-[10px] text-brand-muted">
                     {s.channelIndex}

@@ -3192,13 +3192,15 @@ app.get('/api/mesh/bbs/weather/subscribers/export.csv', (req, res) => {
       return [n?.shortName ?? '', n?.name ?? ''];
     };
     const csv = toCsv(
-      ['node_id', 'short_name', 'long_name', 'subscribed_at_iso', 'subscribed_at_ms', 'channel_index', 'radio_id', 'last_alert_at_iso'],
+      ['node_id', 'short_name', 'long_name', 'zip', 'subscribed_at_iso', 'subscribed_at_ms', 'channel_index', 'radio_id', 'last_alert_at_iso'],
       subs.map(s => {
         const [shortN, longN] = nameOf(s.nodeId);
         return [
           s.nodeId,
           shortN,
           longN,
+          // v2.0 Beta 4: empty zip column means "follows operator home ZIP".
+          s.zip ?? '',
           new Date(s.subscribedAt).toISOString(),
           s.subscribedAt,
           s.channelIndex,

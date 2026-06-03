@@ -112,18 +112,52 @@ export class WeatherAlertPoller {
   /** Force the daily forecast push to fire NOW, regardless of clock. Used
    *  by the "Send test" button in the BBS settings panel so the operator
    *  can verify subscriber delivery without waiting until tomorrow's 7:30. */
-  async sendDailyForecastNow(): Promise<{ ok: true; subscribers: number; summary: string } | { ok: false; error: string }> {
+  async sendDailyForecastNow(): Promise<{ ok: true; subscribers: number; perZip: Record<string, number> } | { ok: false; error: string }> {
     const cfg = this.getConfig();
     if (!cfg.enabled) return { ok: false, error: 'BBS is disabled' };
-    if (!cfg.homeZipCode) return { ok: false, error: 'homeZipCode is not set' };
     try {
-      const summary = await weatherService.getCurrentSummary(cfg.homeZipCode);
-      const subs = meshDb.listWeatherSubscribers();
-      await this.deliverToSubscribers(summary, FORECAST_SENDER_SHORT);
-      return { ok: true, subscribers: subs.length, summary };
+      const r = await this.pushDailyForecastByZip(cfg.homeZipCode);
+      return { ok: true, ...r };
     } catch (err: any) {
       return { ok: false, error: err?.message ?? 'forecast fetch failed' };
     }
+  }
+
+  /**
+   * v2.0 Beta 4: group subscribers by effective ZIP (their `zip` column, or
+   * homeZip fallback), fetch ONE forecast per distinct ZIP, deliver each
+   * forecast only to that ZIP's subscriber subset. Operators no longer
+   * push a single home forecast to everyone — Baltimore subscribers get
+   * Baltimore weather, Frederick subscribers get Frederick's.
+   */
+  private async pushDailyForecastByZip(homeZip: string): Promise<{ subscribers: number; perZip: Record<string, number> }> {
+    const subs = meshDb.listWeatherSubscribers();
+    // Group by effective ZIP. Drop subscribers whose effective ZIP is
+    // empty (no home configured AND no opt-in zip) — nothing to fetch.
+    const groups = new Map<string, typeof subs>();
+    for (const s of subs) {
+      const effective = s.zip ?? homeZip;
+      if (!effective) continue;
+      const group = groups.get(effective);
+      if (group) group.push(s);
+      else groups.set(effective, [s]);
+    }
+
+    const perZip: Record<string, number> = {};
+    let total = 0;
+    for (const [zip, group] of groups) {
+      let summary: string;
+      try {
+        summary = await weatherService.getCurrentSummary(zip);
+      } catch (err: any) {
+        console.warn(`[WeatherPoller] forecast fetch for ${zip} failed: ${err?.message} — skipping ${group.length} subscriber(s)`);
+        continue;
+      }
+      await this.deliverToSpecificSubscribers(group, summary, FORECAST_SENDER_SHORT);
+      perZip[zip] = group.length;
+      total += group.length;
+    }
+    return { subscribers: total, perZip };
   }
 
   /** "YYYY-MM-DD" in server-local time. The container's TZ environment
@@ -141,7 +175,7 @@ export class WeatherAlertPoller {
    *  steps, container restarts) — a minute tick is robust and cheap. */
   private async dailyTick(): Promise<void> {
     const cfg = this.getConfig();
-    if (!cfg.enabled || !cfg.homeZipCode || !cfg.dailyForecastTime) return;
+    if (!cfg.enabled || !cfg.dailyForecastTime) return;
 
     const now = new Date();
     const hh = String(now.getHours()).padStart(2, '0');
@@ -159,89 +193,140 @@ export class WeatherAlertPoller {
       return;
     }
 
-    let summary: string;
     try {
-      summary = await weatherService.getCurrentSummary(cfg.homeZipCode);
+      // v2.0 Beta 4: per-subscriber-ZIP routing. pushDailyForecastByZip
+      // groups subscribers by their effective ZIP and fetches one forecast
+      // per distinct ZIP — Baltimore subs get Baltimore weather, not the
+      // operator's Frederick weather.
+      const r = await this.pushDailyForecastByZip(cfg.homeZipCode);
+      const zipSummary = Object.entries(r.perZip)
+        .map(([z, n]) => `${z}=${n}`).join(', ');
+      console.log(`[WeatherPoller] Daily forecast (${clock}) sent to ${r.subscribers} subscriber(s): ${zipSummary || '(none)'}`);
     } catch (err: any) {
-      console.warn(`[WeatherPoller] daily forecast fetch failed: ${err?.message}`);
+      console.warn(`[WeatherPoller] daily forecast fan-out failed: ${err?.message}`);
       // Roll back the dayKey so we'll retry on the next tick. NWS hiccups
       // shouldn't cost the operator a day of forecasts.
       this.lastDailySentDay = null;
-      return;
     }
-
-    console.log(`[WeatherPoller] Daily forecast (${clock}): "${summary}" → ${subs.length} subscriber(s)`);
-    await this.deliverToSubscribers(summary, FORECAST_SENDER_SHORT);
   }
 
+  /**
+   * v2.0 Beta 4: per-subscriber ZIP alert routing.
+   *
+   * Pre-Beta-4 the poller asked NWS for active alerts at the operator's
+   * homeZipCode only and fanned every alert out to all subscribers. With
+   * `:weather subscribe <ZIP>` adding per-subscriber zips, the poll set
+   * is now the UNION of:
+   *   - the operator's homeZipCode (always polled — drives event log +
+   *     home subscribers with a null `zip` column)
+   *   - every distinct `zip` value across `bbs_weather_subscribers`
+   *
+   * For each unique ZIP we issue one NWS active-alerts request, dedupe
+   * against `seenAlertIds`, write the WEATHER_ALERT event log row only
+   * for the home ZIP (operator's local zone), and DM each subscriber
+   * whose `effective zip` (their stored zip || home) matches the ZIP
+   * that produced the alert.
+   *
+   * Dedup is per-alert-id GLOBALLY (an NWS alert id is unique). If two
+   * adjacent ZIPs return the same alert, we surface it once and route to
+   * whichever subscriber set matches. The alert's NWS-side coverage area
+   * already determined which ZIPs were affected.
+   */
   private async tick(): Promise<void> {
     const cfg = this.getConfig();
-    if (!cfg.enabled || !cfg.homeZipCode) {
-      // Cleared while we were waiting — drop the dedup state so a re-enable
-      // doesn't suppress alerts that are no longer "seen this run".
+    if (!cfg.enabled) {
       if (this.seenAlertIds.size > 0) this.seenAlertIds.clear();
       return;
     }
 
-    let alerts: NwsAlert[];
-    let locationLabel: string;
-    try {
-      alerts = await weatherService.getActiveAlerts(cfg.homeZipCode);
-      const loc = await weatherService.resolveZip(cfg.homeZipCode);
-      locationLabel = `${loc.city}, ${loc.state}`;
-    } catch (err: any) {
-      console.warn(`[WeatherPoller] poll failed: ${err?.message}`);
+    // Build the union of ZIPs we need to poll. Always include the home
+    // ZIP if set; add every distinct subscriber-requested ZIP on top.
+    const subs = meshDb.listWeatherSubscribers();
+    const zipsToPoll = new Set<string>();
+    if (cfg.homeZipCode) zipsToPoll.add(cfg.homeZipCode);
+    for (const s of subs) if (s.zip) zipsToPoll.add(s.zip);
+    if (zipsToPoll.size === 0) {
+      if (this.seenAlertIds.size > 0) this.seenAlertIds.clear();
       return;
     }
 
-    // Reset dedup for any alerts that have rolled off NWS's active list.
-    const currentIds = new Set(alerts.map(a => a.id));
+    // Poll each ZIP serially — small set, no concurrency benefit + keeps
+    // NWS's 10-req/s soft limit comfortably out of reach. Collect per-ZIP
+    // alert lists for the dedup-rollover step + the per-subscriber fanout.
+    const alertsByZip = new Map<string, NwsAlert[]>();
+    const labelsByZip = new Map<string, string>();
+    for (const zip of zipsToPoll) {
+      try {
+        const alerts = await weatherService.getActiveAlerts(zip);
+        const loc = await weatherService.resolveZip(zip);
+        alertsByZip.set(zip, alerts);
+        labelsByZip.set(zip, `${loc.city}, ${loc.state}`);
+      } catch (err: any) {
+        console.warn(`[WeatherPoller] poll failed for ${zip}: ${err?.message}`);
+        // Soft-fail this ZIP — other ZIPs still get processed.
+      }
+    }
+
+    // Roll dedup state forward — any alert id we'd previously surfaced
+    // that's no longer in ANY ZIP's active list expires from `seenAlertIds`
+    // so a future re-issue surfaces normally.
+    const currentIds = new Set<string>();
+    for (const list of alertsByZip.values()) for (const a of list) currentIds.add(a.id);
     for (const oldId of this.seenAlertIds) {
       if (!currentIds.has(oldId)) this.seenAlertIds.delete(oldId);
     }
 
     let newCount = 0;
-    for (const alert of alerts) {
-      if (this.seenAlertIds.has(alert.id)) continue;
-      this.seenAlertIds.add(alert.id);
+    for (const [zip, alerts] of alertsByZip) {
+      const locationLabel = labelsByZip.get(zip) ?? zip;
+      const isHomeZip = zip === cfg.homeZipCode;
+      for (const alert of alerts) {
+        if (this.seenAlertIds.has(alert.id)) continue;
+        this.seenAlertIds.add(alert.id);
 
-      // On the very first tick after startup we silently absorb existing
-      // alerts — the operator already knows about them from their phone /
-      // radio / TV / etc. We don't want to spam the event log with stale
-      // alerts every time the container restarts. Subsequent ticks fire
-      // events normally.
-      if (this.firstRun) continue;
+        // First-tick baseline absorption — still don't spam the event log
+        // with everything that was already active when the container booted.
+        if (this.firstRun) continue;
 
-      newCount++;
-      const compact = weatherService.formatAlertCompact(alert, locationLabel);
-      // v2.0 multi-radio: surface the WEATHER_ALERT event on every connected
-      // bridge so each radio's event log records it locally. Falls back to
-      // logging just the default bridge if BridgeManager hasn't registered
-      // any context yet (very early boot).
-      for (const ctx of this.bm.list()) {
-        ctx.bridge.recordEvent({
-          // Prefix with `wx-` so the alert id doesn't collide with the normal
-          // randomId() format used for radio events.
-          id: `wx-${alert.id}-${ctx.radioId}`,
-          type: 'WEATHER_ALERT',
-          nodeId: 'local',
-          timestamp: Date.now(),
-          details: compact,
+        newCount++;
+        const compact = weatherService.formatAlertCompact(alert, locationLabel);
+
+        // Surface the alert on the operator's event log only for home-ZIP
+        // alerts. Per-subscriber-ZIP alerts route to the subscriber but
+        // shouldn't pollute the operator's local-area alert feed.
+        if (isHomeZip) {
+          for (const ctx of this.bm.list()) {
+            ctx.bridge.recordEvent({
+              id: `wx-${alert.id}-${ctx.radioId}`,
+              type: 'WEATHER_ALERT',
+              nodeId: 'local',
+              timestamp: Date.now(),
+              details: compact,
+            });
+          }
+        }
+        console.log(`[WeatherPoller] NEW alert for ${zip}${isHomeZip ? ' (home)' : ''}: ${compact}`);
+
+        // Subscriber subset whose effective ZIP equals this poll's ZIP.
+        const matchingSubs = subs.filter(s => {
+          const effective = s.zip ?? cfg.homeZipCode;
+          return effective === zip;
         });
+        if (matchingSubs.length === 0) {
+          // Polled this ZIP (subscriber requested it) but no one's matching
+          // now — could happen if they unsubscribed mid-tick. Skip the fanout.
+          continue;
+        }
+        await this.deliverToSpecificSubscribers(matchingSubs, compact, ALERT_SENDER_SHORT);
       }
-      console.log(`[WeatherPoller] NEW alert: ${compact}`);
-
-      // Fan out to subscribers. DM goes out over the radio (best-effort — may
-      // bounce if recipient is offline); mail row is persisted unconditionally
-      // so subscribers can pull it later via :mail R.
-      await this.deliverToSubscribers(compact, ALERT_SENDER_SHORT);
     }
 
     if (this.firstRun) {
-      console.log(`[WeatherPoller] First-run baseline absorbed ${alerts.length} existing alert(s) for ${locationLabel}`);
+      const totalSeen = Array.from(alertsByZip.values()).reduce((a, l) => a + l.length, 0);
+      console.log(`[WeatherPoller] First-run baseline absorbed ${totalSeen} alert(s) across ${zipsToPoll.size} ZIP(s)`);
       this.firstRun = false;
     } else if (newCount > 0) {
-      console.log(`[WeatherPoller] surfaced ${newCount} new alert(s)`);
+      console.log(`[WeatherPoller] surfaced ${newCount} new alert(s) across ${zipsToPoll.size} ZIP(s)`);
     }
   }
 
@@ -258,11 +343,21 @@ export class WeatherAlertPoller {
    * global TX queue limit when many are subscribed.
    */
   private async deliverToSubscribers(compact: string, senderShort: string): Promise<void> {
-    // v2.0 multi-radio: each subscriber row knows which radio they
-    // subscribed via. Route the DM back through that radio's bridge so
-    // multi-mesh operators reach the right peers. Subscribers with a NULL
-    // radio_id (1.x legacy rows) fall back to the default radio.
-    const subscribers = meshDb.listWeatherSubscribers();
+    return this.deliverToSpecificSubscribers(meshDb.listWeatherSubscribers(), compact, senderShort);
+  }
+
+  /**
+   * v2.0 Beta 4: same DM-then-mail-row delivery as deliverToSubscribers,
+   * but the subscriber set is supplied by the caller. Lets the per-ZIP
+   * alert routing in tick() send each alert only to subscribers whose
+   * effective ZIP matches the alert's origin, and lets the daily-forecast
+   * scheduler group subscribers by ZIP so each gets THEIR forecast.
+   */
+  private async deliverToSpecificSubscribers(
+    subscribers: Array<{ nodeId: string; channelIndex: number; radioId: string | null; zip: string | null }>,
+    compact: string,
+    senderShort: string,
+  ): Promise<void> {
     if (subscribers.length === 0) return;
 
     const defaultBridge = this.bm.getDefault()?.bridge ?? null;
@@ -271,7 +366,7 @@ export class WeatherAlertPoller {
       return;
     }
 
-    console.log(`[WeatherPoller] Fanning out alert to ${subscribers.length} subscriber(s)`);
+    console.log(`[WeatherPoller] Fanning out to ${subscribers.length} subscriber(s)`);
     let delivered = 0;
     let skipped = 0;
     for (const sub of subscribers) {
