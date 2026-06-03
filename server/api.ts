@@ -728,6 +728,68 @@ app.post('/api/mesh/radios/:radioId/network/refresh', async (req, res) => {
   catch (err: any) { return res.status(500).json({ error: err.message }); }
 });
 
+/**
+ * v2.0 Beta 5: write NetworkConfig (WiFi SSID/PSK/Eth/NTP).
+ *
+ * LOCAL ADMIN ONLY. The bridge.setNetworkConfig path writes to the
+ * radio's admin app over THIS bridge's own transport — never relayed
+ * across LoRa. Concrete checks before we accept the write:
+ *
+ *   - The radio must have a registered context in BridgeManager. No
+ *     context means no local connection, which means no local admin
+ *     path. Return 404 (matches the readback / refresh endpoints).
+ *
+ *   - The transport must be serial or tcp. BLE isn't supported yet
+ *     and any future "mesh-admin via LoRa" path would explicitly NOT
+ *     resolve here — refuse with 400 if we see one.
+ *
+ *   - The bridge must currently be connected. Disconnect = no admin
+ *     channel. Return 503 (matches every other admin-write endpoint).
+ *
+ * The body is a partial NetworkConfig — operators rarely change every
+ * field. setNetworkConfig merges against the last readback for
+ * fields the operator didn't touch (except wifi_psk, which the
+ * firmware never echoes — see the comment there).
+ */
+app.post('/api/mesh/radios/:radioId/network', async (req, res) => {
+  const ctx = bridgeManager.get(req.params.radioId);
+  if (!ctx) return res.status(404).json({ error: 'radio not found or not connected (local admin requires a direct connection)' });
+  if (!ctx.bridge.connected) return res.status(503).json({ error: `radio "${req.params.radioId}" is not connected` });
+  const transport = ctx.meta.transport;
+  if (transport !== 'serial' && transport !== 'tcp') {
+    return res.status(400).json({ error: `NetworkConfig writes require a direct serial or TCP connection (this radio is on "${transport}")` });
+  }
+
+  const { wifiEnabled, wifiSsid, wifiPsk, ntpServer, ethEnabled } = req.body ?? {};
+  // Coarse type validation. The bridge validates SSID/PSK length itself,
+  // but boolean / string typing belongs at the API edge.
+  if (wifiEnabled !== undefined && typeof wifiEnabled !== 'boolean') {
+    return res.status(400).json({ error: 'wifiEnabled must be a boolean' });
+  }
+  if (wifiSsid !== undefined && typeof wifiSsid !== 'string') {
+    return res.status(400).json({ error: 'wifiSsid must be a string' });
+  }
+  if (wifiPsk !== undefined && typeof wifiPsk !== 'string') {
+    return res.status(400).json({ error: 'wifiPsk must be a string' });
+  }
+  if (ntpServer !== undefined && typeof ntpServer !== 'string') {
+    return res.status(400).json({ error: 'ntpServer must be a string' });
+  }
+  if (ethEnabled !== undefined && typeof ethEnabled !== 'boolean') {
+    return res.status(400).json({ error: 'ethEnabled must be a boolean' });
+  }
+
+  try {
+    await ctx.bridge.setNetworkConfig({ wifiEnabled, wifiSsid, wifiPsk, ntpServer, ethEnabled });
+    // Don't echo the PSK back in the response either. The optimistic
+    // local snapshot doesn't store it; getLocalNetworkConfig returns
+    // PSK-free state by design.
+    return res.json({ ok: true, live: ctx.bridge.getLocalNetworkConfig() });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/mesh/radios/:radioId/power', (req, res) => {
   const ctx = bridgeManager.get(req.params.radioId);
   if (!ctx) return res.status(404).json({ error: 'radio not found or not connected' });

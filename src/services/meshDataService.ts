@@ -750,6 +750,34 @@ export class MeshDataService {
     }
   }
 
+  /**
+   * v2.0 Beta 5: write NetworkConfig (WiFi SSID/PSK, Eth toggle, NTP).
+   * Local-admin only — server refuses if the radio isn't directly
+   * connected via serial or TCP. Omit a field to leave it untouched
+   * (the bridge merges against the last readback). Omit wifiPsk to
+   * clear it (firmware never echoes PSKs so we can't preserve them).
+   */
+  async setRadioNetwork(radioId: string, patch: Partial<{
+    wifiEnabled: boolean;
+    wifiSsid: string;
+    wifiPsk: string;
+    ntpServer: string;
+    ethEnabled: boolean;
+  }>): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/radios/${encodeURIComponent(radioId)}/network`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'request failed' };
+    }
+  }
+
   // v2.0 Beta 2: Canned Messages (per radio). The device stores a
   // pipe-delimited preset list; we read/write it as a string[].
   async getRadioCannedMessages(radioId: string): Promise<{ messages: string[] | null } | null> {

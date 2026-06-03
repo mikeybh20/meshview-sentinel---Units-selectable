@@ -1332,11 +1332,19 @@ function CannedMessagesSection({ radioId }: { radioId: string }) {
 /**
  * v2.0 Beta 2 — Read-only Network config surface.
  *
- * Shows whether the radio is using WiFi or Ethernet plus the SSID + NTP
- * server when reported. Sentinel doesn't edit network config here today —
- * fiddly WiFi PSK + DHCP/static IP belong in the Meshtastic phone app where
- * they can be entered out-of-band of the LoRa link. Surfacing the state
- * gives operators "is my backup WebUI reachable?" info at a glance.
+ * v2.0 Beta 5: now editable. WiFi SSID/PSK, Eth toggle, and NTP can be
+ * written from here, gated to LOCAL ADMIN ONLY — the server-side endpoint
+ * refuses the write unless this radio has a live serial/TCP context (i.e.,
+ * we're talking to the radio directly, not relaying admin packets across
+ * the LoRa mesh). That's the threat we're avoiding: WiFi PSKs broadcast
+ * over the air to every nearby node. Sentinel's admin path never touches
+ * LoRa, so writes from here go strictly over the operator's own
+ * connection to the device.
+ *
+ * Important: WiFi credentials don't survive a readback (firmware never
+ * echoes the PSK). If you click Save without typing a PSK, the firmware
+ * CLEARS the saved one. Empty + SSID + wifi=on = WPA-open expectation,
+ * which most networks reject — the confirmation dialog flags this.
  */
 function NetworkConfigSection({ radioId }: { radioId: string }) {
   const [live, setLive] = React.useState<{
@@ -1344,28 +1352,105 @@ function NetworkConfigSection({ radioId }: { radioId: string }) {
   } | null>(null);
   const [refreshing, setRefreshing] = React.useState(false);
 
+  // Editable form state — synced from live on first load + every refresh.
+  // PSK is intentionally NEVER synced (firmware doesn't echo it); operator
+  // must re-enter on every change, which the warning copy explains.
+  const [wifiEnabled, setWifiEnabled] = React.useState(false);
+  const [wifiSsid, setWifiSsid] = React.useState('');
+  const [wifiPsk, setWifiPsk] = React.useState('');
+  const [ntpServer, setNtpServer] = React.useState('');
+  const [ethEnabled, setEthEnabled] = React.useState(false);
+  const [pskVisible, setPskVisible] = React.useState(false);
+
+  const [saving, setSaving] = React.useState(false);
+  const [msg, setMsg] = React.useState<{ tone: 'ok' | 'err'; text: string } | null>(null);
+
+  const applyLive = (snap: NonNullable<typeof live>) => {
+    setLive(snap);
+    setWifiEnabled(snap.wifiEnabled);
+    setWifiSsid(snap.wifiSsid ?? '');
+    setNtpServer(snap.ntpServer ?? '');
+    setEthEnabled(snap.ethEnabled);
+    // Deliberately NOT touching wifiPsk — firmware never returns it.
+  };
+
   React.useEffect(() => {
     let cancelled = false;
     meshDataService.getRadioNetwork(radioId).then(data => {
-      if (cancelled || !data) return;
-      setLive(data.live);
+      if (cancelled || !data?.live) return;
+      applyLive(data.live);
     });
     return () => { cancelled = true; };
   }, [radioId]);
 
   const refresh = async () => {
     setRefreshing(true);
+    setMsg(null);
     await meshDataService.refreshRadioNetwork(radioId);
     setTimeout(async () => {
       const data = await meshDataService.getRadioNetwork(radioId);
-      if (data) setLive(data.live);
+      if (data?.live) applyLive(data.live);
       setRefreshing(false);
     }, 1200);
   };
 
+  const ssidErr =
+    wifiSsid.length > 32 ? 'SSID exceeds the 32-character 802.11 limit' :
+    null;
+  const pskErr =
+    wifiPsk && (wifiPsk.length < 8 || wifiPsk.length > 63)
+      ? 'WPA2 PSK must be 8..63 characters (or empty for an open network)'
+      : null;
+  const canSave = !ssidErr && !pskErr && !saving;
+
+  const save = async () => {
+    setMsg(null);
+    // Empty-PSK confirm: nearly always a foot-gun unless the network is
+    // genuinely open. Confirmation copy spells it out + offers cancel.
+    if (wifiEnabled && !wifiPsk) {
+      const proceed = confirm(
+        `Save with an EMPTY WiFi PSK?\n\n` +
+        `The firmware doesn't echo saved PSKs on readback, so leaving this blank ` +
+        `will CLEAR the radio's current PSK — your radio will try to join "${wifiSsid}" as an OPEN network. ` +
+        `Most networks reject this and the radio will fall off WiFi until you reconnect via USB.\n\n` +
+        `Cancel and re-type your WiFi password unless you're sure this is an open network.`
+      );
+      if (!proceed) return;
+    }
+    if (!confirm(
+      `Write Network config to ${radioId}?\n\n` +
+      `WiFi: ${wifiEnabled ? 'ON' : 'off'}\n` +
+      `SSID: ${wifiSsid || '(empty)'}\n` +
+      `PSK:  ${wifiPsk ? `(${wifiPsk.length} chars)` : '(empty — will clear saved PSK)'}\n` +
+      `Eth:  ${ethEnabled ? 'ON' : 'off'}\n` +
+      `NTP:  ${ntpServer || '(empty)'}\n\n` +
+      `Local admin only — Sentinel writes over its own connection to the radio, never over LoRa. ` +
+      `If the radio is currently on WiFi and these credentials are wrong, it may drop the LAN connection ` +
+      `until you reconnect via USB.`
+    )) return;
+
+    setSaving(true);
+    const r = await meshDataService.setRadioNetwork(radioId, {
+      wifiEnabled,
+      wifiSsid,
+      wifiPsk,
+      ntpServer,
+      ethEnabled,
+    });
+    setSaving(false);
+    if (!r.ok) {
+      setMsg({ tone: 'err', text: r.error || 'Save failed' });
+      return;
+    }
+    setMsg({ tone: 'ok', text: 'Sent — radio should join the new network within ~15s. Refresh to confirm.' });
+    // Clear the PSK input post-send so it isn't sitting in the DOM. The
+    // input is `type=password` already but extra hygiene doesn't hurt.
+    setWifiPsk('');
+  };
+
   return (
-    <div className="pt-3 border-t border-brand-line">
-      <div className="flex items-center justify-between mb-2">
+    <div className="pt-3 border-t border-brand-line space-y-3">
+      <div className="flex items-center justify-between">
         <h5 className="text-[11px] font-bold uppercase tracking-widest text-brand-ink">Network</h5>
         <button
           onClick={refresh}
@@ -1375,38 +1460,100 @@ function NetworkConfigSection({ radioId }: { radioId: string }) {
           <RefreshCw size={10} className={refreshing ? 'animate-spin' : ''} /> Refresh
         </button>
       </div>
-      {!live ? (
-        <div className="text-[11px] text-brand-muted">
-          No Network config readback yet. Click Refresh once the radio is connected.
-        </div>
-      ) : (
-        <div className="text-[11px] text-brand-muted space-y-1">
-          <div>
-            WiFi:{' '}
-            <span className={live.wifiEnabled ? 'text-emerald-400 font-bold' : 'text-brand-muted'}>
-              {live.wifiEnabled ? 'ON' : 'off'}
-            </span>
-            {live.wifiSsid && (
-              <span className="ml-1 mono-text text-brand-ink">· SSID: {live.wifiSsid}</span>
-            )}
-          </div>
-          <div>
-            Ethernet:{' '}
-            <span className={live.ethEnabled ? 'text-emerald-400 font-bold' : 'text-brand-muted'}>
-              {live.ethEnabled ? 'ON' : 'off'}
-            </span>
-          </div>
-          {live.ntpServer && (
-            <div className="mono-text">NTP: <span className="text-brand-ink">{live.ntpServer}</span></div>
-          )}
-          {live.wifiEnabled && live.wifiSsid && (
-            <p className="text-[10px] text-brand-muted/80 italic mt-1">
-              When WiFi is on, the radio hosts its own captive UI. Point a browser at the radio's IP on your LAN.
-              (Edit WiFi credentials via the Meshtastic phone app — Sentinel deliberately doesn't transit PSKs over LoRa.)
-            </p>
-          )}
+
+      {msg && (
+        <div className={cn(
+          'flex items-start gap-2 text-[11px] rounded border px-2 py-1.5',
+          msg.tone === 'ok'
+            ? 'border-brand-accent/40 bg-brand-accent/10 text-brand-accent'
+            : 'border-red-500/40 bg-red-500/10 text-red-300',
+        )}>
+          {msg.tone === 'ok' ? <Check size={11} className="mt-0.5" /> : <AlertCircle size={11} className="mt-0.5" />}
+          <span>{msg.text}</span>
         </div>
       )}
+
+      {/* WiFi toggle */}
+      <label className="flex items-center gap-2 text-[11px] text-brand-ink select-none cursor-pointer">
+        <input type="checkbox" checked={wifiEnabled} onChange={e => setWifiEnabled(e.target.checked)} />
+        <span className="font-bold">WiFi enabled</span>
+      </label>
+
+      <div className="grid grid-cols-2 gap-2">
+        <div className="space-y-1">
+          <label className="text-[10px] font-bold uppercase tracking-widest text-brand-muted">SSID</label>
+          <input
+            type="text"
+            value={wifiSsid}
+            onChange={e => setWifiSsid(e.target.value)}
+            placeholder="MyWiFi"
+            maxLength={32}
+            className={cn(
+              'w-full bg-brand-line/50 border rounded px-2 py-1 text-[12px] mono-text focus:outline-none',
+              ssidErr ? 'border-brand-error' : 'border-brand-line focus:border-brand-accent',
+            )}
+          />
+          {ssidErr && <div className="text-[10px] text-brand-error">{ssidErr}</div>}
+        </div>
+        <div className="space-y-1">
+          <label className="text-[10px] font-bold uppercase tracking-widest text-brand-muted flex items-center justify-between">
+            <span>PSK</span>
+            <button
+              type="button"
+              onClick={() => setPskVisible(v => !v)}
+              className="text-brand-muted hover:text-brand-ink normal-case"
+            >
+              {pskVisible ? 'hide' : 'show'}
+            </button>
+          </label>
+          <input
+            type={pskVisible ? 'text' : 'password'}
+            value={wifiPsk}
+            onChange={e => setWifiPsk(e.target.value)}
+            placeholder="(re-type on every change)"
+            autoComplete="off"
+            className={cn(
+              'w-full bg-brand-line/50 border rounded px-2 py-1 text-[12px] mono-text focus:outline-none',
+              pskErr ? 'border-brand-error' : 'border-brand-line focus:border-brand-accent',
+            )}
+          />
+          {pskErr && <div className="text-[10px] text-brand-error">{pskErr}</div>}
+        </div>
+      </div>
+
+      {/* Eth + NTP */}
+      <label className="flex items-center gap-2 text-[11px] text-brand-ink select-none cursor-pointer">
+        <input type="checkbox" checked={ethEnabled} onChange={e => setEthEnabled(e.target.checked)} />
+        <span className="font-bold">Ethernet enabled</span>
+        <span className="text-[10px] text-brand-muted normal-case font-normal">(boards with an Ethernet PHY only)</span>
+      </label>
+
+      <div className="space-y-1">
+        <label className="text-[10px] font-bold uppercase tracking-widest text-brand-muted">NTP server (optional)</label>
+        <input
+          type="text"
+          value={ntpServer}
+          onChange={e => setNtpServer(e.target.value)}
+          placeholder="meshtastic.pool.ntp.org"
+          className="w-full bg-brand-line/50 border border-brand-line rounded px-2 py-1 text-[12px] mono-text focus:outline-none focus:border-brand-accent"
+        />
+      </div>
+
+      <button
+        onClick={save}
+        disabled={!canSave}
+        className="bg-brand-accent/10 hover:bg-brand-accent/20 disabled:opacity-40 border border-brand-accent/40 text-brand-accent text-[10px] font-bold uppercase tracking-widest rounded px-3 py-1.5"
+      >
+        {saving ? 'Writing…' : 'Save network config'}
+      </button>
+
+      <p className="text-[10px] text-brand-muted/80 italic leading-snug">
+        Local admin only — Sentinel writes over its own direct connection to the radio (serial or TCP),
+        never over LoRa. The firmware does not echo saved WiFi PSKs on readback, so the PSK field starts
+        empty on every refresh. Type your current PSK every time you save, otherwise the radio will
+        clear it. If you write wrong WiFi credentials, your radio may drop the LAN connection until you
+        reconnect via USB.
+      </p>
     </div>
   );
 }

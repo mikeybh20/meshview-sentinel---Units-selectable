@@ -4200,6 +4200,95 @@ export class MeshtasticSerialBridge extends EventEmitter {
     console.log('[MeshtasticSerial] Requested Network config readback');
   }
 
+  /**
+   * v2.0 Beta 5: write a new NetworkConfig (WiFi SSID/PSK, NTP, Eth toggle).
+   * Strictly LOCAL ADMIN — `sendAdminMessage` writes to this bridge's own
+   * transport (the operator's USB or LAN-direct TCP connection to the
+   * radio), never relayed across LoRa. The threat we're avoiding is the
+   * WiFi PSK getting broadcast over the air to the wider mesh; since our
+   * admin path never touches LoRa, that can't happen here. The API layer
+   * additionally refuses writes on radios where the bridge isn't the
+   * direct-connection one (no contexts means no local admin).
+   *
+   * Untouched protobuf fields are preserved by the firmware on
+   * set_config, so we only emit the fields the operator changed. Same
+   * shape pattern as setPowerConfig / setLoraConfig.
+   *
+   * Caveat: writing wifi_enabled=true with a PSK the radio rejects (wrong
+   * SSID, channel, etc.) can take the radio off WiFi until the operator
+   * reconnects via USB. There's no way to verify success from this end
+   * other than a follow-up readback (which we schedule, but it depends
+   * on the radio actually staying reachable post-write). UI gates this
+   * behind a confirm dialog with that warning.
+   */
+  async setNetworkConfig(opts: {
+    wifiEnabled?: boolean;
+    wifiSsid?: string;
+    wifiPsk?: string;
+    ntpServer?: string;
+    ethEnabled?: boolean;
+  }): Promise<void> {
+    if (!this.isLinkOpen()) throw new Error('Radio not connected');
+    if (!this.localNodeNum) throw new Error('Local node not yet identified — try again in a moment');
+
+    const baseline = this.localNetworkConfig;
+    const merged = {
+      wifiEnabled: opts.wifiEnabled ?? baseline?.wifiEnabled ?? false,
+      wifiSsid:    opts.wifiSsid    ?? baseline?.wifiSsid    ?? '',
+      // PSK is NEVER in the readback (firmware doesn't echo it for security),
+      // so we can't fall back to baseline for it. If the operator didn't
+      // explicitly type one, send empty — firmware will clear the saved PSK.
+      // The UI surfaces this trade-off in its confirmation copy.
+      wifiPsk:     opts.wifiPsk     ?? '',
+      ntpServer:   opts.ntpServer   ?? baseline?.ntpServer   ?? '',
+      ethEnabled:  opts.ethEnabled  ?? baseline?.ethEnabled  ?? false,
+    };
+
+    // Validate SSID length (32-byte 802.11 limit) and PSK length (8..63 for
+    // WPA2). Empty PSK is allowed (open network OR clear saved PSK).
+    if (merged.wifiSsid.length > 32) {
+      throw new Error('WiFi SSID exceeds 32-character 802.11 limit');
+    }
+    if (merged.wifiPsk && (merged.wifiPsk.length < 8 || merged.wifiPsk.length > 63)) {
+      throw new Error('WPA2 PSK must be 8..63 characters (or empty for open network)');
+    }
+
+    // NetworkConfig field numbers from config.proto:
+    //   1=wifi_enabled, 3=wifi_ssid, 4=wifi_psk, 5=ntp_server, 6=eth_enabled.
+    // Field 2 (wifi_psk_legacy?) and 7+ (ipv4_config etc.) are skipped.
+    const networkPayload = Buffer.concat([
+      this.encodeTagBool(1, merged.wifiEnabled),
+      this.encodeTagLen(3,  Buffer.from(merged.wifiSsid,  'utf-8')),
+      this.encodeTagLen(4,  Buffer.from(merged.wifiPsk,   'utf-8')),
+      this.encodeTagLen(5,  Buffer.from(merged.ntpServer, 'utf-8')),
+      this.encodeTagBool(6, merged.ethEnabled),
+    ]);
+    const configMsg = this.encodeTagLen(4, networkPayload);   // Config.network (field 4)
+    const adminPayload = this.encodeTagLen(33, configMsg);    // AdminMessage.set_config
+
+    this.sendAdminMessage(adminPayload);
+    await new Promise(r => setTimeout(r, 80));
+    this.sendAdminMessage(this.buildAdminCommit());
+
+    // PSK redacted in the log — we don't want WiFi credentials in docker logs
+    // even on the operator's own host (often forwarded to journald etc.).
+    console.log(`[MeshtasticSerial] Network config write: wifi=${merged.wifiEnabled} ssid="${merged.wifiSsid}" psk=${merged.wifiPsk ? '[set]' : '[empty]'} ntp="${merged.ntpServer}" eth=${merged.ethEnabled}`);
+
+    // Optimistic local cache update — minus the PSK, which we never store.
+    this.localNetworkConfig = {
+      wifiEnabled: merged.wifiEnabled,
+      wifiSsid:    merged.wifiSsid,
+      ethEnabled:  merged.ethEnabled,
+      ntpServer:   merged.ntpServer,
+      lastReadAt:  Date.now(),
+    };
+    this.emit('networkConfigUpdate', this.localNetworkConfig);
+    // Re-request to confirm the radio applied the change. May fail if the
+    // radio just dropped its old WiFi to join the new one — operator may
+    // need to refresh manually once the radio settles.
+    setTimeout(() => { this.requestNetworkConfig().catch(() => {}); }, 1500);
+  }
+
   /** v2.0 Beta 2: ask the local radio for its PowerConfig (sleep, battery). */
   async requestPowerConfig(): Promise<void> {
     if (!this.isLinkOpen()) return;
