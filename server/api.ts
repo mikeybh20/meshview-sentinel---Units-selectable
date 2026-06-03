@@ -46,7 +46,16 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const app = express();
-app.use(express.json());
+// v2.0 Beta 5: default JSON body limit is 100KB which is too small for
+// the encrypted full-backup envelope (radios + channels + groups +
+// waypoints + bbs_mail + weather subscribers + users + optional
+// history all base64'd into one JSON blob). Restore failed with HTTP
+// 413 Payload Too Large on a real-world dataset. 50MB easily covers a
+// multi-year history-included backup while still rejecting truly
+// pathological payloads. Sentinel is auth'd + LAN-bound + behind the
+// operator's own infra, so the abuse surface from a larger limit is
+// negligible.
+app.use(express.json({ limit: '50mb' }));
 
 // --- Serve built frontend in production ---
 const distPath = join(__dirname, '..', 'dist');
