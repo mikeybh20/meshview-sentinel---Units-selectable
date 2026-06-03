@@ -1310,10 +1310,8 @@ export default function App() {
 
         <AnimatePresence>
           {showExportModal && (
-            <ExportModal 
+            <ExportModal
               nodes={nodes}
-              messages={messages}
-              events={events}
               onClose={() => setShowExportModal(false)}
             />
           )}

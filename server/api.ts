@@ -3217,6 +3217,141 @@ function toCsv(headers: string[], rows: any[][]): string {
   return lines.join('\r\n');
 }
 
+/**
+ * v2.0 Beta 5: server-side CSV exports for messages / events / telemetry.
+ *
+ * Replaces the in-browser filter the original ExportModal used — that path
+ * could only see what the /api/mesh/snapshot endpoint had already loaded
+ * (most-recent N rows trimmed by the snapshot's retention window), so a
+ * date range from a month ago silently returned an empty file even when
+ * the rows existed in SQLite. These endpoints query the DB directly with
+ * the date / node / radio filters pushed to SQL.
+ *
+ * Common query params:
+ *   from=<epoch ms>      lower bound on timestamp (inclusive)
+ *   to=<epoch ms>        upper bound on timestamp (inclusive)
+ *   node_id=<!hex>       filter by node (messages: matches from OR to;
+ *                        events / telemetry: matches node_id)
+ *   radio_id=<short>     scope to one radio's rows (messages/events only;
+ *                        telemetry has no radio_id column)
+ *
+ * Output is RFC 4180-ish — same toCsv helper as the BBS exports. ASC by
+ * timestamp so the CSV is chronological without further sorting.
+ */
+function parseExportQuery(req: express.Request): { fromMs?: number; toMs?: number; nodeId: string | null; radioId: string | null } {
+  const fromMs = Number(req.query.from);
+  const toMs   = Number(req.query.to);
+  const nodeId = typeof req.query.node_id  === 'string' && req.query.node_id  ? String(req.query.node_id)  : null;
+  const radioId = typeof req.query.radio_id === 'string' && req.query.radio_id ? String(req.query.radio_id) : null;
+  return {
+    fromMs: Number.isFinite(fromMs) ? fromMs : undefined,
+    toMs:   Number.isFinite(toMs)   ? toMs   : undefined,
+    nodeId,
+    radioId,
+  };
+}
+
+/** Build a Content-Disposition filename tail like "-3bec-2026-06-02" so
+ *  multiple exports don't collide in the operator's Downloads folder. */
+function exportFilenameTail(radioId: string | null): string {
+  const radio = radioId ? `-${radioId}` : '';
+  return `${radio}-${new Date().toISOString().slice(0, 10)}`;
+}
+
+app.get('/api/mesh/export/messages.csv', (req, res) => {
+  const q = parseExportQuery(req);
+  try {
+    const rows = meshDb().exportMessages(q);
+    const csv = toCsv(
+      ['id', 'timestamp_iso', 'timestamp_ms', 'from_id', 'to_id', 'channel', 'text',
+       'is_own', 'is_reaction', 'hop_limit', 'rx_snr', 'rx_rssi',
+       'status', 'error_code', 'delivery_ms', 'radio_id'],
+      rows.map(r => [
+        r.id,
+        new Date(r.timestamp).toISOString(),
+        r.timestamp,
+        r.fromId,
+        r.toId,
+        r.channel ?? '',
+        r.text,
+        r.isOwn ? 1 : 0,
+        r.isReaction ? 1 : 0,
+        r.hopLimit ?? '',
+        r.rxSnr ?? '',
+        r.rxRssi ?? '',
+        r.status ?? '',
+        r.errorCode ?? '',
+        r.deliveryMs ?? '',
+        r.radioId ?? '',
+      ])
+    );
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="messages${exportFilenameTail(q.radioId)}.csv"`);
+    return res.send(csv);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/mesh/export/events.csv', (req, res) => {
+  const q = parseExportQuery(req);
+  try {
+    const rows = meshDb().exportEvents(q);
+    const csv = toCsv(
+      ['id', 'timestamp_iso', 'timestamp_ms', 'type', 'node_id', 'details', 'radio_id'],
+      rows.map(r => [
+        r.id,
+        new Date(r.timestamp).toISOString(),
+        r.timestamp,
+        r.type,
+        r.nodeId ?? '',
+        r.details,
+        r.radioId ?? '',
+      ])
+    );
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="events${exportFilenameTail(q.radioId)}.csv"`);
+    return res.send(csv);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/mesh/export/telemetry.csv', (req, res) => {
+  // Telemetry has no radio_id column — silently drop the radio_id filter.
+  // It's still in `q` from parseExportQuery so the filename tail matches
+  // whatever radio scope the operator picked in the UI; the actual query
+  // ignores it.
+  const q = parseExportQuery(req);
+  try {
+    const rows = meshDb().exportTelemetry({ fromMs: q.fromMs, toMs: q.toMs, nodeId: q.nodeId });
+    const csv = toCsv(
+      ['node_id', 'timestamp_iso', 'timestamp_ms', 'battery', 'voltage',
+       'ch_util', 'air_util_tx', 'snr', 'rssi',
+       'temperature', 'humidity', 'pressure'],
+      rows.map(r => [
+        r.nodeId,
+        new Date(r.timestamp).toISOString(),
+        r.timestamp,
+        r.battery ?? '',
+        r.voltage ?? '',
+        r.chUtil ?? '',
+        r.airUtilTx ?? '',
+        r.snr ?? '',
+        r.rssi ?? '',
+        r.temperature ?? '',
+        r.humidity ?? '',
+        r.pressure ?? '',
+      ])
+    );
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="telemetry${exportFilenameTail(q.radioId)}.csv"`);
+    return res.send(csv);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/mesh/bbs/mail/export.csv', (req, res) => {
   const radioId = typeof req.query.radio_id === 'string' && req.query.radio_id ? req.query.radio_id : null;
   const fromMs = Number(req.query.from);

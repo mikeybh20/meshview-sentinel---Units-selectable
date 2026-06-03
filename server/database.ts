@@ -1138,6 +1138,123 @@ export class MeshDatabase {
     return Number((result as any).changes ?? 0);
   }
 
+  /**
+   * v2.0 Beta 5: server-side CSV export queries.
+   *
+   * The legacy ExportModal filters props.messages / props.events in the
+   * browser, which only ever sees what the snapshot endpoint loaded
+   * (most-recent N rows). A "messages from last month" export would
+   * silently return empty even with the rows present in SQLite. These
+   * helpers go to the source of truth so date ranges actually work.
+   *
+   * Each returns ASC by timestamp so a CSV-row reader can stream
+   * chronologically without re-sorting. All filters are optional.
+   */
+  exportMessages(opts: {
+    fromMs?: number;
+    toMs?: number;
+    nodeId?: string | null;
+    radioId?: string | null;
+  } = {}): Array<{
+    id: string;
+    fromId: string;
+    toId: string;
+    channel: string | null;
+    text: string;
+    timestamp: number;
+    isOwn: number;
+    isReaction: number;
+    hopLimit: number | null;
+    rxSnr: number | null;
+    rxRssi: number | null;
+    status: string | null;
+    errorCode: number | null;
+    deliveryMs: number | null;
+    radioId: string | null;
+  }> {
+    const where: string[] = [];
+    const params: any[] = [];
+    if (typeof opts.fromMs === 'number') { where.push('timestamp >= ?'); params.push(opts.fromMs); }
+    if (typeof opts.toMs === 'number')   { where.push('timestamp <= ?'); params.push(opts.toMs); }
+    if (opts.nodeId)                     { where.push('(from_id = ? OR to_id = ?)'); params.push(opts.nodeId, opts.nodeId); }
+    if (opts.radioId)                    { where.push('(radio_id = ? OR radio_id IS NULL)'); params.push(opts.radioId); }
+    const sql = `
+      SELECT id, from_id AS fromId, to_id AS toId, channel, text, timestamp,
+             is_own AS isOwn, is_reaction AS isReaction,
+             hop_limit AS hopLimit, rx_snr AS rxSnr, rx_rssi AS rxRssi,
+             status, error_code AS errorCode, delivery_ms AS deliveryMs,
+             radio_id AS radioId
+      FROM messages
+      ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+      ORDER BY timestamp ASC
+    `;
+    return this.db.prepare(sql).all(...params) as any;
+  }
+
+  exportEvents(opts: {
+    fromMs?: number;
+    toMs?: number;
+    nodeId?: string | null;
+    radioId?: string | null;
+  } = {}): Array<{
+    id: string;
+    type: string;
+    nodeId: string | null;
+    timestamp: number;
+    details: string;
+    radioId: string | null;
+  }> {
+    const where: string[] = [];
+    const params: any[] = [];
+    if (typeof opts.fromMs === 'number') { where.push('timestamp >= ?'); params.push(opts.fromMs); }
+    if (typeof opts.toMs === 'number')   { where.push('timestamp <= ?'); params.push(opts.toMs); }
+    if (opts.nodeId)                     { where.push('node_id = ?'); params.push(opts.nodeId); }
+    if (opts.radioId)                    { where.push('(radio_id = ? OR radio_id IS NULL)'); params.push(opts.radioId); }
+    const sql = `
+      SELECT id, type, node_id AS nodeId, timestamp, details, radio_id AS radioId
+      FROM events
+      ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+      ORDER BY timestamp ASC
+    `;
+    return this.db.prepare(sql).all(...params) as any;
+  }
+
+  /** Telemetry has no radio_id column (it's per-node, not per-radio), so the
+   *  radioId filter is intentionally absent. The node_id filter is the
+   *  authoritative scope for telemetry exports. */
+  exportTelemetry(opts: {
+    fromMs?: number;
+    toMs?: number;
+    nodeId?: string | null;
+  } = {}): Array<{
+    nodeId: string;
+    timestamp: number;
+    battery: number | null;
+    voltage: number | null;
+    chUtil: number | null;
+    airUtilTx: number | null;
+    snr: number | null;
+    rssi: number | null;
+    temperature: number | null;
+    humidity: number | null;
+    pressure: number | null;
+  }> {
+    const where: string[] = [];
+    const params: any[] = [];
+    if (typeof opts.fromMs === 'number') { where.push('timestamp >= ?'); params.push(opts.fromMs); }
+    if (typeof opts.toMs === 'number')   { where.push('timestamp <= ?'); params.push(opts.toMs); }
+    if (opts.nodeId)                     { where.push('node_id = ?'); params.push(opts.nodeId); }
+    const sql = `
+      SELECT node_id AS nodeId, timestamp, battery, voltage,
+             ch_util AS chUtil, air_util_tx AS airUtilTx,
+             snr, rssi, temperature, humidity, pressure
+      FROM telemetry
+      ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+      ORDER BY timestamp ASC
+    `;
+    return this.db.prepare(sql).all(...params) as any;
+  }
+
   // ---------------------------------------------------------------------
   // Events
   // ---------------------------------------------------------------------
