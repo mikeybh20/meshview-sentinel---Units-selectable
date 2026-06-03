@@ -176,11 +176,58 @@ app.post('/api/auth/logout', (req, res) => {
 // auth — the login screen has to load somehow.
 //
 // Path matching: inside this mount, req.path is RELATIVE to '/api', so
-// /api/auth/me arrives as '/auth/me'. Allowlist the auth subtree
-// explicitly; everything else needs a valid session.
+// /api/auth/me arrives as '/auth/me'.
+//
+// Role model (v2.0 Beta 5 Phase 2):
+//
+//   - Anything under /api/auth/*       — public (no session needed).
+//   - Reads (GET/HEAD/OPTIONS)         — any authenticated user.
+//   - Viewer-allowed writes (allowlist below) — any authenticated user.
+//     These are "operator actions" — sending mesh traffic on behalf of
+//     the logged-in operator. They don't change shared dashboard state.
+//   - Everything else                   — admin only.
+//
+// VIEWER_WRITE_PATTERNS is the explicit allowlist. Anything not in it
+// goes through requireAdmin. This default-deny posture means new
+// admin-write endpoints automatically inherit admin gating without
+// each one needing to wire requireAdmin manually.
+const VIEWER_WRITE_PATTERNS: Array<{ method: string; pattern: RegExp }> = [
+  // Compose + send mesh traffic — operator action, not config change.
+  { method: 'POST',   pattern: /^\/mesh\/send$/ },
+  // Drop a waypoint on the map.
+  { method: 'POST',   pattern: /^\/mesh\/waypoints$/ },
+  // BBS mail authoring + per-mail state (compose, mark-read, delete one).
+  { method: 'POST',   pattern: /^\/mesh\/bbs\/compose$/ },
+  { method: 'POST',   pattern: /^\/mesh\/bbs\/\d+\/read$/ },
+  { method: 'DELETE', pattern: /^\/mesh\/bbs\/\d+$/ },
+  // Toggle favorite. Today this flips a global flag; Phase 4 will move
+  // it to per-user state. Either way, "favorite this node" is an
+  // operator preference, not a config change.
+  { method: 'POST',   pattern: /^\/mesh\/nodes\/![0-9a-fA-F]+\/favorite$/ },
+];
+
 app.use('/api', (req, res, next) => {
+  // Auth endpoints are always public.
   if (req.path === '/auth' || req.path.startsWith('/auth/')) return next();
-  return requireAuth(req, res, next);
+
+  // Authentication required for everything below.
+  if (!req.user) return void res.status(401).json({ error: 'Not authenticated' });
+
+  // Reads pass at viewer level.
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
+
+  // Viewer-allowed writes pass at viewer level.
+  if (VIEWER_WRITE_PATTERNS.some(p => p.method === req.method && p.pattern.test(req.path))) {
+    return next();
+  }
+
+  // Everything else needs admin. The /api/auth/users management endpoints
+  // (Phase 3) live under /auth so they get the same treatment as login
+  // (public) — Phase 3 will add explicit requireAdmin to those individually.
+  if (req.user.role !== 'admin') {
+    return void res.status(403).json({ error: 'Admin role required for this action' });
+  }
+  return next();
 });
 
 // =============================================

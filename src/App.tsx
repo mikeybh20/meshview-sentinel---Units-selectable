@@ -44,8 +44,8 @@ import { RefreshSplitButton } from './components/RefreshSplitButton';
 import { RadiosView } from './components/views/RadiosView';
 import { ViaFilter, ViaFilterValue } from './components/ViaFilter';
 import { useRadios } from './hooks/useRadios';
-import { useAuth } from './hooks/useAuth';
-import { LogOut, User as UserIcon } from 'lucide-react';
+import { useAuth, useIsAdmin } from './hooks/useAuth';
+import { LogOut, User as UserIcon, Eye as EyeIcon } from 'lucide-react';
 // RecipeView moved into SettingsModal as the "Install Guide" tab; the standalone
 // dashboard page was removed per operator request to keep the main nav focused
 // on operational views.
@@ -880,6 +880,11 @@ export default function App() {
 
       {/* Main Content */}
       <main className="flex-1 flex flex-col relative overflow-hidden">
+        {/* v2.0 Beta 5: viewer banner. Renders only when the current
+            user's role is 'viewer' so admins don't see a thing. Acts as
+            a global "yes, that button is supposed to be greyed out"
+            explainer so viewers don't think the UI is broken. */}
+        <ViewerBanner />
         {/* Header */}
         <header className="h-16 border-b border-brand-line flex items-center justify-between gap-2 px-3 sm:px-6 bg-brand-bg/80 backdrop-blur-sm z-40">
           <div className="flex items-center gap-6">
@@ -1423,6 +1428,33 @@ function UserBadge() {
       >
         <LogOut size={12} />
       </button>
+    </div>
+  );
+}
+
+/**
+ * v2.0 Beta 5 Phase 2 — viewer banner.
+ *
+ * Shows a slim banner at the top of the main pane when the current user's
+ * role is 'viewer'. Explains that admin actions (save / write / delete)
+ * will 403 so viewers don't think the dashboard is broken. Self-hides for
+ * admins so it doesn't clutter the chrome.
+ */
+function ViewerBanner() {
+  const isAdmin = useIsAdmin();
+  const { user } = useAuth();
+  if (!user || isAdmin) return null;
+  return (
+    <div
+      className="flex items-center gap-2 px-4 py-1.5 bg-brand-warning/10 border-b border-brand-warning/30 text-[11px] text-brand-warning"
+      title="You are signed in as a viewer. Configuration changes require an admin account."
+    >
+      <EyeIcon size={12} />
+      <span className="font-bold uppercase tracking-widest">Read-only</span>
+      <span className="opacity-80">
+        — viewer role. You can read everything and send messages, but configuration changes
+        (radios, channels, BBS, network, retention, users) require admin.
+      </span>
     </div>
   );
 }
