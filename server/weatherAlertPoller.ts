@@ -26,6 +26,13 @@ interface BridgeManagerLike {
   get(radioId: string): { bridge: any } | null;
   list(): Array<{ radioId: string; bridge: any }>;
   getDefaultRadioId(): string | null;
+  /** v2.0 Beta 5 Phase 2 (Services Pattern): the radio currently
+   *  designated to run BBS services. WeatherAlertPoller now ONLY
+   *  delivers alerts + the daily forecast through this bridge —
+   *  matches the operator's "Home workspace is the services area"
+   *  model. Returns null when no BBS node is designated; the poller
+   *  silently skips delivery. */
+  getBbsNode(): { radioId: string; bridge: any } | null;
 }
 
 const meshDb = meshDbFactory();
@@ -291,13 +298,18 @@ export class WeatherAlertPoller {
         newCount++;
         const compact = weatherService.formatAlertCompact(alert, locationLabel);
 
-        // Surface the alert on the operator's event log only for home-ZIP
-        // alerts. Per-subscriber-ZIP alerts route to the subscriber but
-        // shouldn't pollute the operator's local-area alert feed.
+        // v2.0 Beta 5 Phase 2: surface the alert event on the BBS
+        // service node only — that's the "home / services" radio's
+        // event log, which is where operators look for install-wide
+        // alerts. Previously fanned out to every bridge, which made
+        // the same WEATHER_ALERT row appear in each personal
+        // workspace's event log; now it lives only in the services
+        // workspace.
         if (isHomeZip) {
-          for (const ctx of this.bm.list()) {
-            ctx.bridge.recordEvent({
-              id: `wx-${alert.id}-${ctx.radioId}`,
+          const bbsCtx = this.bm.getBbsNode();
+          if (bbsCtx?.bridge) {
+            bbsCtx.bridge.recordEvent({
+              id: `wx-${alert.id}-${bbsCtx.radioId}`,
               type: 'WEATHER_ALERT',
               nodeId: 'local',
               timestamp: Date.now(),
@@ -360,26 +372,28 @@ export class WeatherAlertPoller {
   ): Promise<void> {
     if (subscribers.length === 0) return;
 
-    const defaultBridge = this.bm.getDefault()?.bridge ?? null;
-    if (!defaultBridge && !this.bm.list().length) {
-      console.warn('[WeatherPoller] Skipping subscriber fanout — no bridge connected');
+    // v2.0 Beta 5 Phase 2 (Services Pattern): every alert + forecast
+    // now routes through the install's designated BBS service node.
+    // Operators who haven't picked a BBS radio yet get a logged
+    // skip + the mail row still persists so the next time someone
+    // hits `:mail R` from the BBS radio (once picked) they see it.
+    const bbsCtx = this.bm.getBbsNode();
+    if (!bbsCtx?.bridge) {
+      console.warn('[WeatherPoller] No BBS service node designated — skipping fanout. Pick one in Settings → BBS.');
       return;
     }
+    const bbsRadioId = bbsCtx.radioId;
+    const bbsBridge = bbsCtx.bridge;
+    const localNodeId = (bbsBridge as any).localNodeId as string | null;
 
-    console.log(`[WeatherPoller] Fanning out to ${subscribers.length} subscriber(s)`);
+    console.log(`[WeatherPoller] Fanning out to ${subscribers.length} subscriber(s) via BBS node "${bbsRadioId}"`);
     let delivered = 0;
     let skipped = 0;
     for (const sub of subscribers) {
-      const ctx = sub.radioId ? this.bm.get(sub.radioId) : this.bm.getDefault();
-      if (!ctx?.bridge) {
-        skipped++;
-        console.warn(`[WeatherPoller] subscriber ${sub.nodeId} routed via radio "${sub.radioId ?? '<default>'}" but that bridge isn't connected — skipping DM, mail row still persisted`);
-      }
-      const bridge = ctx?.bridge ?? null;
-      const localNodeId = bridge ? (bridge as any).localNodeId as string | null : null;
-
       // Persist mail row first — even if the DM fails, the subscriber can pull
-      // the alert via :mail R later.
+      // the alert via :mail R later. Always stamped with the BBS node's
+      // radio_id so the row lives in the same workspace as the BBS service
+      // (where it'll be visible from the BBS radio's :mail R reads).
       let mailId: number | undefined;
       try {
         if (localNodeId) {
@@ -389,15 +403,16 @@ export class WeatherAlertPoller {
             recipient_node_id: sub.nodeId,
             posted_at: Date.now(),
             body: compact,
-            radio_id: sub.radioId ?? this.bm.getDefaultRadioId(),
+            radio_id: bbsRadioId,
           });
-          bridge?.emit('bbsMail', { recipientNodeId: sub.nodeId, mailId, source: 'weather' });
+          bbsBridge.emit('bbsMail', { recipientNodeId: sub.nodeId, mailId, source: 'weather' });
         }
       } catch (err: any) {
         console.warn(`[WeatherPoller] insertMail failed for ${sub.nodeId}: ${err?.message}`);
       }
 
-      if (!bridge) continue;
+      const bridge = bbsBridge;
+      if (!bridge) { skipped++; continue; }
 
       // Best-effort DM. sendMessage handles auto-retry on rate limit + transient
       // routing errors internally.
@@ -407,12 +422,12 @@ export class WeatherAlertPoller {
         if (mailId !== undefined) meshDb.markMailDelivered(mailId);
         delivered++;
       } catch (err: any) {
-        console.warn(`[WeatherPoller] DM to ${sub.nodeId} via radio ${sub.radioId ?? '<default>'} failed: ${err?.message}`);
+        console.warn(`[WeatherPoller] DM to ${sub.nodeId} via BBS node ${bbsRadioId} failed: ${err?.message}`);
       }
 
       // Small inter-subscriber pause so we don't slam the firmware queue.
       await new Promise(r => setTimeout(r, 500));
     }
-    console.log(`[WeatherPoller] Subscriber fanout complete: ${delivered}/${subscribers.length} DM delivered (${skipped} skipped — radio disconnected)`);
+    console.log(`[WeatherPoller] Subscriber fanout complete: ${delivered}/${subscribers.length} DM delivered`);
   }
 }

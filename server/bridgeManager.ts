@@ -112,8 +112,30 @@ class BridgeManager extends EventEmitter {
     // survives across reconnects. updateRadioBbsOnly() below re-applies it
     // at runtime when the operator toggles.
     svc.setBbsOnlyMode(!!ctx.meta.bbs_only);
+    // v2.0 Beta 5 Phase 2 (Services Pattern): mark THIS bridge's
+    // BbsService as the install's BBS service node if the radios row
+    // says so. Only this BbsService's isCommand() returns true; other
+    // bridges' BBSes stay inert. refreshBbsServiceFlags below
+    // recomputes this across all contexts when the operator picks a
+    // different BBS radio at runtime.
+    svc.setIsBbsServiceNode(!!ctx.meta.is_bbs_node);
     ctx.bridge.setBbs(svc);
     ctx.bbs = svc;
+  }
+
+  /**
+   * Re-read radios.is_bbs_node for every connected radio and set the
+   * matching BbsService flag. Called from the API endpoint that
+   * changes the BBS designation so the gate flips instantly without
+   * a reconnect.
+   *
+   * Idempotent — safe to call after every setBbsNodeRadio.
+   */
+  refreshBbsServiceFlags(): void {
+    const designated = meshDb().getBbsNodeRadioId();
+    for (const ctx of this.contexts.values()) {
+      ctx.bbs?.setIsBbsServiceNode(ctx.radioId === designated);
+    }
   }
 
   /** v2.0 Beta 4: flip the bbs-only flag on an already-attached radio.
@@ -139,6 +161,32 @@ class BridgeManager extends EventEmitter {
   /** Get the BBS service for a specific radio (null if not connected). */
   getBbs(radioId: string): BbsService | null {
     return this.contexts.get(radioId)?.bbs ?? null;
+  }
+
+  /**
+   * v2.0 Beta 5 Phase 2 (Services Pattern): return the context for the
+   * radio currently designated as the BBS service node (radios.
+   * is_bbs_node = 1). Used by:
+   *   - meshtasticSerial TEXT handler to gate BBS command interception
+   *     (only this bridge invokes BbsService.handleInboundDm)
+   *   - WeatherAlertPoller to route alerts + the daily forecast push
+   *     through this bridge specifically
+   *
+   * Returns null when no BBS node is designated (admin hasn't picked
+   * one yet, OR they explicitly cleared the designation). In that
+   * state BBS commands are silently ignored — `:mail` lands as a
+   * plain DM, the weather poller skips its tick.
+   */
+  getBbsNode(): RadioContext | null {
+    const radioId = meshDb().getBbsNodeRadioId();
+    if (!radioId) return null;
+    return this.contexts.get(radioId) ?? null;
+  }
+
+  /** Bridge form of getBbsNode() — convenience for the (very common)
+   *  case of "give me the bridge to route through, or null." */
+  getBbsNodeBridge(): MeshtasticSerialBridge | null {
+    return this.getBbsNode()?.bridge ?? null;
   }
 
   private applyLoraReadback(snap: { region: number; modemPreset: number; frequencySlot: number; hopLimit: number }): void {
@@ -258,6 +306,10 @@ class BridgeManager extends EventEmitter {
       network_label:   null,
       is_default:      1,
       bbs_only:        0,
+      // is_bbs_node: never auto-set on radio creation. Operator
+      // explicitly picks one in Settings → BBS. Default off keeps the
+      // install consistent across radio-add events.
+      is_bbs_node:     0,
       // workspace_id left NULL — bootstrapWorkspaces() (called from
       // MeshDb's constructor on every boot) backfills any unassigned
       // radio to the Household workspace. New radios spawned post-boot

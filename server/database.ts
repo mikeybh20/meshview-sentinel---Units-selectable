@@ -312,6 +312,17 @@ export class MeshDatabase {
         -- stored so the operator can see who's pinging the BBS; only the
         -- auto-reply behavior is new.
         bbs_only        INTEGER NOT NULL DEFAULT 0,
+        -- v2.0 Beta 5 Phase 2 (Services Pattern): "this radio runs the
+        -- install's BBS service." At most one row has this set (UI +
+        -- setBbsNodeRadio() enforce mutex). When set, the BBS state
+        -- machine intercepts incoming DMs only on this bridge; the
+        -- WeatherAlertPoller routes outbound alerts + the daily
+        -- forecast through this bridge. Other radios stay as
+        -- general-purpose operator endpoints. Distinct from bbs_only
+        -- which is purely the auto-reply UX; operators typically set
+        -- both on the BBS radio (the "services" radio in the Home
+        -- workspace).
+        is_bbs_node     INTEGER NOT NULL DEFAULT 0,
         -- v2.0 Beta 5 Workspaces: which workspace owns this radio. NULL
         -- only during the migration window before bootstrapMultiTenant()
         -- runs; afterward every radio has a workspace. Cascade SET NULL
@@ -433,7 +444,33 @@ export class MeshDatabase {
     addColumnIfMissing('channels', 'position_precision INTEGER');
     addColumnIfMissing('bbs_weather_subscribers', 'zip TEXT');
     addColumnIfMissing('radios', 'bbs_only INTEGER NOT NULL DEFAULT 0');
+    addColumnIfMissing('radios', 'is_bbs_node INTEGER NOT NULL DEFAULT 0');
     addColumnIfMissing('radios', 'workspace_id INTEGER');
+
+    // v2.0 Beta 5 Phase 2 (Services Pattern) one-shot migration:
+    // if NO radio is currently designated as the BBS node AND exactly
+    // ONE radio has bbs_only=1, promote that one. Operators who
+    // already chose a single "BBS endpoint" radio with the existing
+    // bbs_only flag get a sane default; operators with zero or
+    // multiple bbs_only radios need to pick explicitly in Settings.
+    try {
+      const haveBbsNode = (this.db.prepare(
+        `SELECT COUNT(*) AS c FROM radios WHERE is_bbs_node = 1`
+      ).get() as { c: number }).c > 0;
+      if (!haveBbsNode) {
+        const candidates = this.db.prepare(
+          `SELECT radio_id FROM radios WHERE bbs_only = 1`
+        ).all() as Array<{ radio_id: string }>;
+        if (candidates.length === 1) {
+          this.db.prepare(
+            `UPDATE radios SET is_bbs_node = 1 WHERE radio_id = ?`
+          ).run(candidates[0].radio_id);
+          console.log(`[MeshDB] Auto-promoted radio "${candidates[0].radio_id}" to is_bbs_node (sole bbs_only=1 radio at migration time)`);
+        }
+      }
+    } catch (err: any) {
+      console.warn('[MeshDB] BBS-node migration warning:', err.message);
+    }
 
     // Workspaces bootstrap migration. Runs idempotently every boot —
     // safe to call repeatedly. Creates a default "Household" workspace
@@ -2132,7 +2169,7 @@ export class MeshDatabase {
     return this.db.prepare(`
       SELECT radio_id, long_name, transport, target, region, modem_preset,
              frequency_slot, primary_channel, num_hops, enabled, color_hex,
-             network_label, is_default, bbs_only, workspace_id, created_at, updated_at
+             network_label, is_default, bbs_only, is_bbs_node, workspace_id, created_at, updated_at
       FROM radios
       ORDER BY is_default DESC, created_at ASC
     `).all() as RadioRow[];
@@ -2142,7 +2179,7 @@ export class MeshDatabase {
     const row = this.db.prepare(`
       SELECT radio_id, long_name, transport, target, region, modem_preset,
              frequency_slot, primary_channel, num_hops, enabled, color_hex,
-             network_label, is_default, bbs_only, workspace_id, created_at, updated_at
+             network_label, is_default, bbs_only, is_bbs_node, workspace_id, created_at, updated_at
       FROM radios WHERE radio_id = ?
     `).get(radioId) as RadioRow | undefined;
     return row ?? null;
@@ -2152,7 +2189,7 @@ export class MeshDatabase {
     const row = this.db.prepare(`
       SELECT radio_id, long_name, transport, target, region, modem_preset,
              frequency_slot, primary_channel, num_hops, enabled, color_hex,
-             network_label, is_default, bbs_only, workspace_id, created_at, updated_at
+             network_label, is_default, bbs_only, is_bbs_node, workspace_id, created_at, updated_at
       FROM radios WHERE is_default = 1
       LIMIT 1
     `).get() as RadioRow | undefined;
@@ -2165,11 +2202,11 @@ export class MeshDatabase {
       INSERT INTO radios (
         radio_id, long_name, transport, target, region, modem_preset,
         frequency_slot, primary_channel, num_hops, enabled, color_hex,
-        network_label, is_default, bbs_only, workspace_id, created_at, updated_at
+        network_label, is_default, bbs_only, is_bbs_node, workspace_id, created_at, updated_at
       ) VALUES (
         @radio_id, @long_name, @transport, @target, @region, @modem_preset,
         @frequency_slot, @primary_channel, @num_hops, @enabled, @color_hex,
-        @network_label, @is_default, @bbs_only, @workspace_id, @created_at, @updated_at
+        @network_label, @is_default, @bbs_only, @is_bbs_node, @workspace_id, @created_at, @updated_at
       )
       ON CONFLICT(radio_id) DO UPDATE SET
         long_name       = excluded.long_name,
@@ -2185,9 +2222,12 @@ export class MeshDatabase {
         network_label   = excluded.network_label,
         is_default      = excluded.is_default,
         bbs_only        = excluded.bbs_only,
-        -- workspace_id deliberately not in the update set: changing it
-        -- belongs to the dedicated setRadioWorkspace() helper so admin
-        -- reassignment is auditable + atomic. upsertRadio preserves it.
+        -- is_bbs_node + workspace_id deliberately not in the update set:
+        -- both are sensitive cross-row state (only one radio can hold
+        -- is_bbs_node; workspace_id has its own admin reassignment
+        -- flow). setBbsNodeRadio() / setRadioWorkspace() are the
+        -- only sanctioned ways to change them. upsertRadio preserves
+        -- both unchanged.
         updated_at      = excluded.updated_at
     `).run({
       radio_id:        r.radio_id,
@@ -2204,6 +2244,11 @@ export class MeshDatabase {
       network_label:   r.network_label ?? null,
       is_default:      r.is_default ? 1 : 0,
       bbs_only:        r.bbs_only ? 1 : 0,
+      // is_bbs_node: same rule as workspace_id — preserved on upsert,
+      // never set via this path. Only setBbsNodeRadio() flips it (with
+      // mutex enforcement). New radio inserts use 0; existing rows
+      // keep their current value via the ON CONFLICT update-set omit.
+      is_bbs_node:     r.is_bbs_node ? 1 : 0,
       // workspace_id: nullable; bootstrapWorkspaces() backfills NULLs at
       // boot. tryAutoRegisterDefault + spawnSecondary leave it NULL so
       // the migration assigns the radio to Household. Workspace
@@ -2220,6 +2265,64 @@ export class MeshDatabase {
       `UPDATE radios SET bbs_only = ?, updated_at = ? WHERE radio_id = ?`
     ).run(on ? 1 : 0, Date.now(), radioId);
     return r.changes > 0;
+  }
+
+  /**
+   * v2.0 Beta 5 Phase 2 (Services Pattern): designate THE BBS service
+   * radio. Enforces install-wide uniqueness — clears is_bbs_node on
+   * every other radio in the same transaction. Pass null to clear the
+   * designation entirely (BBS service goes off).
+   *
+   * Returns the new BBS radio_id (or null) so the caller can confirm
+   * what landed. Refuses with false-ish when radioId is provided but
+   * doesn't exist.
+   *
+   * Also re-stamps bbs_mail.radio_id + bbs_weather_subscribers.radio_id
+   * to match the new BBS node, so the mail history + subscriber list
+   * appears in the new BBS radio's workspace immediately after the
+   * flip (rather than living in the OLD radio's workspace where the
+   * new BBS node can't see them).
+   */
+  setBbsNodeRadio(radioId: string | null): string | null {
+    const tx = this.db.transaction((target: string | null) => {
+      // Clear everywhere first so re-running with the same id stays
+      // idempotent (and so an explicit null cleanly turns off BBS).
+      this.db.prepare(
+        `UPDATE radios SET is_bbs_node = 0, updated_at = ? WHERE is_bbs_node = 1`
+      ).run(Date.now());
+      if (target == null) return null;
+      // Confirm the target exists, then set its flag.
+      const row = this.db.prepare(
+        `SELECT 1 FROM radios WHERE radio_id = ?`
+      ).get(target);
+      if (!row) return null;
+      this.db.prepare(
+        `UPDATE radios SET is_bbs_node = 1, updated_at = ? WHERE radio_id = ?`
+      ).run(Date.now(), target);
+      // Re-stamp BBS-stored data so the operator sees their mail +
+      // subscriber list under the new BBS node's workspace. Without
+      // this, the dashboard filter (snapshot scopes by radio_id ∈
+      // workspace) would hide the history until admin manually
+      // migrates the rows.
+      this.db.prepare(
+        `UPDATE bbs_mail SET radio_id = ?`
+      ).run(target);
+      this.db.prepare(
+        `UPDATE bbs_weather_subscribers SET radio_id = ?`
+      ).run(target);
+      return target;
+    });
+    return tx(radioId) as string | null;
+  }
+
+  /** Returns the radio_id currently serving BBS, or null when no
+   *  radio is designated. Cached by callers — toggling fires the
+   *  bbsConfigUpdate SSE event so subscribers re-fetch. */
+  getBbsNodeRadioId(): string | null {
+    const row = this.db.prepare(
+      `SELECT radio_id FROM radios WHERE is_bbs_node = 1 LIMIT 1`
+    ).get() as { radio_id: string } | undefined;
+    return row?.radio_id ?? null;
   }
 
   // ---------------------------------------------------------------------
@@ -2703,6 +2806,11 @@ export interface RadioRow {
    *  the command index. Lets an operator dedicate one radio to BBS while
    *  others stay general chat nodes. 0 = standard behavior. */
   bbs_only: number;         // 0|1
+  /** v2.0 Beta 5 Phase 2 (Services Pattern): "this radio runs the
+   *  install's BBS service." setBbsNodeRadio() enforces install-wide
+   *  uniqueness — flipping this on any radio clears it everywhere
+   *  else atomically. */
+  is_bbs_node: number;      // 0|1
   /** v2.0 Beta 5 Workspaces: which workspace owns this radio. Nullable
    *  during the migration window only; bootstrapWorkspaces() backfills
    *  every NULL on every boot so post-migration this is effectively

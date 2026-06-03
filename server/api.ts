@@ -1150,6 +1150,10 @@ app.post('/api/mesh/radios', (req, res) => {
     // First radio added becomes default if no default exists yet.
     is_default:      db.getDefaultRadio() ? 0 : 1,
     bbs_only:        body.bbs_only ? 1 : 0,
+    // is_bbs_node defaults off on radio creation. setBbsNodeRadio is
+    // the single sanctioned way to flip it (install-wide mutex), so
+    // we don't honor a body field here.
+    is_bbs_node:     0,
     // workspace_id left NULL — bootstrapWorkspaces() runs on next boot
     // (or on next radios upsert?) and assigns this radio to Household.
     // Callers that want to drop a radio into a specific workspace use
@@ -3737,6 +3741,53 @@ app.post('/api/mesh/channels', async (req, res) => {
 /** GET /api/mesh/bbs/config — current BBS configuration. */
 app.get('/api/mesh/bbs/config', (_req, res) => {
   return res.json(bbsConfig);
+});
+
+/**
+ * v2.0 Beta 5 Phase 2 (Services Pattern): the BBS service node.
+ *
+ * GET returns the current designated radio (or null) plus the list of
+ * radios that could be chosen — admin needs this to render the
+ * dropdown. The candidate list is install-wide, not workspace-filtered,
+ * because the BBS service is install-wide.
+ *
+ * POST takes { radioId: string | null } and flips the designation.
+ * Null clears it entirely (BBS service goes off). setBbsNodeRadio
+ * enforces install-wide mutex + re-stamps existing bbs_mail +
+ * bbs_weather_subscribers rows to the new radio so the BBS history
+ * appears in the new BBS node's workspace immediately.
+ *
+ * After the DB flip, BridgeManager.refreshBbsServiceFlags() updates
+ * each connected BbsService's isBbsNode flag so the gate flips
+ * without a reconnect cycle.
+ */
+app.get('/api/mesh/bbs/node', requireAuth, (_req, res) => {
+  return res.json({
+    radioId: meshDb().getBbsNodeRadioId(),
+    candidates: meshDb().listRadios().map(r => ({
+      radio_id: r.radio_id,
+      long_name: r.long_name,
+      workspace_id: r.workspace_id,
+    })),
+  });
+});
+
+app.post('/api/mesh/bbs/node', requireAdmin, (req, res) => {
+  const raw = req.body?.radioId;
+  const target = raw === null || raw === undefined ? null : String(raw).trim();
+  if (target !== null && !meshDb().getRadio(target)) {
+    return res.status(404).json({ error: `radio "${target}" not found` });
+  }
+  const applied = meshDb().setBbsNodeRadio(target);
+  bridgeManager.refreshBbsServiceFlags();
+  // Fan a config-changed SSE event so any open dashboard re-fetches
+  // BBS state + the workspace switcher's radio list. Reusing the
+  // existing bbsConfig event channel keeps the client wiring minimal.
+  for (const send of sseClients) {
+    try { send(`event: bbsConfig\ndata: ${JSON.stringify(bbsConfig)}\n\n`); } catch { /* client gone */ }
+  }
+  console.log(`[BBS] Service node ${applied ? `set to "${applied}"` : 'cleared'}`);
+  return res.json({ radioId: applied });
 });
 
 /**

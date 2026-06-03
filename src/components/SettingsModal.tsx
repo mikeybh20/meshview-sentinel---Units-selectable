@@ -1613,6 +1613,92 @@ interface BbsConfigShape {
   dailyForecastTime: string;
 }
 
+/**
+ * v2.0 Beta 5 Phase 2 (Services Pattern) — BBS service node picker.
+ *
+ * Install-wide setting: which radio runs the BBS state machine + the
+ * weather alert/forecast push. Admin picks one; flipping it
+ * automatically:
+ *   1. Clears is_bbs_node on every other radio (server enforces mutex).
+ *   2. Re-stamps bbs_mail + bbs_weather_subscribers radio_id to the
+ *      new BBS radio so the history appears in its workspace.
+ *   3. Refreshes the BBS service flag on every connected bridge so
+ *      the new radio starts intercepting :mail / :wx / :cmd
+ *      immediately (no reconnect needed).
+ *
+ * Picker shows every radio in the install (not workspace-filtered),
+ * since this is an install-wide service. Viewers see the read-only
+ * value with the dropdown disabled.
+ */
+function BbsServiceNodePicker() {
+  const isAdmin = useIsAdmin();
+  const [radioId, setRadioId] = React.useState<string | null>(null);
+  const [candidates, setCandidates] = React.useState<Array<{ radio_id: string; long_name: string; workspace_id: number | null }>>([]);
+  const [loading, setLoading] = React.useState(false);
+  const [msg, setMsg] = React.useState<{ tone: 'ok' | 'err'; text: string } | null>(null);
+
+  const refresh = React.useCallback(async () => {
+    setLoading(true);
+    const r = await meshDataService.getBbsServiceNode();
+    setLoading(false);
+    if (r) { setRadioId(r.radioId); setCandidates(r.candidates ?? []); }
+  }, []);
+
+  React.useEffect(() => { refresh(); }, [refresh]);
+
+  const handleChange = async (value: string) => {
+    const target = value === '' ? null : value;
+    setMsg(null);
+    const r = await meshDataService.setBbsServiceNode(target);
+    if (!r.ok) { setMsg({ tone: 'err', text: r.error || 'Set failed' }); return; }
+    setMsg({ tone: 'ok', text: target ? `BBS service running on "${target}".` : 'BBS service disabled — pick a radio to re-enable.' });
+    refresh();
+  };
+
+  return (
+    <div className="space-y-2 pb-2 border-b border-brand-line/60">
+      <h4 className="text-xs font-bold uppercase tracking-widest text-brand-muted">BBS service radio</h4>
+      <div className="flex items-center gap-2 flex-wrap">
+        <select
+          value={radioId ?? ''}
+          onChange={e => handleChange(e.target.value)}
+          disabled={!isAdmin || loading}
+          className="bg-brand-line/50 border border-brand-line rounded px-2 py-1.5 text-sm mono-text focus:outline-none focus:border-brand-accent disabled:opacity-50"
+        >
+          <option value="">— None (BBS disabled) —</option>
+          {candidates.map(r => (
+            <option key={r.radio_id} value={r.radio_id}>
+              {r.radio_id} — {r.long_name}
+            </option>
+          ))}
+        </select>
+        {radioId && (
+          <span className="text-[10px] uppercase font-bold tracking-widest px-2 py-0.5 rounded bg-brand-accent/20 text-brand-accent border border-brand-accent/40">
+            Active
+          </span>
+        )}
+      </div>
+      {msg && (
+        <div className={cn(
+          'flex items-start gap-2 rounded border text-[11px] px-2 py-1.5',
+          msg.tone === 'ok'
+            ? 'border-brand-accent/40 bg-brand-accent/10 text-brand-accent'
+            : 'border-red-500/40 bg-red-500/10 text-red-300',
+        )}>
+          {msg.tone === 'ok' ? <Check size={11} className="mt-0.5" /> : <AlertCircle size={11} className="mt-0.5" />}
+          <span>{msg.text}</span>
+        </div>
+      )}
+      <p className="text-[10px] text-brand-muted leading-snug pt-1">
+        One radio install-wide handles BBS commands (<code className="text-brand-accent">:mail</code> / <code className="text-brand-accent">:wx</code> / <code className="text-brand-accent">:cmd</code>) and the weather alert / daily forecast push.
+        Existing BBS mail + weather subscribers automatically re-stamp to the new radio so the history follows.
+        Other radios stay as normal operator endpoints — BBS commands sent to them land as plain DMs.
+        {!isAdmin && <span className="block mt-1 italic">Read-only for viewers — ask an admin to change.</span>}
+      </p>
+    </div>
+  );
+}
+
 function BbsSection() {
   const [cfg, setCfg] = React.useState<BbsConfigShape | null>(null);
   const [loading, setLoading] = React.useState(true);
@@ -1819,6 +1905,11 @@ function BbsSection() {
           />
         </div>
       </div>
+
+      {/* v2.0 Beta 5 Phase 2: BBS service node picker — install-wide
+          choice of which radio runs BBS commands + the weather poller.
+          Admin-only; viewers see the current value disabled. */}
+      <BbsServiceNodePicker />
 
       {/* Home ZIP + weather */}
       <div className="space-y-3">

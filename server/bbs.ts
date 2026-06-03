@@ -104,6 +104,18 @@ export class BbsService {
   setBbsOnlyMode(on: boolean): void { this.bbsOnlyMode = on; }
   isBbsOnly(): boolean { return this.bbsOnlyMode; }
 
+  /** v2.0 Beta 5 Phase 2 (Services Pattern): "is this bridge the
+   *  install's designated BBS service node?" Only the BBS node
+   *  intercepts BBS commands. Other radios stay general-purpose —
+   *  their bbs.isCommand() short-circuits to false, so :mail / :wx
+   *  land as plain DMs there. BridgeManager sets this from
+   *  radios.is_bbs_node at attach time + on every setBbsNodeRadio
+   *  flip. Default false so a freshly-created BbsService stays
+   *  inert until BridgeManager confirms. */
+  private isBbsServiceNode = false;
+  setIsBbsServiceNode(on: boolean): void { this.isBbsServiceNode = on; }
+  isBbsNode(): boolean { return this.isBbsServiceNode; }
+
   /** Called from meshtasticSerial's TEXT handler AFTER isCommand returns
    *  false, when the DM is addressed to the local node and we're in
    *  bbs-only mode. Sends the command index back as an auto-reply.
@@ -111,6 +123,13 @@ export class BbsService {
    *  reply is new. Best-effort — sender retry covers transient drops. */
   async maybeAutoReplyForBbsOnly(fromId: string, channelIndex: number): Promise<boolean> {
     if (!this.bbsOnlyMode) return false;
+    // v2.0 Beta 5 Phase 2: auto-reply only fires on the install's BBS
+    // service node. If admin set bbs_only=1 on a radio that isn't
+    // also the BBS node, we suppress the auto-reply — the radio isn't
+    // serving BBS commands either way, and replying with the :cmd
+    // index would point the sender at commands that won't work on
+    // this radio.
+    if (!this.isBbsServiceNode) return false;
     if (!this.config.enabled) return false;
     // Don't auto-reply to ourselves (covers loopback if the firmware ever
     // delivers a self-DM) and don't auto-reply if a session is in flight
@@ -125,9 +144,15 @@ export class BbsService {
 
   /** Test whether this text is one of our configured triggers OR continues an
    *  active session. Replaces the standalone isBbsCommand() function so the
-   *  trigger isn't a module const. */
+   *  trigger isn't a module const.
+   *
+   *  v2.0 Beta 5 Phase 2: only the install's designated BBS service node
+   *  returns true. Non-BBS bridges short-circuit here so :mail / :wx
+   *  land as normal DMs on those radios — there's only ONE BBS endpoint
+   *  install-wide, addressed by mesh peers via the BBS radio's node_id. */
   isCommand(text: string, fromId: string): boolean {
     if (!this.config.enabled) return false;
+    if (!this.isBbsServiceNode) return false;
     if (!text) return false;
     const t = text.trim().toLowerCase();
     if (t.startsWith(this.config.mailTrigger)) return true;

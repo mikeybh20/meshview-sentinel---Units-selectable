@@ -517,6 +517,37 @@ export class MeshDataService {
   }
 
   // -------------------------------------------------------------------
+  // v2.0 Beta 5 Phase 2 (Services Pattern): BBS service node
+  // -------------------------------------------------------------------
+
+  async getBbsServiceNode(): Promise<{
+    radioId: string | null;
+    candidates: Array<{ radio_id: string; long_name: string; workspace_id: number | null }>;
+  } | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/bbs/node`, { credentials: 'include' });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  }
+
+  async setBbsServiceNode(radioId: string | null): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/bbs/node`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ radioId }),
+      });
+      const b = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: b.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'Network error' };
+    }
+  }
+
+  // -------------------------------------------------------------------
   // v2.0 Beta 5 Workspaces (Phase 1B + Phase 1C management)
   // -------------------------------------------------------------------
 
