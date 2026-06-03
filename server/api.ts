@@ -1658,6 +1658,41 @@ app.post('/api/mesh/restore', (req, res) => {
   }
 });
 
+// --- v2.0 Beta 5: live system stats (Jetson tegrastats equivalent) ---
+//
+// Reads /proc + /sys and returns a tegrastats-shaped snapshot. Cached
+// for 2s so a dashboard polling every 5s + a second tab + a curl
+// probe don't each fire their own 200ms /proc/stat sample.
+//
+// In-flight dedup: if a sample is already underway, concurrent
+// requests await the same promise rather than each starting their
+// own. Sampling /proc/stat costs ~200ms (the two-read diff window),
+// so back-to-back unsynchronized polls would otherwise create
+// 4-5 idle samples per second.
+import { readJetsonStats } from './jetsonStats.js';
+let jetsonStatsCache: { at: number; snapshot: any } | null = null;
+let jetsonStatsInflight: Promise<any> | null = null;
+const JETSON_STATS_CACHE_MS = 2_000;
+
+app.get('/api/system/jetson-stats', async (_req, res) => {
+  const now = Date.now();
+  if (jetsonStatsCache && now - jetsonStatsCache.at < JETSON_STATS_CACHE_MS) {
+    return res.json(jetsonStatsCache.snapshot);
+  }
+  try {
+    if (!jetsonStatsInflight) {
+      jetsonStatsInflight = readJetsonStats().then(snap => {
+        jetsonStatsCache = { at: Date.now(), snapshot: snap };
+        return snap;
+      }).finally(() => { jetsonStatsInflight = null; });
+    }
+    const snap = await jetsonStatsInflight;
+    return res.json(snap);
+  } catch (err: any) {
+    return res.status(500).json({ error: err?.message ?? 'stats read failed' });
+  }
+});
+
 // --- v2.0 Phase 5: host system info ---
 // Powers the boot-time RAM advisory in Settings → Radios. Reports total RAM,
 // free RAM, CPU count, and detected platform hints (Jetson via device-tree)
