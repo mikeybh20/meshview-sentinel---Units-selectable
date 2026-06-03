@@ -129,6 +129,16 @@ app.post('/api/auth/bootstrap', (req, res) => {
       role: 'admin',
     });
     meshDb().touchUserLogin(userId);
+    // v2.0 Beta 5 Workspaces: every user joins the Household workspace
+    // automatically. The bootstrap admin specifically also becomes the
+    // owner of Household when it doesn't have one yet (fresh install).
+    const wsList = meshDb().listWorkspaces();
+    if (wsList[0]) {
+      meshDb().addWorkspaceMember(wsList[0].id, userId);
+      if (wsList[0].ownerUserId == null) {
+        meshDb().setWorkspaceOwner(wsList[0].id, userId);
+      }
+    }
     const { cookie, expiresAt } = createSession(userId, requesterIp(req));
     res.setHeader('Set-Cookie', buildSessionSetCookie(cookie, expiresAt));
     return res.json({
@@ -220,6 +230,11 @@ app.post('/api/auth/users', requireAdmin, (req, res) => {
       passwordHash: hashPassword(passwordResult),
       role: req.body.role,
     });
+    // v2.0 Beta 5 Workspaces: auto-join the newly created user to the
+    // Household workspace so they have somewhere to land on first login.
+    // Admins later move them between workspaces via the management UI.
+    const firstWs = meshDb().listWorkspaces()[0];
+    if (firstWs) meshDb().addWorkspaceMember(firstWs.id, id);
     const created = meshDb().getUserById(id);
     return res.status(201).json({
       user: created ? {
@@ -893,9 +908,20 @@ app.post('/api/mesh/radios', (req, res) => {
     // First radio added becomes default if no default exists yet.
     is_default:      db.getDefaultRadio() ? 0 : 1,
     bbs_only:        body.bbs_only ? 1 : 0,
+    // workspace_id left NULL — bootstrapWorkspaces() runs on next boot
+    // (or on next radios upsert?) and assigns this radio to Household.
+    // Callers that want to drop a radio into a specific workspace use
+    // setRadioWorkspace() after creation.
+    workspace_id:    null,
     created_at:      now,
     updated_at:      now,
   });
+  // Backfill immediately so the radio doesn't sit unassigned until the
+  // next boot reaches bootstrapWorkspaces().
+  if (!db.getRadio(radio_id)?.workspace_id) {
+    const firstWs = db.listWorkspaces()[0];
+    if (firstWs) db.setRadioWorkspace(radio_id, firstWs.id);
+  }
   return res.status(201).json(db.getRadio(radio_id));
 });
 
@@ -1487,6 +1513,11 @@ const BACKUP_TABLES_CORE = [
   // needs to come over for those hashes to validate). Sessions are
   // intentionally NOT backed up — they're short-lived per-host state.
   'users',
+  // v2.0 Beta 5 Workspaces: tenant scoping. workspaces + memberships
+  // travel together; radios.workspace_id already rides on the radios
+  // backup. Sessions stay per-host. The auth-secret file in data/
+  // still needs to come over for password hashes to validate.
+  'workspaces', 'workspace_members',
 ] as const;
 const BACKUP_TABLES_HISTORY = [
   'nodes', 'messages', 'events', 'telemetry',

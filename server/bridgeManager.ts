@@ -258,11 +258,24 @@ class BridgeManager extends EventEmitter {
       network_label:   null,
       is_default:      1,
       bbs_only:        0,
+      // workspace_id left NULL — bootstrapWorkspaces() (called from
+      // MeshDb's constructor on every boot) backfills any unassigned
+      // radio to the Household workspace. New radios spawned post-boot
+      // get assigned via the same backfill on the next constructor pass,
+      // or explicitly by an admin via setRadioWorkspace().
+      workspace_id:    null,
       created_at:      now,
       updated_at:      now,
     };
 
     db.upsertRadio(row);
+    // v2.0 Beta 5 Workspaces: backfill workspace assignment for a
+    // brand-new radio so it shows up in the Household workspace right
+    // away rather than waiting for the next boot's bootstrapWorkspaces.
+    if (!existingRow) {
+      const firstWs = db.listWorkspaces()[0];
+      if (firstWs) db.setRadioWorkspace(shortName, firstWs.id);
+    }
 
     // If this is the first radio ever (no rows previously), backfill legacy
     // NULL radio_id rows to attribute the 1.x data to this radio.

@@ -312,8 +312,15 @@ export class MeshDatabase {
         -- stored so the operator can see who's pinging the BBS; only the
         -- auto-reply behavior is new.
         bbs_only        INTEGER NOT NULL DEFAULT 0,
+        -- v2.0 Beta 5 Workspaces: which workspace owns this radio. NULL
+        -- only during the migration window before bootstrapMultiTenant()
+        -- runs; afterward every radio has a workspace. Cascade SET NULL
+        -- when a workspace is deleted (the radio survives but becomes
+        -- unassigned — admin gets prompted to reassign).
+        workspace_id    INTEGER,
         created_at      INTEGER NOT NULL,
-        updated_at      INTEGER NOT NULL
+        updated_at      INTEGER NOT NULL,
+        FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE SET NULL
       );
 
       CREATE INDEX IF NOT EXISTS idx_radios_enabled ON radios(enabled);
@@ -351,6 +358,39 @@ export class MeshDatabase {
       );
       CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
       CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+
+      -- v2.0 Beta 5 Workspaces: multi-tenant scoping.
+      --
+      -- A workspace is a container for radios + the messages/channels/
+      -- BBS that come from them. Each radio belongs to exactly one
+      -- workspace; users can be members of multiple workspaces and
+      -- switch between them. Designed for the family use case ("each
+      -- household member sees their subset of the shared radios"):
+      -- create one "Household" workspace for shared infra, plus one
+      -- workspace per person for their personal radios.
+      --
+      -- The default workspace_id on radios is set during bootstrap
+      -- migration (auto-creates a "Household" workspace + assigns
+      -- every existing radio to it + adds every existing user as a
+      -- member). After migration the column is effectively NOT NULL.
+      CREATE TABLE IF NOT EXISTS workspaces (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        name            TEXT NOT NULL,
+        slug            TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        owner_user_id   INTEGER,
+        created_at      INTEGER NOT NULL,
+        FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE SET NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS workspace_members (
+        workspace_id    INTEGER NOT NULL,
+        user_id         INTEGER NOT NULL,
+        joined_at       INTEGER NOT NULL,
+        PRIMARY KEY (workspace_id, user_id),
+        FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id)      REFERENCES users(id)      ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_ws_members_user ON workspace_members(user_id);
 
       -- v2.0 Beta 5 Phase 4: per-user preferences.
       --
@@ -393,6 +433,13 @@ export class MeshDatabase {
     addColumnIfMissing('channels', 'position_precision INTEGER');
     addColumnIfMissing('bbs_weather_subscribers', 'zip TEXT');
     addColumnIfMissing('radios', 'bbs_only INTEGER NOT NULL DEFAULT 0');
+    addColumnIfMissing('radios', 'workspace_id INTEGER');
+
+    // Workspaces bootstrap migration. Runs idempotently every boot —
+    // safe to call repeatedly. Creates a default "Household" workspace
+    // and assigns every existing user + radio to it on first boot
+    // post-Workspaces. Subsequent boots no-op.
+    this.bootstrapWorkspaces();
 
     // v2.0 multi-radio additive migration. Every radio-scoped table gets a
     // radio_id column. Stays nullable for the migration window so existing
@@ -1483,6 +1530,11 @@ export class MeshDatabase {
     // across migrations. Sessions deliberately NOT in this list — they're
     // per-host transient state.
     'users',
+    // v2.0 Beta 5 Workspaces: tenant scoping. workspaces + memberships
+    // round-trip so a backup-then-restore preserves the multi-tenant
+    // layout (otherwise the restore re-runs bootstrapWorkspaces and
+    // throws everything into one Household).
+    'workspaces', 'workspace_members',
     // history (opt-in)
     'nodes', 'messages', 'events', 'telemetry',
     'neighbor_info', 'store_forward_routers',
@@ -2080,7 +2132,7 @@ export class MeshDatabase {
     return this.db.prepare(`
       SELECT radio_id, long_name, transport, target, region, modem_preset,
              frequency_slot, primary_channel, num_hops, enabled, color_hex,
-             network_label, is_default, bbs_only, created_at, updated_at
+             network_label, is_default, bbs_only, workspace_id, created_at, updated_at
       FROM radios
       ORDER BY is_default DESC, created_at ASC
     `).all() as RadioRow[];
@@ -2090,7 +2142,7 @@ export class MeshDatabase {
     const row = this.db.prepare(`
       SELECT radio_id, long_name, transport, target, region, modem_preset,
              frequency_slot, primary_channel, num_hops, enabled, color_hex,
-             network_label, is_default, bbs_only, created_at, updated_at
+             network_label, is_default, bbs_only, workspace_id, created_at, updated_at
       FROM radios WHERE radio_id = ?
     `).get(radioId) as RadioRow | undefined;
     return row ?? null;
@@ -2100,7 +2152,7 @@ export class MeshDatabase {
     const row = this.db.prepare(`
       SELECT radio_id, long_name, transport, target, region, modem_preset,
              frequency_slot, primary_channel, num_hops, enabled, color_hex,
-             network_label, is_default, bbs_only, created_at, updated_at
+             network_label, is_default, bbs_only, workspace_id, created_at, updated_at
       FROM radios WHERE is_default = 1
       LIMIT 1
     `).get() as RadioRow | undefined;
@@ -2113,11 +2165,11 @@ export class MeshDatabase {
       INSERT INTO radios (
         radio_id, long_name, transport, target, region, modem_preset,
         frequency_slot, primary_channel, num_hops, enabled, color_hex,
-        network_label, is_default, bbs_only, created_at, updated_at
+        network_label, is_default, bbs_only, workspace_id, created_at, updated_at
       ) VALUES (
         @radio_id, @long_name, @transport, @target, @region, @modem_preset,
         @frequency_slot, @primary_channel, @num_hops, @enabled, @color_hex,
-        @network_label, @is_default, @bbs_only, @created_at, @updated_at
+        @network_label, @is_default, @bbs_only, @workspace_id, @created_at, @updated_at
       )
       ON CONFLICT(radio_id) DO UPDATE SET
         long_name       = excluded.long_name,
@@ -2133,6 +2185,9 @@ export class MeshDatabase {
         network_label   = excluded.network_label,
         is_default      = excluded.is_default,
         bbs_only        = excluded.bbs_only,
+        -- workspace_id deliberately not in the update set: changing it
+        -- belongs to the dedicated setRadioWorkspace() helper so admin
+        -- reassignment is auditable + atomic. upsertRadio preserves it.
         updated_at      = excluded.updated_at
     `).run({
       radio_id:        r.radio_id,
@@ -2149,6 +2204,11 @@ export class MeshDatabase {
       network_label:   r.network_label ?? null,
       is_default:      r.is_default ? 1 : 0,
       bbs_only:        r.bbs_only ? 1 : 0,
+      // workspace_id: nullable; bootstrapWorkspaces() backfills NULLs at
+      // boot. tryAutoRegisterDefault + spawnSecondary leave it NULL so
+      // the migration assigns the radio to Household. Workspace
+      // reassignment happens via setRadioWorkspace.
+      workspace_id:    r.workspace_id ?? null,
       created_at:      r.created_at ?? now,
       updated_at:      now,
     });
@@ -2316,6 +2376,217 @@ export class MeshDatabase {
     return Number(r.changes ?? 0);
   }
 
+  // ---------------------------------------------------------------------
+  // v2.0 Beta 5 Workspaces — Phase 1 schema + bootstrap migration
+  // ---------------------------------------------------------------------
+
+  /**
+   * One-shot bootstrap that gets the DB into the "every existing user is
+   * in the Household workspace, every existing radio is assigned to it"
+   * state. Idempotent — running on a post-migration DB does nothing.
+   *
+   * The migration runs unconditionally at constructor time. Three guards
+   * make it cheap on subsequent boots:
+   *   - If at least one workspace already exists, we skip creating the
+   *     default one (but still backfill any unassigned radios + users —
+   *     covers the case where workspaces were deleted and re-added).
+   *   - The backfills use INSERT OR IGNORE so re-running is a no-op.
+   *   - The radio.workspace_id update is a NULL-guarded UPDATE.
+   *
+   * "Household" was picked over "Default" because the target audience is
+   * a family install — the name reflects the actual use case. The slug
+   * is "household" lowercased — slugs are stable identifiers used in
+   * URLs and shouldn't change even if the display name does.
+   */
+  private bootstrapWorkspaces(): void {
+    try {
+      // Idempotent: if a Household workspace already exists, use it;
+      // otherwise create it. Either way we end up with a row to assign
+      // orphaned radios + users to.
+      let defaultWs = this.db.prepare(
+        `SELECT id FROM workspaces ORDER BY id ASC LIMIT 1`
+      ).get() as { id: number } | undefined;
+
+      if (!defaultWs) {
+        const now = Date.now();
+        const r = this.db.prepare(`
+          INSERT INTO workspaces (name, slug, owner_user_id, created_at)
+          VALUES (?, ?, NULL, ?)
+        `).run('Household', 'household', now);
+        defaultWs = { id: Number(r.lastInsertRowid) };
+        console.log('[MeshDB] Bootstrapped default workspace "Household" (id=' + defaultWs.id + ')');
+      }
+
+      // Backfill: every existing user joins the default workspace.
+      // INSERT OR IGNORE handles the case where some users are already in.
+      const memberInsert = this.db.prepare(`
+        INSERT OR IGNORE INTO workspace_members (workspace_id, user_id, joined_at)
+        VALUES (?, ?, ?)
+      `);
+      const userIds = this.db.prepare(`SELECT id FROM users`).all() as Array<{ id: number }>;
+      const now = Date.now();
+      for (const u of userIds) memberInsert.run(defaultWs.id, u.id, now);
+
+      // Backfill: every radio with NULL workspace_id joins the default.
+      this.db.prepare(
+        `UPDATE radios SET workspace_id = ? WHERE workspace_id IS NULL`
+      ).run(defaultWs.id);
+
+      // Set owner if the default workspace doesn't have one yet — picks
+      // the first admin (or the first user if no admin yet, e.g. pre-
+      // bootstrap install with no users at all yet).
+      const owner = this.db.prepare(`
+        SELECT id FROM users
+        WHERE locked = 0
+        ORDER BY (role = 'admin') DESC, id ASC
+        LIMIT 1
+      `).get() as { id: number } | undefined;
+      if (owner) {
+        this.db.prepare(
+          `UPDATE workspaces SET owner_user_id = ? WHERE id = ? AND owner_user_id IS NULL`
+        ).run(owner.id, defaultWs.id);
+      }
+    } catch (err: any) {
+      console.warn('[MeshDB] Workspace bootstrap failed (continuing — workspaces feature may not work):', err.message);
+    }
+  }
+
+  // -- workspace CRUD --
+
+  listWorkspaces(opts: { forUserId?: number | null } = {}): Array<{
+    id: number; name: string; slug: string;
+    ownerUserId: number | null; createdAt: number;
+    memberCount: number; radioCount: number;
+    /** True only when forUserId was supplied — useful for "all
+     *  workspaces I'm a member of" queries. */
+    isMember?: boolean;
+  }> {
+    if (opts.forUserId == null) {
+      return this.db.prepare(`
+        SELECT
+          w.id, w.name, w.slug,
+          w.owner_user_id AS ownerUserId,
+          w.created_at AS createdAt,
+          (SELECT COUNT(*) FROM workspace_members m WHERE m.workspace_id = w.id) AS memberCount,
+          (SELECT COUNT(*) FROM radios r WHERE r.workspace_id = w.id) AS radioCount
+        FROM workspaces w
+        ORDER BY w.created_at ASC
+      `).all() as any;
+    }
+    return this.db.prepare(`
+      SELECT
+        w.id, w.name, w.slug,
+        w.owner_user_id AS ownerUserId,
+        w.created_at AS createdAt,
+        (SELECT COUNT(*) FROM workspace_members m WHERE m.workspace_id = w.id) AS memberCount,
+        (SELECT COUNT(*) FROM radios r WHERE r.workspace_id = w.id) AS radioCount,
+        1 AS isMember
+      FROM workspaces w
+      JOIN workspace_members me ON me.workspace_id = w.id AND me.user_id = ?
+      ORDER BY w.created_at ASC
+    `).all(opts.forUserId) as any;
+  }
+
+  getWorkspace(id: number): { id: number; name: string; slug: string; ownerUserId: number | null; createdAt: number } | null {
+    const row = this.db.prepare(`
+      SELECT id, name, slug, owner_user_id AS ownerUserId, created_at AS createdAt
+      FROM workspaces WHERE id = ?
+    `).get(id) as any;
+    return row ?? null;
+  }
+
+  createWorkspace(input: { name: string; slug: string; ownerUserId: number | null }): number {
+    const r = this.db.prepare(`
+      INSERT INTO workspaces (name, slug, owner_user_id, created_at)
+      VALUES (?, ?, ?, ?)
+    `).run(input.name, input.slug, input.ownerUserId, Date.now());
+    return Number(r.lastInsertRowid);
+  }
+
+  updateWorkspaceName(id: number, name: string): boolean {
+    const r = this.db.prepare(`UPDATE workspaces SET name = ? WHERE id = ?`).run(name, id);
+    return r.changes > 0;
+  }
+
+  /** Assign or clear a workspace's owner. Only used by the bootstrap +
+   *  admin transfer paths. */
+  setWorkspaceOwner(id: number, ownerUserId: number | null): boolean {
+    const r = this.db.prepare(
+      `UPDATE workspaces SET owner_user_id = ? WHERE id = ?`
+    ).run(ownerUserId, id);
+    return r.changes > 0;
+  }
+
+  deleteWorkspace(id: number): boolean {
+    // Cascade rules: workspace_members → CASCADE (members vanish).
+    // radios.workspace_id → SET NULL (radios survive but unassigned;
+    // admin gets prompted to reassign).
+    const r = this.db.prepare(`DELETE FROM workspaces WHERE id = ?`).run(id);
+    return r.changes > 0;
+  }
+
+  countWorkspaces(): number {
+    const row = this.db.prepare(`SELECT COUNT(*) AS c FROM workspaces`).get() as { c: number } | undefined;
+    return row?.c ?? 0;
+  }
+
+  // -- membership --
+
+  listWorkspaceMembers(workspaceId: number): Array<{
+    userId: number; username: string; role: 'admin' | 'viewer';
+    joinedAt: number; isOwner: boolean;
+  }> {
+    return this.db.prepare(`
+      SELECT
+        u.id AS userId, u.username, u.role,
+        m.joined_at AS joinedAt,
+        (SELECT owner_user_id FROM workspaces WHERE id = m.workspace_id) = u.id AS isOwner
+      FROM workspace_members m
+      JOIN users u ON u.id = m.user_id
+      WHERE m.workspace_id = ?
+      ORDER BY u.created_at ASC
+    `).all(workspaceId) as any;
+  }
+
+  addWorkspaceMember(workspaceId: number, userId: number): boolean {
+    const r = this.db.prepare(`
+      INSERT OR IGNORE INTO workspace_members (workspace_id, user_id, joined_at)
+      VALUES (?, ?, ?)
+    `).run(workspaceId, userId, Date.now());
+    return r.changes > 0;
+  }
+
+  removeWorkspaceMember(workspaceId: number, userId: number): boolean {
+    const r = this.db.prepare(`
+      DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?
+    `).run(workspaceId, userId);
+    return r.changes > 0;
+  }
+
+  isWorkspaceMember(workspaceId: number, userId: number): boolean {
+    const row = this.db.prepare(`
+      SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ?
+    `).get(workspaceId, userId);
+    return !!row;
+  }
+
+  /** All workspace ids the user belongs to. Powers the "what can this
+   *  user see?" filter in list endpoints. Admins typically bypass this. */
+  workspaceIdsForUser(userId: number): number[] {
+    const rows = this.db.prepare(`
+      SELECT workspace_id AS id FROM workspace_members WHERE user_id = ?
+    `).all(userId) as Array<{ id: number }>;
+    return rows.map(r => r.id);
+  }
+
+  /** Set the workspace_id of a radio. Returns false if no row matched. */
+  setRadioWorkspace(radioId: string, workspaceId: number | null): boolean {
+    const r = this.db.prepare(`
+      UPDATE radios SET workspace_id = ?, updated_at = ? WHERE radio_id = ?
+    `).run(workspaceId, Date.now(), radioId);
+    return r.changes > 0;
+  }
+
   // -- user prefs --
 
   /** Whole-row dump for one user. Values come back as parsed JSON
@@ -2432,6 +2703,11 @@ export interface RadioRow {
    *  the command index. Lets an operator dedicate one radio to BBS while
    *  others stay general chat nodes. 0 = standard behavior. */
   bbs_only: number;         // 0|1
+  /** v2.0 Beta 5 Workspaces: which workspace owns this radio. Nullable
+   *  during the migration window only; bootstrapWorkspaces() backfills
+   *  every NULL on every boot so post-migration this is effectively
+   *  NOT NULL. Cascade-SET-NULL when the workspace gets deleted. */
+  workspace_id: number | null;
   created_at: number;
   updated_at: number;
 }
