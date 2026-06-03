@@ -4192,6 +4192,58 @@ export class MeshtasticSerialBridge extends EventEmitter {
   }
 
   /** v2.0 Beta 2: ask the local radio for its NetworkConfig (WiFi/Eth). */
+  /**
+   * v2.0 Beta 5 Labeled Devices: set the device's long_name + short_name.
+   *
+   * Used by the Labeled Devices module to repurpose Heltec Vision
+   * Master / similar e-ink boards as physical signage. The firmware
+   * renders long_name prominently on the device-info screen (usually
+   * the home screen), so changing it produces a persistent on-device
+   * label that survives power cycles.
+   *
+   * Wraps the User submessage in AdminMessage.set_owner (field 32),
+   * sends to the local node, follows up with the commit. Standard
+   * Meshtastic admin protocol; the change also broadcasts as a
+   * NodeInfo update so the mesh sees the new identity.
+   *
+   * Strictly local admin — sendAdminMessage writes to THIS bridge's
+   * transport. Caller (the labeled-devices push helper) opens a
+   * transient bridge against the target device's host:port for the
+   * duration of the call.
+   *
+   * Validation: long_name is capped at 40 chars (firmware NodeDB
+   * field width), short_name at 4 chars (standard Meshtastic
+   * convention — the four-char chip-like badge).
+   */
+  async setOwner(opts: { longName: string; shortName: string }): Promise<void> {
+    if (!this.isLinkOpen()) throw new Error('Device not connected');
+    if (!this.localNodeNum) throw new Error('Local node not yet identified — try again in a moment');
+
+    const longName = (opts.longName ?? '').trim().slice(0, 40);
+    const shortName = (opts.shortName ?? '').trim().slice(0, 4);
+    if (!longName) throw new Error('long_name cannot be empty');
+    if (!shortName) throw new Error('short_name cannot be empty');
+
+    // User submessage. Field numbers per mesh.proto User:
+    //   1 = id (string)  — left empty; firmware preserves
+    //   2 = long_name (string)
+    //   3 = short_name (string)
+    //   ... is_licensed (5), role (6), etc. — preserved by firmware on
+    //   set_owner when not provided in our message.
+    const userPayload = Buffer.concat([
+      this.encodeTagLen(2, Buffer.from(longName, 'utf-8')),
+      this.encodeTagLen(3, Buffer.from(shortName, 'utf-8')),
+    ]);
+    // AdminMessage.set_owner = field 32 (length-delim User).
+    const adminPayload = this.encodeTagLen(32, userPayload);
+
+    this.sendAdminMessage(adminPayload);
+    await new Promise(r => setTimeout(r, 80));
+    this.sendAdminMessage(this.buildAdminCommit());
+
+    console.log(`[MeshtasticSerial] Owner write: long="${longName}" short="${shortName}"`);
+  }
+
   async requestNetworkConfig(): Promise<void> {
     if (!this.isLinkOpen()) return;
     if (!this.localNodeNum) return;

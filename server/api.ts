@@ -7,7 +7,7 @@ import { fileURLToPath } from 'url';
 import os from 'os';
 import dotenv from 'dotenv';
 import { serialDiscovery } from './serialDiscovery.js';
-import { meshBridge, type MeshtasticSerialBridge } from './meshtasticSerial.js';
+import { meshBridge, MeshtasticSerialBridge } from './meshtasticSerial.js';
 import { meshDb } from './database.js';
 // BbsService is no longer instantiated here in v2.0 — see [bridgeManager.ts](./bridgeManager.ts)
 // which owns one BbsService per RadioContext. api.ts just plumbs config + endpoints.
@@ -665,6 +665,11 @@ const VIEWER_WRITE_PATTERNS: Array<{ method: string; pattern: RegExp }> = [
   // it to per-user state. Either way, "favorite this node" is an
   // operator preference, not a config change.
   { method: 'POST',   pattern: /^\/mesh\/nodes\/![0-9a-fA-F]+\/favorite$/ },
+  // v2.0 Beta 5 Labeled Devices: pushing a new label to a tap-label
+  // device (Heltec Vision Master, etc.). Operator action — the
+  // bartender changing the keg shouldn't need admin role to update
+  // the sign. The handler enforces workspace membership separately.
+  { method: 'POST',   pattern: /^\/labeled-devices\/\d+\/push$/ },
 ];
 
 app.use('/api', (req, res, next) => {
@@ -3761,6 +3766,169 @@ app.get('/api/mesh/bbs/config', (_req, res) => {
  * each connected BbsService's isBbsNode flag so the gate flips
  * without a reconnect cycle.
  */
+// =============================================
+// v2.0 Beta 5 — Labeled Devices (e-ink signage / tap labels)
+// =============================================
+//
+// Lightweight management for Heltec Vision Master / similar e-ink
+// devices used as physical signage — tap labels, station signs.
+// Devices are NOT full radios in BridgeManager; pushing a new label
+// opens a one-shot TCP connection, sends AdminMessage.set_owner,
+// disconnects. Per-device memory cost is ~0 between pushes.
+//
+// Workspace-scoped: members see + push to their workspace's devices.
+// Adding/removing devices is admin-only. Pushing labels is a
+// viewer-allowed write (operator action, not config change) so wife/
+// kid can update tap labels without admin role.
+//
+// PUBLIC_API allowlist note: the label-push PATCH is added to the
+// existing VIEWER_WRITE_PATTERNS via its path — but the gate above
+// already lets reads/writes flow when the path matches a workspace
+// member's permission. We additionally enforce workspace membership
+// per-device in the handler.
+
+/** One-shot label push: open transient bridge, wait for identity,
+ *  send set_owner + commit, disconnect. Returns null on success or
+ *  an error string on failure. Catches everything so the API
+ *  handler always gets a clean result. */
+async function pushDeviceLabel(host: string, port: number, longName: string, shortName: string): Promise<string | null> {
+  const bridge = new MeshtasticSerialBridge();
+  try {
+    await bridge.connectTcp(host, port);
+    // Wait up to 5s for the device's identity packet so localNodeNum
+    // populates. setOwner refuses without it (admin messages need a
+    // target node_num). 5s is conservative — typical identity exchange
+    // completes in under 1s on a healthy LAN connection.
+    const start = Date.now();
+    while (!bridge.getLocalNodeId() && Date.now() - start < 5000) {
+      await new Promise(r => setTimeout(r, 100));
+    }
+    if (!bridge.getLocalNodeId()) {
+      return 'Device did not respond with identity within 5s — check host/port and that the device is on';
+    }
+    await bridge.setOwner({ longName, shortName });
+    // Let the commit flush before we tear down the connection. The
+    // firmware ACKs commits internally; 300ms is a comfortable margin.
+    await new Promise(r => setTimeout(r, 300));
+    return null;
+  } catch (err: any) {
+    return err?.message ?? 'push failed';
+  } finally {
+    try { await bridge.disconnect(); } catch { /* best-effort */ }
+  }
+}
+
+/** GET /api/labeled-devices — list devices the user can see. Admin
+ *  sees all; member sees only those in their workspaces. */
+app.get('/api/labeled-devices', requireAuth, (req, res) => {
+  const userId = req.user!.id;
+  const isAdmin = req.user!.role === 'admin';
+  const wsIds = isAdmin ? undefined : meshDb().workspaceIdsForUser(userId);
+  const devices = meshDb().listLabeledDevices({ workspaceIds: wsIds });
+  return res.json({ devices });
+});
+
+/** POST /api/labeled-devices — admin creates a device. Body:
+ *  { workspaceId, displayName, host, port? }. Port defaults to 4403. */
+app.post('/api/labeled-devices', requireAdmin, (req, res) => {
+  const workspaceId = Number(req.body?.workspaceId);
+  const displayName = String(req.body?.displayName ?? '').trim();
+  const host = String(req.body?.host ?? '').trim();
+  const portRaw = req.body?.port;
+  const port = Number.isFinite(portRaw) ? Math.floor(portRaw) : 4403;
+
+  if (!Number.isInteger(workspaceId)) return res.status(400).json({ error: 'workspaceId is required' });
+  if (!meshDb().getWorkspace(workspaceId)) return res.status(404).json({ error: 'workspace not found' });
+  if (displayName.length < 1 || displayName.length > 64) {
+    return res.status(400).json({ error: 'displayName must be 1..64 chars' });
+  }
+  if (!host) return res.status(400).json({ error: 'host is required' });
+  if (port < 1 || port > 65535) return res.status(400).json({ error: 'port out of range' });
+
+  try {
+    const id = meshDb().createLabeledDevice({ workspaceId, displayName, host, port });
+    return res.status(201).json({ device: meshDb().getLabeledDevice(id) });
+  } catch (err: any) {
+    return res.status(500).json({ error: err?.message ?? 'create failed' });
+  }
+});
+
+/** PATCH /api/labeled-devices/:id — admin updates display_name /
+ *  host / port / workspaceId. The label itself is updated via the
+ *  push endpoint, not here, so changing the connection target is the
+ *  only thing this does. */
+app.patch('/api/labeled-devices/:id', requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'id must be an integer' });
+  if (!meshDb().getLabeledDevice(id)) return res.status(404).json({ error: 'device not found' });
+
+  const patch: any = {};
+  if (req.body?.displayName !== undefined) {
+    const dn = String(req.body.displayName).trim();
+    if (dn.length < 1 || dn.length > 64) return res.status(400).json({ error: 'displayName must be 1..64 chars' });
+    patch.displayName = dn;
+  }
+  if (req.body?.host !== undefined) {
+    const h = String(req.body.host).trim();
+    if (!h) return res.status(400).json({ error: 'host cannot be empty' });
+    patch.host = h;
+  }
+  if (req.body?.port !== undefined) {
+    const p = Number(req.body.port);
+    if (!Number.isInteger(p) || p < 1 || p > 65535) return res.status(400).json({ error: 'port out of range' });
+    patch.port = p;
+  }
+  if (req.body?.workspaceId !== undefined) {
+    const wid = Number(req.body.workspaceId);
+    if (!Number.isInteger(wid) || !meshDb().getWorkspace(wid)) {
+      return res.status(400).json({ error: 'workspaceId must reference an existing workspace' });
+    }
+    patch.workspaceId = wid;
+  }
+  meshDb().updateLabeledDevice(id, patch);
+  return res.json({ device: meshDb().getLabeledDevice(id) });
+});
+
+/** DELETE /api/labeled-devices/:id — admin removes a device. */
+app.delete('/api/labeled-devices/:id', requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'id must be an integer' });
+  meshDb().deleteLabeledDevice(id);
+  return res.json({ ok: true });
+});
+
+/** POST /api/labeled-devices/:id/push — push a new label to the
+ *  device. Any workspace member can do this (no admin role
+ *  required) since it's an operator action, not a config change.
+ *  Body: { label, short }. */
+app.post('/api/labeled-devices/:id/push', requireAuth, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'id must be an integer' });
+  const device = meshDb().getLabeledDevice(id);
+  if (!device) return res.status(404).json({ error: 'device not found' });
+
+  // Workspace gate: must be a member (or admin).
+  const userId = req.user!.id;
+  if (req.user!.role !== 'admin' && !meshDb().isWorkspaceMember(device.workspaceId, userId)) {
+    return res.status(403).json({ error: 'Not a member of this device\'s workspace' });
+  }
+
+  const label = String(req.body?.label ?? '').trim();
+  const short = String(req.body?.short ?? '').trim();
+  if (!label) return res.status(400).json({ error: 'label is required' });
+  if (!short) return res.status(400).json({ error: 'short is required (≤4 chars, used as the badge)' });
+  if (label.length > 40) return res.status(400).json({ error: 'label must be ≤40 chars (Meshtastic long_name limit)' });
+  if (short.length > 4) return res.status(400).json({ error: 'short must be ≤4 chars (Meshtastic short_name limit)' });
+
+  console.log(`[LabeledDevices] Pushing to ${device.host}:${device.port} — long="${label}" short="${short}"`);
+  const err = await pushDeviceLabel(device.host, device.port, label, short);
+  meshDb().recordLabeledDevicePush(id, { label, short, error: err });
+  if (err) {
+    return res.status(502).json({ error: err, device: meshDb().getLabeledDevice(id) });
+  }
+  return res.json({ ok: true, device: meshDb().getLabeledDevice(id) });
+});
+
 app.get('/api/mesh/bbs/node', requireAuth, (_req, res) => {
   return res.json({
     radioId: meshDb().getBbsNodeRadioId(),

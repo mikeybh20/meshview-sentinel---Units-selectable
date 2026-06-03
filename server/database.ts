@@ -403,6 +403,31 @@ export class MeshDatabase {
       );
       CREATE INDEX IF NOT EXISTS idx_ws_members_user ON workspace_members(user_id);
 
+      -- v2.0 Beta 5 Labeled Devices: lightweight "managed e-ink labels"
+      -- (Heltec Vision Master, etc.) used as physical signage — tap
+      -- labels, station IDs, room signs. The device's long_name is the
+      -- displayed text on its e-paper home screen; this table holds
+      -- the connection info + last-pushed label so Sentinel can do a
+      -- one-shot TCP connect → AdminMessage.set_owner → disconnect
+      -- without holding a persistent bridge per device. Scales to
+      -- many more devices than the full radio bridge path can on a
+      -- constrained host like the Jetson Nano 2GB.
+      CREATE TABLE IF NOT EXISTS labeled_devices (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        workspace_id    INTEGER NOT NULL,
+        display_name    TEXT NOT NULL,
+        host            TEXT NOT NULL,
+        port            INTEGER NOT NULL DEFAULT 4403,
+        current_label   TEXT,
+        current_short   TEXT,
+        last_pushed_at  INTEGER,
+        last_error      TEXT,
+        created_at      INTEGER NOT NULL,
+        updated_at      INTEGER NOT NULL,
+        FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_labeled_devices_ws ON labeled_devices(workspace_id);
+
       -- v2.0 Beta 5 Phase 4: per-user preferences.
       --
       -- Generic key/value store, one row per (user, key). value is a
@@ -2687,6 +2712,117 @@ export class MeshDatabase {
     const r = this.db.prepare(`
       UPDATE radios SET workspace_id = ?, updated_at = ? WHERE radio_id = ?
     `).run(workspaceId, Date.now(), radioId);
+    return r.changes > 0;
+  }
+
+  // ---------------------------------------------------------------------
+  // v2.0 Beta 5 Labeled Devices
+  // ---------------------------------------------------------------------
+
+  /** Workspace-filtered list when workspaceIds supplied (member view).
+   *  Admin gets every device when called without filter. */
+  listLabeledDevices(opts: { workspaceIds?: number[] } = {}): Array<{
+    id: number; workspaceId: number; displayName: string;
+    host: string; port: number;
+    currentLabel: string | null; currentShort: string | null;
+    lastPushedAt: number | null; lastError: string | null;
+    createdAt: number; updatedAt: number;
+  }> {
+    let sql: string;
+    let params: any[] = [];
+    if (opts.workspaceIds && opts.workspaceIds.length > 0) {
+      const placeholders = opts.workspaceIds.map(() => '?').join(',');
+      sql = `
+        SELECT id, workspace_id AS workspaceId, display_name AS displayName,
+               host, port,
+               current_label AS currentLabel, current_short AS currentShort,
+               last_pushed_at AS lastPushedAt, last_error AS lastError,
+               created_at AS createdAt, updated_at AS updatedAt
+        FROM labeled_devices
+        WHERE workspace_id IN (${placeholders})
+        ORDER BY display_name ASC
+      `;
+      params = opts.workspaceIds;
+    } else {
+      sql = `
+        SELECT id, workspace_id AS workspaceId, display_name AS displayName,
+               host, port,
+               current_label AS currentLabel, current_short AS currentShort,
+               last_pushed_at AS lastPushedAt, last_error AS lastError,
+               created_at AS createdAt, updated_at AS updatedAt
+        FROM labeled_devices
+        ORDER BY display_name ASC
+      `;
+    }
+    return this.db.prepare(sql).all(...params) as any;
+  }
+
+  getLabeledDevice(id: number): {
+    id: number; workspaceId: number; displayName: string;
+    host: string; port: number;
+    currentLabel: string | null; currentShort: string | null;
+    lastPushedAt: number | null; lastError: string | null;
+    createdAt: number; updatedAt: number;
+  } | null {
+    const row = this.db.prepare(`
+      SELECT id, workspace_id AS workspaceId, display_name AS displayName,
+             host, port,
+             current_label AS currentLabel, current_short AS currentShort,
+             last_pushed_at AS lastPushedAt, last_error AS lastError,
+             created_at AS createdAt, updated_at AS updatedAt
+      FROM labeled_devices WHERE id = ?
+    `).get(id) as any;
+    return row ?? null;
+  }
+
+  createLabeledDevice(input: {
+    workspaceId: number; displayName: string; host: string; port: number;
+  }): number {
+    const now = Date.now();
+    const r = this.db.prepare(`
+      INSERT INTO labeled_devices
+        (workspace_id, display_name, host, port, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(input.workspaceId, input.displayName, input.host, input.port, now, now);
+    return Number(r.lastInsertRowid);
+  }
+
+  updateLabeledDevice(id: number, patch: {
+    displayName?: string; host?: string; port?: number; workspaceId?: number;
+  }): boolean {
+    const sets: string[] = [];
+    const params: any[] = [];
+    if (patch.displayName !== undefined) { sets.push('display_name = ?');  params.push(patch.displayName); }
+    if (patch.host        !== undefined) { sets.push('host = ?');          params.push(patch.host); }
+    if (patch.port        !== undefined) { sets.push('port = ?');          params.push(patch.port); }
+    if (patch.workspaceId !== undefined) { sets.push('workspace_id = ?');  params.push(patch.workspaceId); }
+    if (sets.length === 0) return false;
+    sets.push('updated_at = ?'); params.push(Date.now());
+    params.push(id);
+    const r = this.db.prepare(`
+      UPDATE labeled_devices SET ${sets.join(', ')} WHERE id = ?
+    `).run(...params);
+    return r.changes > 0;
+  }
+
+  /** Record the result of a label-push attempt — success or failure. */
+  recordLabeledDevicePush(id: number, opts: {
+    label: string; short: string; error?: string | null;
+  }): boolean {
+    const r = this.db.prepare(`
+      UPDATE labeled_devices SET
+        current_label = ?,
+        current_short = ?,
+        last_pushed_at = ?,
+        last_error = ?,
+        updated_at = ?
+      WHERE id = ?
+    `).run(opts.label, opts.short, Date.now(), opts.error ?? null, Date.now(), id);
+    return r.changes > 0;
+  }
+
+  deleteLabeledDevice(id: number): boolean {
+    const r = this.db.prepare(`DELETE FROM labeled_devices WHERE id = ?`).run(id);
     return r.changes > 0;
   }
 

@@ -20,6 +20,7 @@ import {
   RefreshCw,
   Mail,
   CloudRain,
+  Tag,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -62,13 +63,14 @@ import { LogsView } from './components/views/LogsView';
 import { MatrixView } from './components/views/MatrixView';
 import { MailView } from './components/views/MailView';
 import { WeatherView } from './components/views/WeatherView';
+import { LabeledDevicesView } from './components/views/LabeledDevicesView';
 
 export default function App() {
   const theme = useTheme();
   const [nodes, setNodes] = React.useState<Node[]>([]);
   const [messages, setMessages] = React.useState<Message[]>([]);
   const [events, setEvents] = React.useState<RadioEvent[]>([]);
-  const [activeTab, setActiveTab] = React.useState<'dashboard' | 'map' | 'messages' | 'logs' | 'matrix' | 'topology' | 'mail' | 'weather' | 'radios'>('dashboard');
+  const [activeTab, setActiveTab] = React.useState<'dashboard' | 'map' | 'messages' | 'logs' | 'matrix' | 'topology' | 'mail' | 'weather' | 'radios' | 'labels'>('dashboard');
   const [selectedNodeId, setSelectedNodeId] = React.useState<string | null>(null);
   const [configuringNodeId, setConfiguringNodeId] = React.useState<string | null>(null);
   const [showExportModal, setShowExportModal] = React.useState(false);
@@ -707,6 +709,12 @@ export default function App() {
             label="BBS Weather"
           />
           <NavItem
+            active={activeTab === 'labels'}
+            onClick={() => setActiveTab('labels')}
+            icon={<Tag size={20} />}
+            label="Device Labels"
+          />
+          <NavItem
             active={activeTab === 'logs'}
             onClick={() => setActiveTab('logs')}
             icon={<History size={20} />}
@@ -1251,6 +1259,18 @@ export default function App() {
                 className="h-full overflow-hidden"
               >
                 <WeatherView nodes={nodes} />
+              </motion.div>
+            )}
+
+            {activeTab === 'labels' && (
+              <motion.div
+                key="labels"
+                initial={{ opacity: 0, scale: 0.98 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.98 }}
+                className="h-full overflow-hidden"
+              >
+                <LabeledDevicesView />
               </motion.div>
             )}
 
