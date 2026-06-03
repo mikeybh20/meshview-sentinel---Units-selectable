@@ -87,6 +87,14 @@ export class MeshDataService {
     this.pollMs = pollMs;
   }
 
+  /** v2.0 Beta 5 Workspaces: fire an immediate poll. Called by
+   *  switchWorkspace() so the dashboard reflects the new workspace
+   *  context without waiting for the next scheduled tick. */
+  forceRefresh(): void {
+    void this.poll();
+    this.pollStatus();
+  }
+
   /** Start polling the server for live mesh data and open the SSE stream */
   start() {
     this.poll(); // immediate first fetch

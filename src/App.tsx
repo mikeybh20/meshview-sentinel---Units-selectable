@@ -45,7 +45,8 @@ import { RadiosView } from './components/views/RadiosView';
 import { ViaFilter, ViaFilterValue } from './components/ViaFilter';
 import { useRadios } from './hooks/useRadios';
 import { useAuth, useIsAdmin } from './hooks/useAuth';
-import { LogOut, User as UserIcon, Eye as EyeIcon } from 'lucide-react';
+import { useWorkspaces } from './hooks/useWorkspaces';
+import { LogOut, User as UserIcon, Eye as EyeIcon, Layers as LayersIcon, ChevronDown } from 'lucide-react';
 // RecipeView moved into SettingsModal as the "Install Guide" tab; the standalone
 // dashboard page was removed per operator request to keep the main nav focused
 // on operational views.
@@ -952,6 +953,10 @@ export default function App() {
                 role chip. Click to log out (confirm dialog gates the
                 action so a stray click doesn't bounce you to the login
                 screen). */}
+            {/* v2.0 Beta 5 Workspaces: dropdown to switch active
+                workspace. Self-hides when the user is only a member
+                of one — no point showing a switcher with no choice. */}
+            <WorkspaceSwitcher />
             <UserBadge />
           </div>
         </header>
@@ -1455,6 +1460,83 @@ function ViewerBanner() {
         — viewer role. You can read everything and send messages, but configuration changes
         (radios, channels, BBS, network, retention, users) require admin.
       </span>
+    </div>
+  );
+}
+
+/**
+ * v2.0 Beta 5 Workspaces — top-bar workspace switcher.
+ *
+ * Dropdown showing every workspace the current user is a member of,
+ * with a checkmark on the active one. Click to switch. Hidden entirely
+ * when the user is only in one workspace (no choice → no clutter).
+ *
+ * The switch action is in useWorkspaces() — it persists to user_prefs
+ * synchronously THEN forces a meshDataService refresh so the dashboard
+ * flips workspace context in one tick with no race conditions.
+ */
+function WorkspaceSwitcher() {
+  const { workspaces, currentWorkspaceId, switchWorkspace, loading } = useWorkspaces();
+  const [open, setOpen] = React.useState(false);
+
+  // Self-hide when there's nothing to switch between.
+  if (workspaces.length <= 1) return null;
+
+  const current = workspaces.find(w => w.id === currentWorkspaceId);
+
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setOpen(o => !o)}
+        title="Switch workspace"
+        className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-brand-line/30 border border-brand-line text-xs hover:bg-brand-line/50 transition-colors"
+      >
+        <LayersIcon size={12} className="text-brand-muted" />
+        <span className="mono-text text-brand-ink max-w-[12ch] truncate">
+          {current?.name ?? 'Workspace'}
+        </span>
+        <ChevronDown size={11} className="text-brand-muted" />
+      </button>
+      {open && (
+        <>
+          {/* Click-outside catcher — invisible overlay at the same z layer
+              as the menu so a stray click closes it. */}
+          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+          <div className="absolute right-0 top-full mt-1 z-50 min-w-[200px] rounded-lg border border-brand-line bg-brand-bg shadow-xl overflow-hidden">
+            <div className="px-3 py-1.5 border-b border-brand-line/60 text-[9px] uppercase font-bold tracking-widest text-brand-muted">
+              Workspaces
+            </div>
+            {workspaces.map(ws => {
+              const active = ws.id === currentWorkspaceId;
+              return (
+                <button
+                  key={ws.id}
+                  onClick={() => { setOpen(false); if (!active) switchWorkspace(ws.id); }}
+                  disabled={loading}
+                  className={cn(
+                    'w-full px-3 py-2 text-left flex items-center justify-between gap-2 text-[11px] transition-colors',
+                    active
+                      ? 'bg-brand-accent/10 text-brand-accent'
+                      : 'text-brand-ink hover:bg-brand-line/40',
+                  )}
+                >
+                  <div className="flex flex-col min-w-0">
+                    <span className="mono-text truncate">{ws.name}</span>
+                    <span className="text-[9px] text-brand-muted">
+                      {ws.radioCount} radio{ws.radioCount === 1 ? '' : 's'} · {ws.memberCount} member{ws.memberCount === 1 ? '' : 's'}
+                    </span>
+                  </div>
+                  {active && (
+                    <span className="text-[9px] uppercase tracking-widest font-bold text-brand-accent shrink-0">
+                      Active
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </>
+      )}
     </div>
   );
 }

@@ -376,6 +376,92 @@ app.delete('/api/auth/prefs/:key', requireAuth, (req, res) => {
   return res.json({ ok: true });
 });
 
+// =============================================
+// v2.0 Beta 5 Workspaces — Phase 1B endpoints + filtering helpers
+// =============================================
+//
+// The user's "current workspace" determines which radios + messages
+// they see in the dashboard. Three places to resolve it from, in
+// priority order:
+//
+//   1. ?workspace_id=<n>   explicit query param — used by the
+//                          workspace switcher to force a specific
+//                          context without waiting for user_prefs
+//                          to flush. Validated against membership.
+//   2. user_prefs          'mesh.currentWorkspaceId' — persisted
+//                          choice. Falls back when no query param.
+//   3. First membership    deterministic default for someone who
+//                          never picked a workspace.
+//
+// Admins MUST be members of a workspace to see it in the dashboard.
+// They get bypass rights for management endpoints (Settings →
+// Workspaces) but not for the data view. This keeps the family case
+// clean — "kid's workspace" doesn't accidentally surface in parent's
+// dashboard unless parent is a member.
+
+/** Resolve the user's current workspace id. Returns null when the user
+ *  isn't a member of any workspace (post-deletion edge case). */
+function currentWorkspaceIdForUser(req: express.Request): number | null {
+  const userId = req.user!.id;
+  // 1. Query param override
+  const queryRaw = req.query?.workspace_id;
+  if (typeof queryRaw === 'string' && queryRaw) {
+    const n = parseInt(queryRaw, 10);
+    if (Number.isInteger(n) && meshDb().isWorkspaceMember(n, userId)) return n;
+  }
+  // 2. user_prefs choice (validate still member)
+  const stored = meshDb().getUserPref(userId, 'mesh.currentWorkspaceId');
+  if (typeof stored === 'number' && meshDb().isWorkspaceMember(stored, userId)) {
+    return stored;
+  }
+  // 3. First membership
+  const ids = meshDb().workspaceIdsForUser(userId);
+  return ids[0] ?? null;
+}
+
+/** Radios the user can currently see — the set of radio_ids in their
+ *  current workspace. Empty Set when no workspace context. */
+function visibleRadioIdsForUser(req: express.Request): Set<string> {
+  const wsId = currentWorkspaceIdForUser(req);
+  if (wsId == null) return new Set();
+  return new Set(
+    meshDb().listRadios()
+      .filter(r => r.workspace_id === wsId)
+      .map(r => r.radio_id)
+  );
+}
+
+/** GET /api/workspaces — list workspaces the current user is a member
+ *  of, plus their currentWorkspaceId so the frontend can render the
+ *  switcher in the right state from first paint. */
+app.get('/api/workspaces', requireAuth, (req, res) => {
+  const userId = req.user!.id;
+  const workspaces = meshDb().listWorkspaces({ forUserId: userId });
+  return res.json({
+    workspaces,
+    currentWorkspaceId: currentWorkspaceIdForUser(req),
+  });
+});
+
+/** GET /api/workspaces/:id — single workspace + members + assigned
+ *  radios. Only accessible to members + admins. Used by Phase 1C's
+ *  management UI. */
+app.get('/api/workspaces/:id', requireAuth, (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'id must be an integer' });
+  const ws = meshDb().getWorkspace(id);
+  if (!ws) return res.status(404).json({ error: 'workspace not found' });
+  // Admin can read any workspace; non-admin members only the ones they
+  // belong to. Phase 1C will gate management writes on admin role.
+  const userId = req.user!.id;
+  if (req.user!.role !== 'admin' && !meshDb().isWorkspaceMember(id, userId)) {
+    return res.status(403).json({ error: 'Not a member of this workspace' });
+  }
+  const members = meshDb().listWorkspaceMembers(id);
+  const radios = meshDb().listRadios().filter(r => r.workspace_id === id);
+  return res.json({ workspace: ws, members, radios });
+});
+
 /** DELETE /api/auth/users/:id — delete a user (admin only). Refuses to
  *  delete the last unlocked admin (would lock the install) and refuses
  *  to delete the currently-authenticated user (operator should log out
@@ -860,12 +946,20 @@ function nextAvailableColor(existing: string[]): string {
 
 const SHORT_NAME_RE = /^[A-Za-z0-9_!-]{1,4}$/;
 
-app.get('/api/mesh/radios', (_req, res) => {
-  const rows = meshDb().listRadios();
+app.get('/api/mesh/radios', (req, res) => {
+  // v2.0 Beta 5 Workspaces: filter to the user's current workspace.
+  // Admins see only their current workspace's radios in the dashboard
+  // too — they can switch workspaces from the top bar, or use the
+  // Settings → Workspaces panel for cross-workspace administration.
+  // Empty visibleSet (user not in any workspace, edge case) returns
+  // an empty list, which the UI handles gracefully.
+  const visible = visibleRadioIdsForUser(req);
+  const rows = meshDb().listRadios().filter(r => visible.has(r.radio_id));
   return res.json({
     radios: rows,
     defaultRadioId: bridgeManager.getDefaultRadioId(),
     palette: RADIO_COLOR_PALETTE,
+    currentWorkspaceId: currentWorkspaceIdForUser(req),
   });
 });
 
@@ -2218,11 +2312,30 @@ app.get('/api/mesh/events', (_req, res) => {
 });
 
 // Full snapshot (nodes + messages + events in one call)
-app.get('/api/mesh/snapshot', (_req, res) => {
+app.get('/api/mesh/snapshot', (req, res) => {
   let blocked: string[] = [];
   try { blocked = meshDb().loadBlockedNodes(); } catch { /* fall back to empty */ }
   const ctxs = bridgeManager.list();
   const useAgg = ctxs.length > 0;
+
+  // v2.0 Beta 5 Workspaces: filter the snapshot to radios in the
+  // user's current workspace. Messages/events tagged with a radio_id
+  // outside the workspace are excluded; nodes whose heardByRadios set
+  // doesn't intersect the workspace are excluded. Legacy 1.x rows
+  // with no radio_id stay visible — they predate workspaces and
+  // belong to "everyone" semantically.
+  const visible = visibleRadioIdsForUser(req);
+  const inWorkspace = (radioId: string | null | undefined) =>
+    !radioId || visible.has(radioId);
+  const nodeInWorkspace = (n: any) => {
+    if (!n.heardByRadios || n.heardByRadios.length === 0) return true; // legacy
+    return n.heardByRadios.some((r: string) => visible.has(r));
+  };
+  // Cast through any — MeshEvent's static type doesn't model radioId
+  // even though bridgeManager.getAllEvents() stamps it at fan-out time.
+  // Same story for legacy 1.x message rows without radio_id.
+  const filterByRadioId = <T>(arr: T[]) =>
+    arr.filter((row: any) => inWorkspace(row?.radioId));
   // v2.0 Beta 3 bugfix: pull channels from the *default radio's* bridge in
   // BridgeManager rather than the raw singleton. They diverge after the
   // operator points `/api/mesh/connect/tcp` at a different radio: meshBridge
@@ -2243,10 +2356,13 @@ app.get('/api/mesh/snapshot', (_req, res) => {
   // even with two radios visibly connected. waypoints / traces /
   // neighborInfo / store-forward / module-config / groups all sourced
   // from the same authoritative bridge.
+  const rawNodes    = useAgg ? bridgeManager.getAllNodes()    : defaultBridge.getNodes();
+  const rawMessages = useAgg ? bridgeManager.getAllMessages() : defaultBridge.getMessages();
+  const rawEvents   = useAgg ? bridgeManager.getAllEvents()   : defaultBridge.getEvents();
   return res.json({
-    nodes:    useAgg ? bridgeManager.getAllNodes()    : defaultBridge.getNodes(),
-    messages: useAgg ? bridgeManager.getAllMessages() : defaultBridge.getMessages(),
-    events:   useAgg ? bridgeManager.getAllEvents()   : defaultBridge.getEvents(),
+    nodes:    rawNodes.filter(nodeInWorkspace),
+    messages: filterByRadioId(rawMessages),
+    events:   filterByRadioId(rawEvents),
     channels: defaultBridge.getChannels(),
     waypoints: defaultBridge.getWaypoints(),
     traces: defaultBridge.getTraces(),
@@ -2255,6 +2371,7 @@ app.get('/api/mesh/snapshot', (_req, res) => {
     localModuleConfig: defaultBridge.getLocalModuleConfig(),
     groups: defaultBridge.getGroups(),
     blocked,
+    currentWorkspaceId: currentWorkspaceIdForUser(req),
     radioConnected: defaultBridge.connected,
     localNodeId: defaultBridge.getLocalNodeId(),
   });
