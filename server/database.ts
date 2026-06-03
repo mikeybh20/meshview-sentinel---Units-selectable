@@ -1459,6 +1459,10 @@ export class MeshDatabase {
     'radios', 'channels',
     'groups', 'waypoints', 'blocked_nodes',
     'bbs_mail', 'bbs_weather_subscribers',
+    // v2.0 Beta 5: multi-user accounts. Carries username + hash + role
+    // across migrations. Sessions deliberately NOT in this list — they're
+    // per-host transient state.
+    'users',
     // history (opt-in)
     'nodes', 'messages', 'events', 'telemetry',
     'neighbor_info', 'store_forward_routers',

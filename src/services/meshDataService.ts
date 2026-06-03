@@ -509,6 +509,71 @@ export class MeshDataService {
   }
 
   // -------------------------------------------------------------------
+  // v2.0 Beta 5 Phase 3: user management (admin-only)
+  // -------------------------------------------------------------------
+
+  async listUsers(): Promise<{ users: Array<{
+    id: number;
+    username: string;
+    role: 'admin' | 'viewer';
+    createdAt: number;
+    lastLoginAt: number | null;
+    locked: number;
+  }> } | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/auth/users`, { credentials: 'include' });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  }
+
+  async createUser(input: { username: string; password: string; role: 'admin' | 'viewer' }): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/auth/users`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify(input),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'Network error' };
+    }
+  }
+
+  async updateUser(id: number, patch: Partial<{ role: 'admin' | 'viewer'; locked: boolean; password: string }>): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/auth/users/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify(patch),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'Network error' };
+    }
+  }
+
+  async deleteUser(id: number): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/auth/users/${id}`, {
+        method: 'DELETE',
+        credentials: 'include',
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'Network error' };
+    }
+  }
+
+  // -------------------------------------------------------------------
   // v2.0 multi-radio
   // -------------------------------------------------------------------
 

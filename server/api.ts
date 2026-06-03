@@ -169,6 +169,153 @@ app.post('/api/auth/logout', (req, res) => {
   return res.json({ ok: true });
 });
 
+// =============================================
+// v2.0 Beta 5 Phase 3: user management endpoints (admin-only)
+// =============================================
+//
+// These live under /api/auth/users so they share the same path prefix as
+// the unauthenticated /api/auth/{login,bootstrap,me,logout} endpoints,
+// but they're explicitly admin-gated via requireAdmin. The blanket
+// /api/* gate at the bottom of this file treats /auth/* as a public
+// path; that's correct for login + bootstrap, but the users/* subtree
+// would also be exempted without these explicit gates. requireAdmin
+// runs first and enforces both auth + role.
+//
+// /me is special: it returns the current user's own profile and is
+// usable by any authenticated user (admin can view their own profile,
+// viewer can view their own profile). It maps to the requireAuth
+// middleware, not requireAdmin.
+
+/** GET /api/auth/users — list all users (admin only). */
+app.get('/api/auth/users', requireAdmin, (_req, res) => {
+  return res.json({ users: meshDb().listUsers() });
+});
+
+/** POST /api/auth/users — create a new user (admin only).
+ *  Body: { username, password, role }. Returns the created user
+ *  (without password hash). Username collisions return 409. */
+app.post('/api/auth/users', requireAdmin, (req, res) => {
+  const usernameResult = validateUsername(req.body?.username);
+  if (typeof usernameResult !== 'string') return res.status(400).json(usernameResult);
+  const passwordResult = validatePassword(req.body?.password);
+  if (typeof passwordResult !== 'string') return res.status(400).json(passwordResult);
+  if (!isValidRole(req.body?.role)) return res.status(400).json({ error: "role must be 'admin' or 'viewer'" });
+
+  if (meshDb().getUserByUsername(usernameResult)) {
+    return res.status(409).json({ error: 'Username already taken' });
+  }
+
+  try {
+    const id = meshDb().createUser({
+      username: usernameResult,
+      passwordHash: hashPassword(passwordResult),
+      role: req.body.role,
+    });
+    const created = meshDb().getUserById(id);
+    return res.status(201).json({
+      user: created ? {
+        id: created.id,
+        username: created.username,
+        role: created.role,
+        createdAt: created.createdAt,
+        lastLoginAt: created.lastLoginAt,
+        locked: created.locked,
+      } : null,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message ?? 'create failed' });
+  }
+});
+
+/** Helper for the patch endpoints — refuses operations that would leave
+ *  the install with zero active admins. countAdmins excludes locked
+ *  accounts, so demoting/locking the last unlocked admin is rejected. */
+function wouldOrphanInstall(targetUserId: number, change: 'demote' | 'lock' | 'delete'): boolean {
+  const target = meshDb().getUserById(targetUserId);
+  if (!target) return false;
+  // Only matters if the target is currently a usable admin. Lifting an
+  // already-locked or already-viewer account doesn't affect headcount.
+  const wasUsableAdmin = target.role === 'admin' && !target.locked;
+  if (!wasUsableAdmin) return false;
+  if (change === 'demote' || change === 'lock' || change === 'delete') {
+    return meshDb().countAdmins() <= 1;
+  }
+  return false;
+}
+
+/** PATCH /api/auth/users/:id — update role / locked / reset password
+ *  (admin only). Each field is optional; missing fields stay as-is.
+ *  Body: { role?, locked?, password? } */
+app.patch('/api/auth/users/:id', requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'id must be an integer' });
+  const target = meshDb().getUserById(id);
+  if (!target) return res.status(404).json({ error: 'User not found' });
+
+  const updates = req.body ?? {};
+  // Role change
+  if (updates.role !== undefined) {
+    if (!isValidRole(updates.role)) return res.status(400).json({ error: "role must be 'admin' or 'viewer'" });
+    if (updates.role === 'viewer' && wouldOrphanInstall(id, 'demote')) {
+      return res.status(409).json({ error: 'Cannot demote the last admin — promote another user first' });
+    }
+    meshDb().updateUserRole(id, updates.role);
+  }
+  // Locked toggle
+  if (updates.locked !== undefined) {
+    const locked = !!updates.locked;
+    if (locked && wouldOrphanInstall(id, 'lock')) {
+      return res.status(409).json({ error: 'Cannot lock the last admin — promote another user first' });
+    }
+    meshDb().updateUserLocked(id, locked);
+    // Force-expire all sessions for a locked user so existing browser
+    // tabs get bounced to the login screen on next request.
+    if (locked) meshDb().deleteSessionsForUser(id);
+  }
+  // Password reset
+  if (updates.password !== undefined) {
+    const passwordResult = validatePassword(updates.password);
+    if (typeof passwordResult !== 'string') return res.status(400).json(passwordResult);
+    meshDb().updateUserPassword(id, hashPassword(passwordResult));
+    // Drop existing sessions for the user since their old password is
+    // effectively revoked. Admin's own session is dropped too if they
+    // reset their own password — they'll have to log in again with
+    // the new password.
+    meshDb().deleteSessionsForUser(id);
+  }
+  const updated = meshDb().getUserById(id);
+  return res.json({
+    user: updated ? {
+      id: updated.id,
+      username: updated.username,
+      role: updated.role,
+      createdAt: updated.createdAt,
+      lastLoginAt: updated.lastLoginAt,
+      locked: updated.locked,
+    } : null,
+  });
+});
+
+/** DELETE /api/auth/users/:id — delete a user (admin only). Refuses to
+ *  delete the last unlocked admin (would lock the install) and refuses
+ *  to delete the currently-authenticated user (operator should log out
+ *  first, prevents an "are you sure?" footgun). */
+app.delete('/api/auth/users/:id', requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'id must be an integer' });
+  const target = meshDb().getUserById(id);
+  if (!target) return res.status(404).json({ error: 'User not found' });
+  if (req.user && req.user.id === id) {
+    return res.status(409).json({ error: "Can't delete your own account — log in as another admin first" });
+  }
+  if (wouldOrphanInstall(id, 'delete')) {
+    return res.status(409).json({ error: 'Cannot delete the last admin — promote another user first' });
+  }
+  meshDb().deleteUser(id);
+  // Sessions cascade-delete via the FK; explicit prune isn't needed.
+  return res.json({ ok: true });
+});
+
 // ---- Blanket gate for everything else under /api/* ----
 //
 // Mounted AFTER /api/auth/* so login + bootstrap stay reachable. Static
@@ -1269,6 +1416,12 @@ app.get('/api/gpu/health', async (_req, res) => {
 const BACKUP_TABLES_CORE = [
   'groups', 'waypoints', 'blocked_nodes',
   'bbs_mail', 'bbs_weather_subscribers',
+  // v2.0 Beta 5: multi-user accounts. Round-trip the users table so a
+  // migration to a new host carries over the operator's logins (incl.
+  // their scrypt password hashes — the auth-secret file in data/ also
+  // needs to come over for those hashes to validate). Sessions are
+  // intentionally NOT backed up — they're short-lived per-host state.
+  'users',
 ] as const;
 const BACKUP_TABLES_HISTORY = [
   'nodes', 'messages', 'events', 'telemetry',
@@ -1350,6 +1503,7 @@ app.post('/api/mesh/restore', (req, res) => {
     radios: 0, channels: 0, bbsConfig: false,
     groups: 0, waypoints: 0, blockedNodes: 0,
     bbsMail: 0, bbsWeatherSubscribers: 0,
+    users: 0,
     tcpEndpoint: false,
     history: 0,
   };
@@ -1388,6 +1542,11 @@ app.post('/api/mesh/restore', (req, res) => {
         blocked_nodes: 'blockedNodes',
         bbs_mail: 'bbsMail',
         bbs_weather_subscribers: 'bbsWeatherSubscribers',
+        // v2.0 Beta 5: users round-trip. Careful — restoring users from
+        // a different install requires its auth-secret file to come over
+        // too, otherwise existing session cookies validate but resolve
+        // to no row + scrypt password hashes still validate fine.
+        users: 'users',
       };
       for (const t of BACKUP_TABLES_CORE) {
         const rows = payload.core[t];
