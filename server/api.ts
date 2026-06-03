@@ -296,6 +296,62 @@ app.patch('/api/auth/users/:id', requireAdmin, (req, res) => {
   });
 });
 
+// =============================================
+// v2.0 Beta 5 Phase 4: per-user preferences (any authenticated user, own data only)
+// =============================================
+//
+// Generic key/value store mounted under /api/auth/prefs/*. Lives in the
+// same /api/auth/ subtree so the existing auth gate covers it; an
+// authenticated user can only ever read/write THEIR OWN prefs because
+// the user_id is sourced from req.user, never the URL.
+//
+// Use cases: read status (per-chat lastRead timestamps), preferred
+// radio, selected group, dashboard widget layout, ViaFilter selection,
+// perRadioScope toggle, drafts. Whatever you'd previously have stored
+// in localStorage that should follow the operator across devices.
+//
+// Values are JSON-encoded server-side so any shape works (objects,
+// arrays, primitives). Keys are arbitrary strings — server doesn't
+// validate them beyond length, so the client is free to use
+// dot-namespacing like "mesh.readStatus".
+
+/** GET /api/auth/prefs — return ALL of the current user's prefs as a
+ *  single { key: value } object. Used to seed the client cache on login. */
+app.get('/api/auth/prefs', requireAuth, (req, res) => {
+  return res.json({ prefs: meshDb().listUserPrefs(req.user!.id) });
+});
+
+/** GET /api/auth/prefs/:key — return one pref. 404 when missing so the
+ *  client can distinguish "never set" from "explicit null". */
+app.get('/api/auth/prefs/:key', requireAuth, (req, res) => {
+  const v = meshDb().getUserPref(req.user!.id, req.params.key);
+  if (v === undefined) return res.status(404).json({ error: 'not set' });
+  return res.json({ key: req.params.key, value: v });
+});
+
+/** PUT /api/auth/prefs/:key — upsert one pref. Body { value: <any> }. */
+app.put('/api/auth/prefs/:key', requireAuth, (req, res) => {
+  const key = req.params.key;
+  if (!key || key.length > 256) {
+    return res.status(400).json({ error: 'key must be a non-empty string up to 256 chars' });
+  }
+  if (!('value' in (req.body ?? {}))) {
+    return res.status(400).json({ error: 'body must be { value: <any> }' });
+  }
+  try {
+    meshDb().setUserPref(req.user!.id, key, req.body.value);
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(400).json({ error: err.message ?? 'pref write failed' });
+  }
+});
+
+/** DELETE /api/auth/prefs/:key — clear one pref. Idempotent (200 either way). */
+app.delete('/api/auth/prefs/:key', requireAuth, (req, res) => {
+  meshDb().deleteUserPref(req.user!.id, req.params.key);
+  return res.json({ ok: true });
+});
+
 /** DELETE /api/auth/users/:id — delete a user (admin only). Refuses to
  *  delete the last unlocked admin (would lock the install) and refuses
  *  to delete the currently-authenticated user (operator should log out

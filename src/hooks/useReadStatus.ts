@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Channel, Message } from '../types';
+import { useUserPref } from './useUserPref';
 
 const STORAGE_KEY = 'mesh.readStatus';
 
@@ -39,10 +40,10 @@ function chatIdForMessage(m: Message, channels: Channel[], localNodeId: string |
  * the user reads, instead of disappearing the moment markActive fires.
  */
 export function useReadStatus({ messages, channels, localNodeId, activeChatId, markActiveAsRead }: Args) {
-  const [readMap, setReadMap] = useState<Record<string, number>>(() => {
-    try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); }
-    catch { return {}; }
-  });
+  // v2.0 Beta 5 Phase 4: read status follows the user across devices.
+  // useUserPref handles the server round-trip, debouncing, and localStorage
+  // mirror — fall back to {} when not authenticated yet.
+  const [readMap, setReadMap] = useUserPref<Record<string, number>>(STORAGE_KEY, {});
   const [firstUnreadAt, setFirstUnreadAt] = useState<Record<string, number>>({});
 
   // Keep a live ref of readMap so the chat-switch effect below can read it
@@ -63,12 +64,10 @@ export function useReadStatus({ messages, channels, localNodeId, activeChatId, m
   // messages view and new messages arrive — handled by the caller via markActiveAsRead).
   useEffect(() => {
     if (!activeChatId || !markActiveAsRead) return;
-    setReadMap(prev => {
-      const next = { ...prev, [activeChatId]: Date.now() };
-      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(next)); } catch { /* private mode? */ }
-      return next;
-    });
-  }, [activeChatId, markActiveAsRead, messages.length]);
+    // v2.0 Beta 5 Phase 4: persistence is handled by useUserPref under the
+    // hood — push the local update + the server PUT debounce-batches.
+    setReadMap(prev => ({ ...prev, [activeChatId]: Date.now() }));
+  }, [activeChatId, markActiveAsRead, messages.length, setReadMap]);
 
   const unreadCounts = useMemo<Record<string, number>>(() => {
     const counts: Record<string, number> = {};

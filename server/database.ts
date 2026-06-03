@@ -351,6 +351,26 @@ export class MeshDatabase {
       );
       CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
       CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+
+      -- v2.0 Beta 5 Phase 4: per-user preferences.
+      --
+      -- Generic key/value store, one row per (user, key). value is a
+      -- JSON-serialized blob so the same schema covers numbers, strings,
+      -- objects, arrays, and Map<string, X> shapes (e.g. read status
+      -- timestamps). Keeping it generic means new prefs land without
+      -- schema migrations.
+      --
+      -- Cascade-delete with the user — deleting an account drops all
+      -- their saved state in one shot, no orphaned rows.
+      CREATE TABLE IF NOT EXISTS user_prefs (
+        user_id      INTEGER NOT NULL,
+        key          TEXT NOT NULL,
+        value_json   TEXT NOT NULL,
+        updated_at   INTEGER NOT NULL,
+        PRIMARY KEY (user_id, key),
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_user_prefs_user ON user_prefs(user_id);
     `);
 
     // Additive migrations for older DBs. SQLite throws if the column already
@@ -2294,6 +2314,53 @@ export class MeshDatabase {
   pruneExpiredSessions(now: number = Date.now()): number {
     const r = this.db.prepare(`DELETE FROM sessions WHERE expires_at < ?`).run(now);
     return Number(r.changes ?? 0);
+  }
+
+  // -- user prefs --
+
+  /** Whole-row dump for one user. Values come back as parsed JSON
+   *  (whatever was stored). Used on login + every focus to seed the
+   *  client cache. */
+  listUserPrefs(userId: number): Record<string, any> {
+    const rows = this.db.prepare(
+      `SELECT key, value_json FROM user_prefs WHERE user_id = ?`
+    ).all(userId) as Array<{ key: string; value_json: string }>;
+    const out: Record<string, any> = {};
+    for (const r of rows) {
+      try { out[r.key] = JSON.parse(r.value_json); }
+      catch { /* corrupted entry — skip it rather than crashing the whole load */ }
+    }
+    return out;
+  }
+
+  /** Read one pref. Returns undefined for missing or unparseable. */
+  getUserPref(userId: number, key: string): any | undefined {
+    const row = this.db.prepare(
+      `SELECT value_json FROM user_prefs WHERE user_id = ? AND key = ?`
+    ).get(userId, key) as { value_json: string } | undefined;
+    if (!row) return undefined;
+    try { return JSON.parse(row.value_json); } catch { return undefined; }
+  }
+
+  /** Upsert one pref. value is serialized via JSON.stringify (caller's
+   *  responsibility to pass something serializable; rejecting cycles
+   *  surfaces as the upsert throwing). */
+  setUserPref(userId: number, key: string, value: any): void {
+    const json = JSON.stringify(value);
+    this.db.prepare(`
+      INSERT INTO user_prefs (user_id, key, value_json, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(user_id, key) DO UPDATE SET
+        value_json = excluded.value_json,
+        updated_at = excluded.updated_at
+    `).run(userId, key, json, Date.now());
+  }
+
+  deleteUserPref(userId: number, key: string): boolean {
+    const r = this.db.prepare(
+      `DELETE FROM user_prefs WHERE user_id = ? AND key = ?`
+    ).run(userId, key);
+    return r.changes > 0;
   }
 
   /**
