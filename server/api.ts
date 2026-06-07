@@ -230,11 +230,17 @@ app.post('/api/auth/users', requireAdmin, (req, res) => {
       passwordHash: hashPassword(passwordResult),
       role: req.body.role,
     });
-    // v2.0 Beta 5 Workspaces: auto-join the newly created user to the
-    // Household workspace so they have somewhere to land on first login.
-    // Admins later move them between workspaces via the management UI.
-    const firstWs = meshDb().listWorkspaces()[0];
-    if (firstWs) meshDb().addWorkspaceMember(firstWs.id, id);
+    // v2.0 Beta 5 Workspaces (fix): no auto-join. The previous version
+    // auto-joined every new user to Household, but Household is the
+    // services area (BBS + weather) in the family pattern, so a new
+    // user like "mike" would log in and see the BBS radio instead of
+    // their own. The admin now assigns the user to one or more
+    // workspaces via Settings → Workspaces before they log in. Until
+    // assigned, the user lands on an empty dashboard with a hint
+    // banner (see AuthGate / dashboard empty state).
+    //
+    // Bootstrap-admin auto-join still fires from /api/auth/bootstrap
+    // because there has to be one seed member who owns Household.
     const created = meshDb().getUserById(id);
     return res.status(201).json({
       user: created ? {
@@ -400,7 +406,21 @@ app.delete('/api/auth/prefs/:key', requireAuth, (req, res) => {
 // dashboard unless parent is a member.
 
 /** Resolve the user's current workspace id. Returns null when the user
- *  isn't a member of any workspace (post-deletion edge case). */
+ *  isn't a member of any workspace (post-deletion edge case).
+ *
+ *  Resolution order:
+ *    1. Query param `workspace_id=…` (validated as membership)
+ *    2. `user_prefs.mesh.currentWorkspaceId` (the last workspace this
+ *       user explicitly switched to via the top-bar switcher)
+ *    3. **First workspace the user OWNS.** Added in Beta 5 because the
+ *       prior "first membership" fallback meant mike — auto-joined to
+ *       Household when his account was created, then made owner of
+ *       "Mike's Radio Space" — defaulted to Household and saw 3bec on
+ *       login instead of his own WRTJ. Ownership is the strongest
+ *       signal of "this is *my* workspace."
+ *    4. First membership (any role) — for users with no owned
+ *       workspaces yet (e.g. fresh viewer accounts).
+ */
 function currentWorkspaceIdForUser(req: express.Request): number | null {
   const userId = req.user!.id;
   // 1. Query param override
@@ -414,9 +434,17 @@ function currentWorkspaceIdForUser(req: express.Request): number | null {
   if (typeof stored === 'number' && meshDb().isWorkspaceMember(stored, userId)) {
     return stored;
   }
-  // 3. First membership
-  const ids = meshDb().workspaceIdsForUser(userId);
-  return ids[0] ?? null;
+  // 3. First owned workspace — "my space" beats "shared services" as
+  //    a sensible landing. Only considers workspaces the user is also a
+  //    member of (an admin who reassigned ownership but stayed a
+  //    member of Household shouldn't get teleported elsewhere).
+  const memberIds = new Set(meshDb().workspaceIdsForUser(userId));
+  const ownedIds = meshDb().listWorkspaces({ forUserId: userId })
+    .filter(w => w.ownerUserId === userId && memberIds.has(w.id))
+    .map(w => w.id);
+  if (ownedIds.length > 0) return ownedIds[0];
+  // 4. First membership
+  return memberIds.size > 0 ? Array.from(memberIds)[0] : null;
 }
 
 /** Radios the user can currently see — the set of radio_ids in their
@@ -429,6 +457,77 @@ function visibleRadioIdsForUser(req: express.Request): Set<string> {
       .filter(r => r.workspace_id === wsId)
       .map(r => r.radio_id)
   );
+}
+
+/**
+ * v2.0 Beta 5 Workspaces (fix): pick the bridge that "speaks for" the
+ * user's current workspace. Used by /api/mesh/status and
+ * /api/mesh/snapshot to populate radioConnected, localNodeId, channels,
+ * localModuleConfig, etc. — fields that historically came from the
+ * install-default bridge.
+ *
+ * Before this helper, a user logged in to "Mike's Radio Space" (only
+ * WRTJ) was still seeing 3bec's connection state, 3bec's channels, and
+ * the MQTT module status of 3bec — because the snapshot read from
+ * bridgeManager.getDefault() unconditionally.
+ *
+ * Preference order:
+ *   1. The install-default radio IF it sits in the user's workspace.
+ *      (Common case: admin viewing Household, where the default lives.)
+ *   2. The first CONNECTED radio in the workspace. Beats #3 because a
+ *      connected bridge has live localNodeId/channels.
+ *   3. The first radio in the workspace by row order. Lets a workspace
+ *      with one offline radio still surface its cached identity rather
+ *      than silently falling to null.
+ *   4. null — workspace has zero radios (new "Mike's" before any
+ *      assignment). Callers must handle null by zeroing out their
+ *      radio-bound fields.
+ *
+ * The set of visible radios is computed once via visibleRadioIdsForUser
+ * to keep parity with the snapshot/radios filter — same workspace, same
+ * set, no drift.
+ */
+function workspacePrimaryBridge(req: express.Request): { bridge: MeshtasticSerialBridge; radioId: string } | null {
+  const visible = visibleRadioIdsForUser(req);
+  if (visible.size === 0) return null;
+
+  // 1. Install default if it's in the workspace
+  const defaultRadioId = bridgeManager.getDefaultRadioId();
+  if (defaultRadioId && visible.has(defaultRadioId)) {
+    const ctx = bridgeManager.get(defaultRadioId);
+    if (ctx) return { bridge: ctx.bridge, radioId: defaultRadioId };
+  }
+
+  // 2. First connected
+  for (const radioId of visible) {
+    const ctx = bridgeManager.get(radioId);
+    if (ctx?.bridge.connected) return { bridge: ctx.bridge, radioId };
+  }
+
+  // 3. First in workspace (even if disconnected — keeps cached identity)
+  for (const radioId of visible) {
+    const ctx = bridgeManager.get(radioId);
+    if (ctx) return { bridge: ctx.bridge, radioId };
+  }
+
+  return null;
+}
+
+/**
+ * v2.0 Beta 5 Workspaces (fix): does ANY radio in the user's workspace
+ * currently have a connected bridge? Used by the System Status footer
+ * + MQTT pill, which previously read `defaultBridge.connected` and so
+ * showed RADIO OFFLINE to a Mike-in-his-workspace user whenever the
+ * install-default radio (3bec) was offline — even though Mike's actual
+ * radio (WRTJ) was up.
+ */
+function anyWorkspaceRadioConnected(req: express.Request): boolean {
+  const visible = visibleRadioIdsForUser(req);
+  for (const radioId of visible) {
+    const ctx = bridgeManager.get(radioId);
+    if (ctx?.bridge.connected) return true;
+  }
+  return false;
 }
 
 /** GET /api/workspaces — list workspaces the current user is a member
@@ -1041,31 +1140,50 @@ function forEachBridge(fn: (b: MeshtasticSerialBridge) => void): void {
 }
 
 // Status: is the radio connected?
-app.get('/api/mesh/status', (_req, res) => {
+app.get('/api/mesh/status', (req, res) => {
   const device = serialDiscovery.getDevice();
-  // v2.0 Beta 3: same fix as /api/mesh/snapshot — route local-radio fields
-  // through the default-radio bridge in BridgeManager rather than reading
-  // meshBridge directly. The singleton can be silently rebound by
-  // /api/mesh/connect/tcp, leaving its `.connected` / .getLocalNodeId()
-  // stale while contexts[defaultRadioId].bridge holds the real state.
-  // The "RADIO OFFLINE" indicator in the left rail polls this endpoint.
-  const defaultBridge = bridgeManager.getDefault()?.bridge ?? meshBridge;
+  // v2.0 Beta 5 Workspaces (fix): status fields now resolve through the
+  // *workspace's* primary bridge instead of the install default. Without
+  // this, a user logged in to "Mike's Radio Space" (only WRTJ) saw
+  // 3bec's connection state in the System Status footer + the MQTT
+  // pill — a confusing "your dashboard's view + your radio are
+  // unrelated" experience.
+  //
+  // radioConnected is the OR across all workspace radios so the footer
+  // reads ONLINE if anything in your scope is up. The other fields
+  // (localNodeId, transport, firmware…) come from a single chosen
+  // primary so they stay coherent — see workspacePrimaryBridge() for
+  // the pick order.
+  //
+  // Auth note: this endpoint pre-dates the auth gate and still works
+  // unauthenticated (the dashboard's "are you live?" polling fires
+  // before the auth handshake). When req.user is missing we fall back
+  // to the install-default behavior so the cold-boot indicator still
+  // works.
+  const primary = req.user ? workspacePrimaryBridge(req) : null;
+  const bridge = primary?.bridge ?? bridgeManager.getDefault()?.bridge ?? meshBridge;
+  const workspaceConnected = req.user ? anyWorkspaceRadioConnected(req) : bridge.connected;
+
   return res.json({
     systemVersion: SYSTEM_VERSION,
-    radioConnected: defaultBridge.connected,
-    transport: defaultBridge.getTransport(),
+    radioConnected: workspaceConnected,
+    transport: bridge.getTransport(),
     serialDevice: device ? {
       port: device.port,
       vendor: device.vendor,
       product: device.product,
       isLoRa: device.isLoRa,
     } : null,
-    nodeCount: defaultBridge.getNodes().length,
-    messageCount: defaultBridge.getMessages().length,
-    localNodeId: defaultBridge.getLocalNodeId(),
-    firmwareVersion: defaultBridge.getLocalFirmwareVersion(),
-    rebootCount: defaultBridge.getLocalRebootCount(),
+    nodeCount: bridge.getNodes().length,
+    messageCount: bridge.getMessages().length,
+    localNodeId: bridge.getLocalNodeId(),
+    firmwareVersion: bridge.getLocalFirmwareVersion(),
+    rebootCount: bridge.getLocalRebootCount(),
     defaultRadioId: bridgeManager.getDefaultRadioId(),
+    // v2.0 Beta 5: the radio_id the status fields above describe. With
+    // workspace scoping this is no longer always the install default;
+    // the client can show "Status: WRTJ" to make the binding obvious.
+    primaryRadioId: primary?.radioId ?? null,
   });
 });
 
@@ -2493,44 +2611,52 @@ app.get('/api/mesh/snapshot', (req, res) => {
   // Same story for legacy 1.x message rows without radio_id.
   const filterByRadioId = <T>(arr: T[]) =>
     arr.filter((row: any) => inWorkspace(row?.radioId));
-  // v2.0 Beta 3 bugfix: pull channels from the *default radio's* bridge in
-  // BridgeManager rather than the raw singleton. They diverge after the
-  // operator points `/api/mesh/connect/tcp` at a different radio: meshBridge
-  // gets rebound to that new target's transport but BridgeManager's contexts
-  // (which the per-radio /api/mesh/channels?radio_id=X endpoint reads from)
-  // keep pointing at their original bridge instances. Result was that the
-  // snapshot's channel list could be a different radio's slots than what the
-  // /api/mesh/channels?radio_id=<default> endpoint returned — so the
-  // sidebar's "default radio" view showed someone else's channels.
-  const defaultBridge = bridgeManager.getDefault()?.bridge ?? meshBridge;
-  // v2.0 Beta 3 bugfix: ALL "the local radio's …" fields route through the
-  // default-radio bridge from BridgeManager, NOT meshBridge directly. Same
-  // root cause as the channels fix above — meshBridge can be silently
-  // rebound by /api/mesh/connect/tcp and end up holding stale or
-  // wrong-radio state. radioConnected + localNodeId driving MailView /
-  // RadioStatus gating on the wrong bridge made the BBS Mail page show
-  // "MAIL UNAVAILABLE — Waiting for the local radio to identify itself"
-  // even with two radios visibly connected. waypoints / traces /
-  // neighborInfo / store-forward / module-config / groups all sourced
-  // from the same authoritative bridge.
-  const rawNodes    = useAgg ? bridgeManager.getAllNodes()    : defaultBridge.getNodes();
-  const rawMessages = useAgg ? bridgeManager.getAllMessages() : defaultBridge.getMessages();
-  const rawEvents   = useAgg ? bridgeManager.getAllEvents()   : defaultBridge.getEvents();
+  // v2.0 Beta 5 Workspaces (fix): "local radio's …" fields now resolve
+  // through the user's WORKSPACE primary bridge instead of the install
+  // default. Before this, a user in Mike's Radio Space (only WRTJ) saw
+  // 3bec's channels, 3bec's localNodeId, 3bec's MQTT module config —
+  // because every "local" field read from bridgeManager.getDefault()
+  // unconditionally.
+  //
+  // workspacePrimary may be null when the workspace has no assigned
+  // radios (admin created "Mike's" but hasn't moved WRTJ over yet) —
+  // in that case we fall back to the install default so the dashboard
+  // doesn't go blank, and the NoWorkspaceBanner / "no radios in this
+  // workspace" empty state takes care of telling the user what to do.
+  //
+  // radioConnected here is the OR across the user's workspace radios
+  // (matching /api/mesh/status) so the LIVE RADIO / RADIO OFFLINE
+  // indicators show ONLINE whenever any of their scope's radios are
+  // up — not just the install default.
+  const workspacePrimary = req.user ? workspacePrimaryBridge(req) : null;
+  const localBridge = workspacePrimary?.bridge
+    ?? bridgeManager.getDefault()?.bridge
+    ?? meshBridge;
+  const workspaceConnected = req.user ? anyWorkspaceRadioConnected(req) : localBridge.connected;
+
+  const rawNodes    = useAgg ? bridgeManager.getAllNodes()    : localBridge.getNodes();
+  const rawMessages = useAgg ? bridgeManager.getAllMessages() : localBridge.getMessages();
+  const rawEvents   = useAgg ? bridgeManager.getAllEvents()   : localBridge.getEvents();
   return res.json({
     nodes:    rawNodes.filter(nodeInWorkspace),
     messages: filterByRadioId(rawMessages),
     events:   filterByRadioId(rawEvents),
-    channels: defaultBridge.getChannels(),
-    waypoints: defaultBridge.getWaypoints(),
-    traces: defaultBridge.getTraces(),
-    neighborInfo: defaultBridge.getNeighborInfo(),
-    storeForwardRouters: defaultBridge.getStoreForwardRouters(),
-    localModuleConfig: defaultBridge.getLocalModuleConfig(),
-    groups: defaultBridge.getGroups(),
+    channels: localBridge.getChannels(),
+    waypoints: localBridge.getWaypoints(),
+    traces: localBridge.getTraces(),
+    neighborInfo: localBridge.getNeighborInfo(),
+    storeForwardRouters: localBridge.getStoreForwardRouters(),
+    localModuleConfig: localBridge.getLocalModuleConfig(),
+    groups: localBridge.getGroups(),
     blocked,
     currentWorkspaceId: currentWorkspaceIdForUser(req),
-    radioConnected: defaultBridge.connected,
-    localNodeId: defaultBridge.getLocalNodeId(),
+    radioConnected: workspaceConnected,
+    localNodeId: localBridge.getLocalNodeId(),
+    // v2.0 Beta 5: the radio_id whose state populated the "local"
+    // fields above. Lets the client label the System Status / LIVE
+    // RADIO indicator with "(WRTJ)" so the workspace binding is
+    // obvious instead of mysterious.
+    primaryRadioId: workspacePrimary?.radioId ?? null,
   });
 });
 
@@ -4058,14 +4184,20 @@ app.post('/api/mesh/bbs/compose', async (req, res) => {
   if (!clean) return res.status(400).json({ error: 'body must be non-empty' });
 
   // v2.0: optional radio_id routes the compose through a specific radio's
-  // bridge. Omit to use the default radio (1.x behavior).
+  // bridge. Omit to use the BBS service node (designated radio) when set,
+  // otherwise the default radio. The 1.x fallback to the raw meshBridge
+  // singleton was causing "Local node not identified — radio still booting"
+  // whenever the singleton flapped (TCP retry loop) while a registered
+  // RadioContext was fully identified — i.e. dashboard-side Compose failed
+  // even though the underlying radio was online.
   const radioId = typeof radioIdRaw === 'string' && radioIdRaw ? radioIdRaw : null;
-  const ctx = radioId ? bridgeManager.get(radioId) : null;
-  const bridge = ctx?.bridge ?? meshBridge;
+  let ctx = radioId ? bridgeManager.get(radioId) : null;
   if (radioId && !ctx) {
     return res.status(404).json({ error: `radio "${radioId}" is not currently connected` });
   }
-  const localNodeId = (bridge as any).localNodeId as string | null;
+  if (!ctx) ctx = bridgeManager.getBbsNode() ?? bridgeManager.getDefault();
+  const bridge = ctx?.bridge ?? meshBridge;
+  const localNodeId = bridge.getLocalNodeId();
   if (!localNodeId) return res.status(503).json({ error: 'Local node not identified — radio still booting' });
   if (!bridge.connected) return res.status(503).json({ error: 'Radio not connected' });
 

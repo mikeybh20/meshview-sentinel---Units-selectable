@@ -1773,20 +1773,48 @@ export class MeshtasticSerialBridge extends EventEmitter {
             console.log(`[MeshtasticSerial] Local node identified as ${id}`);
 
             // Read the local module configs once we know the local node id.
-            setTimeout(() => {
-              this.requestNeighborInfoConfig().catch(() => { /* best-effort */ });
-              this.requestRangeTestConfig().catch(() => { /* best-effort */ });
-              this.requestTelemetryConfig().catch(() => { /* best-effort */ });
-              this.requestStoreForwardConfig().catch(() => { /* best-effort */ });
-              this.requestExternalNotificationConfig().catch(() => { /* best-effort */ });
-              this.requestMqttConfig().catch(() => { /* best-effort */ });
-              this.requestDetectionSensorConfig().catch(() => { /* best-effort */ });
-              this.requestAudioConfig().catch(() => { /* best-effort */ });
-              this.requestSerialConfig().catch(() => { /* best-effort */ });
-              this.requestAmbientLightingConfig().catch(() => { /* best-effort */ });
-              this.requestPaxcounterConfig().catch(() => { /* best-effort */ });
-              this.requestRemoteHardwareConfig().catch(() => { /* best-effort */ });
-            }, 500);
+            //
+            // v2.0 Beta 5 (flap fix): these used to all fire inside a
+            // single setTimeout, which blasted ~12 admin ToRadio frames
+            // at the radio in <5ms. ESP32-based Meshtastic firmware
+            // has a small TCP receive buffer and a slower admin
+            // dispatcher than that — under the flood, the radio
+            // dropped the TCP socket. Our 5s reconnect loop then
+            // reconnected, re-blasted the 12 reads, the radio dropped
+            // again, repeat. That's the "primary radio 3bec is
+            // continuously disconnecting" symptom.
+            //
+            // Staggering the reads at 250ms apart gives the firmware
+            // time to dispatch each admin packet, build the response,
+            // and clear its buffer before the next one arrives. Total
+            // sweep time goes from ~5ms to ~3s — well worth it for a
+            // link that actually stays up.
+            const moduleReads: Array<() => Promise<void>> = [
+              () => this.requestNeighborInfoConfig(),
+              () => this.requestRangeTestConfig(),
+              () => this.requestTelemetryConfig(),
+              () => this.requestStoreForwardConfig(),
+              () => this.requestExternalNotificationConfig(),
+              () => this.requestMqttConfig(),
+              () => this.requestDetectionSensorConfig(),
+              () => this.requestAudioConfig(),
+              () => this.requestSerialConfig(),
+              () => this.requestAmbientLightingConfig(),
+              () => this.requestPaxcounterConfig(),
+              () => this.requestRemoteHardwareConfig(),
+            ];
+            const READ_STAGGER_MS = 250;
+            const READ_START_DELAY_MS = 500;
+            moduleReads.forEach((read, i) => {
+              setTimeout(() => {
+                // Bail out if the link dropped before this scheduled
+                // tick fired — otherwise we'd queue admin packets at
+                // a closed/reconnecting bridge and either error out or
+                // pollute the next connection's identity window.
+                if (!this.isLinkOpen()) return;
+                read().catch(() => { /* best-effort */ });
+              }, READ_START_DELAY_MS + i * READ_STAGGER_MS);
+            });
           }
         } else if (fieldNumber === 8) {
           this.localRebootCount = value;

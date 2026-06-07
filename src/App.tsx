@@ -47,7 +47,7 @@ import { ViaFilter, ViaFilterValue } from './components/ViaFilter';
 import { useRadios } from './hooks/useRadios';
 import { useAuth, useIsAdmin } from './hooks/useAuth';
 import { useWorkspaces } from './hooks/useWorkspaces';
-import { LogOut, User as UserIcon, Eye as EyeIcon, Layers as LayersIcon, ChevronDown } from 'lucide-react';
+import { LogOut, User as UserIcon, Eye as EyeIcon, Layers as LayersIcon, ChevronDown, AlertCircle } from 'lucide-react';
 // RecipeView moved into SettingsModal as the "Install Guide" tab; the standalone
 // dashboard page was removed per operator request to keep the main nav focused
 // on operational views.
@@ -894,6 +894,7 @@ export default function App() {
             a global "yes, that button is supposed to be greyed out"
             explainer so viewers don't think the UI is broken. */}
         <ViewerBanner />
+        <NoWorkspaceBanner />
         {/* Header */}
         <header className="h-16 border-b border-brand-line flex items-center justify-between gap-2 px-3 sm:px-6 bg-brand-bg/80 backdrop-blur-sm z-40">
           <div className="flex items-center gap-6">
@@ -925,26 +926,34 @@ export default function App() {
               />
             )}
             {(() => {
-              // Truthful MQTT status pill. Three states:
-              //   active   — local radio's MQTT module is enabled (authoritative readback)
+              // Truthful MQTT status pill. Four states:
+              //   active   — local radio's MQTT module is enabled (authoritative readback) AND radio is online
               //   observed — module disabled or unread, but at least one peer has been
               //              seen via the MQTT bridge in the last 30 min
+              //   stale    — module IS enabled per cached readback, but the radio is offline right now,
+              //              so the in-process bridge is not actually uplinking. Without this state we
+              //              showed "MQTT: ACTIVE" while the radio status footer correctly read OFFLINE.
               //   off      — neither (no MQTT traffic, no module enable)
               const cutoff = Date.now() - 30 * 60 * 1000;
               const moduleEnabled = !!localModuleConfig.mqtt?.enabled;
               const observed = nodes.some(n => n.lastVia === 'mqtt' && n.lastSeen >= cutoff);
-              const state: 'active' | 'observed' | 'off' =
-                moduleEnabled ? 'active' : observed ? 'observed' : 'off';
+              const state: 'active' | 'stale' | 'observed' | 'off' =
+                moduleEnabled
+                  ? (radioConnected ? 'active' : 'stale')
+                  : observed ? 'observed' : 'off';
               const label =
                 state === 'active'   ? 'MQTT: ACTIVE' :
+                state === 'stale'    ? 'MQTT: STALE' :
                 state === 'observed' ? 'MQTT: OBSERVED' :
                                        'MQTT: OFF';
               const tone =
                 state === 'active'   ? 'text-brand-accent' :
+                state === 'stale'    ? 'text-brand-muted' :
                 state === 'observed' ? 'text-brand-warning' :
                                        'text-brand-muted';
               const title =
                 state === 'active'   ? 'Local radio\'s MQTT module is enabled (per its admin readback). Per-channel uplink/downlink toggles still live in Channels.' :
+                state === 'stale'    ? 'Local radio\'s MQTT module is enabled per its last admin readback, but the radio is currently offline — nothing is being uplinked or downlinked right now.' :
                 state === 'observed' ? 'MQTT module not enabled here, but at least one peer has reached us via an MQTT bridge in the last 30 minutes.' :
                                        'No MQTT activity. Configure the local module in Settings → Modules → MQTT, or wait for an MQTT-bridged peer to appear.';
               return (
@@ -1465,6 +1474,39 @@ function UserBadge() {
  * will 403 so viewers don't think the dashboard is broken. Self-hides for
  * admins so it doesn't clutter the chrome.
  */
+/**
+ * v2.0 Beta 5 Workspaces (fix): empty-workspace banner.
+ *
+ * New users no longer auto-join the Household workspace, so a freshly
+ * created viewer can log in and find themselves with zero memberships.
+ * Without a banner the dashboard just renders empty (no radios, no
+ * nodes, no messages) and the user thinks something is broken. This
+ * tells them their admin still has assignment work to do.
+ *
+ * Admins seeing this banner means their own membership got cleared
+ * somehow (rare — usually only if they removed themselves) — same
+ * message is fine since they can fix it via Settings → Workspaces.
+ */
+function NoWorkspaceBanner() {
+  const { user } = useAuth();
+  const { workspaces, loading } = useWorkspaces();
+  if (!user || loading) return null;
+  if (workspaces.length > 0) return null;
+  return (
+    <div
+      className="flex items-center gap-2 px-4 py-1.5 bg-amber-500/10 border-b border-amber-500/30 text-[11px] text-amber-300"
+      title="You haven't been assigned to any workspace yet. Your dashboard will be empty until an admin adds you to one."
+    >
+      <AlertCircle size={12} />
+      <span className="font-bold uppercase tracking-widest">No Workspace</span>
+      <span className="opacity-80">
+        — your account isn't a member of any workspace yet. Ask an admin to add you via
+        <span className="font-bold"> Settings → Workspaces</span> before the dashboard will populate.
+      </span>
+    </div>
+  );
+}
+
 function ViewerBanner() {
   const isAdmin = useIsAdmin();
   const { user } = useAuth();
