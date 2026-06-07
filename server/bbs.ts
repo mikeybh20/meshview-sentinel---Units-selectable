@@ -43,6 +43,42 @@ const STATE_TIMEOUT_MS_FALLBACK = 300_000;
  *  shared channel on a default Meshtastic install. */
 const PUSH_CHANNEL_FALLBACK = 0;
 
+/** v2.0 Beta 5 BBS (alias): permanent aliases for the weather subsystem.
+ *  The configured weatherTrigger is whichever one of these the operator
+ *  has saved (defaults to :wx for fresh installs, :weather for pre-Beta-4
+ *  upgrades). The OTHER ONE in this list always works as a shortcut —
+ *  so a subscriber typing :weather hits the same flow as :wx and vice
+ *  versa without the operator having to pick one and stick with it.
+ *  All entries must be lowercase, must start with ':', and must NOT
+ *  collide with mailTrigger / cmdTrigger after normalization. */
+const WEATHER_ALIASES: readonly string[] = [':wx', ':weather'];
+
+/**
+ * Rewrite a leading weather-alias prefix to the configured weatherTrigger
+ * so every downstream `lower.startsWith(weatherTrigger …)` check in
+ * handleInboundDm hits without us having to duplicate every comparison
+ * across all aliases.
+ *
+ * Pure prefix rewrite — case-preserving on the tail, lowercase-matching
+ * on the head. If the input doesn't start with a known alias, returns
+ * the original untouched.
+ *
+ * Excludes the configured trigger from the rewrite (already canonical)
+ * and any alias that would collide with mailTrigger / cmdTrigger so a
+ * pathological operator config can't accidentally redirect a different
+ * subsystem into the weather flow.
+ */
+function canonicalizeWeatherAlias(text: string, cfg: BbsConfig): string {
+  const lower = text.toLowerCase();
+  for (const alias of WEATHER_ALIASES) {
+    if (alias === cfg.weatherTrigger) continue;
+    if (alias === cfg.mailTrigger || alias === cfg.cmdTrigger) continue;
+    if (lower === alias) return cfg.weatherTrigger;
+    if (lower.startsWith(alias + ' ')) return cfg.weatherTrigger + text.slice(alias.length);
+  }
+  return text;
+}
+
 type SessionState =
   | { kind: 'awaiting-recipient'; enteredAt: number; channelIndex: number; pendingBody?: string }
   | { kind: 'awaiting-recipient-pick'; enteredAt: number; channelIndex: number; candidates: MeshNode[]; pendingBody?: string }
@@ -157,6 +193,15 @@ export class BbsService {
     const t = text.trim().toLowerCase();
     if (t.startsWith(this.config.mailTrigger)) return true;
     if (t.startsWith(this.config.weatherTrigger)) return true;
+    // v2.0 Beta 5 BBS (alias): :wx and :weather are interchangeable —
+    // both prefixes hit the weather flow regardless of which one the
+    // operator has saved as the configured trigger. See
+    // WEATHER_ALIASES + canonicalizeWeatherAlias().
+    for (const alias of WEATHER_ALIASES) {
+      if (alias === this.config.weatherTrigger) continue;
+      if (alias === this.config.mailTrigger || alias === this.config.cmdTrigger) continue;
+      if (t === alias || t.startsWith(alias + ' ')) return true;
+    }
     if (t === this.config.cmdTrigger) return true;
     // Mid-flow continuation — anything goes if they're in a session.
     if (this.sessions.has(fromId) || this.weatherSessions.has(fromId)) return true;
@@ -179,7 +224,13 @@ export class BbsService {
    */
   async handleInboundDm(fromId: string, text: string, channelIndex: number): Promise<boolean> {
     if (!this.config.enabled) return false;
-    const trimmed = text.trim();
+    // v2.0 Beta 5 BBS (alias): rewrite a leading :wx ↔ :weather to the
+    // configured weatherTrigger BEFORE we trim / lowercase / dispatch.
+    // Lets every downstream `lower.startsWith(weatherTrigger…)` check
+    // hit without having to duplicate matchers across both alias forms.
+    // Mid-session messages are untouched (no leading colon to match).
+    const canonicalized = canonicalizeWeatherAlias(text, this.config);
+    const trimmed = canonicalized.trim();
     const senderNode = this.bridge.getNodes().find(n => n.id === fromId);
     const senderShortName = senderNode?.shortName || fromId.slice(-4);
     const mailTrigger = this.config.mailTrigger;

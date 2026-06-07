@@ -1250,46 +1250,107 @@ app.get('/api/mesh/radios', (req, res) => {
   });
 });
 
+/**
+ * v2.0 Beta 5 Radios (fix): the Add path now ALWAYS yields a usable
+ * outcome rather than refusing on collision. Concretely:
+ *
+ *   1. Genuinely new radio_id → INSERT, assign to caller's current
+ *      workspace (or Household fallback), log [Radios] ADD with the
+ *      full request body + assigned workspace.
+ *
+ *   2. radio_id collides AND ?claim=true → UPDATE the existing row
+ *      with the request's transport/target/long_name/network_label,
+ *      reassign to the caller's current workspace. Logs
+ *      [Radios] CLAIM with before/after state. This is the path the
+ *      AddRadioForm's "Claim existing" button takes when it sees a
+ *      409 and the operator confirms.
+ *
+ *   3. radio_id collides AND no claim flag → 409 with a clear
+ *      explanation of WHERE the existing row lives so the operator
+ *      can find it, plus a hint that the same form supports
+ *      ?claim=true to overwrite. Logs [Radios] REFUSED with the
+ *      reason and the existing row's location.
+ *
+ * Every outcome — validation failure, collision, success — emits a
+ * structured [Radios] log line so the operator can grep their docker
+ * logs to troubleshoot failed adds. The format is:
+ *   [Radios] <verb> radio_id="X" by user=<u> result=<status> details=<...>
+ */
 app.post('/api/mesh/radios', (req, res) => {
   const body = req.body ?? {};
   const radio_id = String(body.radio_id ?? '').trim();
   const long_name = String(body.long_name ?? '').trim();
   const transport = String(body.transport ?? '').trim();
   const target = String(body.target ?? '').trim();
+  const claim = req.query?.claim === 'true' || body.claim === true;
+  const actor = req.user ? `${req.user.username}#${req.user.id}` : '<unauthenticated>';
+  const log = (verb: string, result: string, details: string) => {
+    console.log(`[Radios] ${verb} radio_id="${radio_id}" by user=${actor} result=${result}${details ? ' ' + details : ''}`);
+  };
 
   if (!radio_id || !SHORT_NAME_RE.test(radio_id)) {
+    log('ADD', 'REJECTED', `reason=bad_radio_id raw="${String(body.radio_id ?? '')}"`);
     return res.status(400).json({ error: 'radio_id must be 1-4 chars (A-Z, 0-9, _, !, -)' });
   }
-  if (!long_name) return res.status(400).json({ error: 'long_name is required' });
+  if (!long_name) {
+    log('ADD', 'REJECTED', 'reason=missing_long_name');
+    return res.status(400).json({ error: 'long_name is required' });
+  }
   if (transport !== 'serial' && transport !== 'tcp' && transport !== 'ble') {
+    log('ADD', 'REJECTED', `reason=bad_transport raw="${transport}"`);
     return res.status(400).json({ error: 'transport must be serial|tcp|ble' });
   }
-  if (!target) return res.status(400).json({ error: 'target is required' });
+  if (!target) {
+    log('ADD', 'REJECTED', 'reason=missing_target');
+    return res.status(400).json({ error: 'target is required' });
+  }
 
   const db = meshDb();
   const existing = db.getRadio(radio_id);
+  const callerWsId = req.user ? currentWorkspaceIdForUser(req) : null;
+  const fallbackWs = db.listWorkspaces()[0] ?? null;
+  const targetWsId = callerWsId ?? fallbackWs?.id ?? null;
+  const targetWsName = targetWsId
+    ? (db.listWorkspaces().find(w => w.id === targetWsId)?.name ?? `workspace #${targetWsId}`)
+    : 'no workspace';
+
   if (existing) {
-    // v2.0 Beta 5 Workspaces (fix): the prior message just said
-    // 'already exists' which was confusing when the radio was hidden
-    // from the operator's current workspace view — they'd see an
-    // empty radios list, try to add the radio, and get a "but it's
-    // already here" error with no hint where to find it.
-    //
-    // The two common ways a row appears without an explicit add:
-    //   1. BridgeManager.tryAutoRegisterDefault() inserted it when
-    //      the auto-discovered singleton's MyNodeInfo arrived.
-    //   2. The operator restored an encrypted backup from another
-    //      install — every radios row came with it.
-    //
-    // Tell them WHERE the row lives so they can act.
-    const wsName = existing.workspace_id
+    const existingWsName = existing.workspace_id
       ? (db.listWorkspaces().find(w => w.id === existing.workspace_id)?.name ?? `workspace #${existing.workspace_id}`)
       : 'no workspace (unassigned)';
-    return res.status(409).json({
-      error: `radio_id "${radio_id}" is already in the registry — assigned to ${wsName} at ${existing.transport}:${existing.target}. ` +
-        `If you can't see it in your Radios list, it's because your current workspace doesn't contain it; switch via the workspace dropdown, ` +
-        `or reassign it via Settings → Workspaces. If this is a stale auto-discovered row, delete it from there first, then re-add here.`,
+
+    if (!claim) {
+      log('ADD', 'REFUSED_COLLISION',
+        `existing_at="${existing.transport}:${existing.target}" existing_workspace="${existingWsName}" hint=use_claim_or_edit`);
+      return res.status(409).json({
+        error: `radio_id "${radio_id}" is already in the registry — currently in ${existingWsName} at ${existing.transport}:${existing.target}. ` +
+          `Resubmit with the "Claim existing" button to overwrite the row with the values you entered and move it to your workspace, ` +
+          `or open Settings → Workspaces to find and edit it where it lives now.`,
+        existingWorkspaceId: existing.workspace_id,
+        existingWorkspaceName: existingWsName,
+        existingTransport: existing.transport,
+        existingTarget: existing.target,
+        canClaim: true,
+      });
+    }
+
+    // CLAIM path: overwrite the existing row with the operator's values
+    // and reassign to their workspace. Preserve color_hex / region /
+    // modem_preset / frequency_slot / num_hops / is_default / is_bbs_node
+    // — those are firmware-derived or install-level invariants that an
+    // operator changing them via the Radios form would be surprising.
+    db.upsertRadio({
+      ...existing,
+      long_name,
+      transport: transport as 'serial' | 'tcp' | 'ble',
+      target,
+      network_label: body.network_label ?? existing.network_label,
+      updated_at: Date.now(),
     });
+    if (targetWsId) db.setRadioWorkspace(radio_id, targetWsId);
+    log('CLAIM', 'OK',
+      `from="${existing.transport}:${existing.target}@${existingWsName}" to="${transport}:${target}@${targetWsName}"`);
+    return res.status(200).json({ ...db.getRadio(radio_id), claimed: true });
   }
 
   const existingColors = db.listRadios().map(r => r.color_hex).filter((c): c is string => !!c);
@@ -1307,27 +1368,20 @@ app.post('/api/mesh/radios', (req, res) => {
     enabled:         body.enabled === false ? 0 : 1,
     color_hex:       body.color_hex ?? nextAvailableColor(existingColors),
     network_label:   body.network_label ?? null,
-    // First radio added becomes default if no default exists yet.
     is_default:      db.getDefaultRadio() ? 0 : 1,
     bbs_only:        body.bbs_only ? 1 : 0,
-    // is_bbs_node defaults off on radio creation. setBbsNodeRadio is
-    // the single sanctioned way to flip it (install-wide mutex), so
-    // we don't honor a body field here.
     is_bbs_node:     0,
-    // workspace_id left NULL — bootstrapWorkspaces() runs on next boot
-    // (or on next radios upsert?) and assigns this radio to Household.
-    // Callers that want to drop a radio into a specific workspace use
-    // setRadioWorkspace() after creation.
-    workspace_id:    null,
+    workspace_id:    targetWsId,
     created_at:      now,
     updated_at:      now,
   });
-  // Backfill immediately so the radio doesn't sit unassigned until the
-  // next boot reaches bootstrapWorkspaces().
-  if (!db.getRadio(radio_id)?.workspace_id) {
-    const firstWs = db.listWorkspaces()[0];
-    if (firstWs) db.setRadioWorkspace(radio_id, firstWs.id);
+  // Defensive: if upsertRadio dropped workspace_id (older code paths
+  // sometimes did), restamp via setRadioWorkspace.
+  if (targetWsId && !db.getRadio(radio_id)?.workspace_id) {
+    db.setRadioWorkspace(radio_id, targetWsId);
   }
+  log('ADD', 'OK',
+    `transport=${transport} target="${target}" long_name="${long_name}" assigned_workspace="${targetWsName}"`);
   return res.status(201).json(db.getRadio(radio_id));
 });
 
@@ -1335,9 +1389,22 @@ app.put('/api/mesh/radios/:radioId', (req, res) => {
   const { radioId } = req.params;
   const db = meshDb();
   const existing = db.getRadio(radioId);
-  if (!existing) return res.status(404).json({ error: 'radio not found' });
+  const actor = req.user ? `${req.user.username}#${req.user.id}` : '<unauthenticated>';
+  if (!existing) {
+    console.log(`[Radios] EDIT radio_id="${radioId}" by user=${actor} result=NOT_FOUND`);
+    return res.status(404).json({ error: 'radio not found' });
+  }
 
   const body = req.body ?? {};
+  // Capture which fields the caller actually changed for the audit log,
+  // so a future "why did target X get overwritten?" question is easy to
+  // grep the docker logs for.
+  const changed: string[] = [];
+  const trackedFields = ['long_name','transport','target','region','modem_preset','frequency_slot','primary_channel','num_hops','enabled','color_hex','network_label','bbs_only'] as const;
+  for (const f of trackedFields) {
+    if (body[f] !== undefined && body[f] !== (existing as any)[f]) changed.push(`${f}="${body[f]}"`);
+  }
+
   db.upsertRadio({
     ...existing,
     long_name:       body.long_name       ?? existing.long_name,
@@ -1351,15 +1418,12 @@ app.put('/api/mesh/radios/:radioId', (req, res) => {
     enabled:         body.enabled !== undefined ? (body.enabled ? 1 : 0) : existing.enabled,
     color_hex:       body.color_hex       !== undefined ? body.color_hex       : existing.color_hex,
     network_label:   body.network_label   !== undefined ? body.network_label   : existing.network_label,
-    // v2.0 Beta 4: bbs_only flag — when set, the BbsService on this radio
-    // auto-replies to non-BBS DMs with the command index. Propagate to the
-    // live BbsService instance so the toggle takes effect immediately
-    // (otherwise the operator would have to wait for a reconnect).
     bbs_only:        body.bbs_only        !== undefined ? (body.bbs_only ? 1 : 0) : existing.bbs_only,
   });
   if (body.bbs_only !== undefined) {
     bridgeManager.updateRadioBbsOnly(radioId, !!body.bbs_only);
   }
+  console.log(`[Radios] EDIT radio_id="${radioId}" by user=${actor} result=OK changed=[${changed.join(',') || 'none'}]`);
   return res.json(db.getRadio(radioId));
 });
 
@@ -1367,17 +1431,21 @@ app.delete('/api/mesh/radios/:radioId', (req, res) => {
   const { radioId } = req.params;
   const db = meshDb();
   const existing = db.getRadio(radioId);
-  if (!existing) return res.status(404).json({ error: 'radio not found' });
-  // v2.0 bugfix: gate deletion on the LIVE singleton, not the DB column —
-  // the DB column reflects operator preference and might point at a radio
-  // that isn't currently connected (which is fine to delete). What we
-  // really can't delete is whichever radio is currently held by the
-  // auto-discovered singleton bridge.
+  const actor = req.user ? `${req.user.username}#${req.user.id}` : '<unauthenticated>';
+  if (!existing) {
+    console.log(`[Radios] DELETE radio_id="${radioId}" by user=${actor} result=NOT_FOUND`);
+    return res.status(404).json({ error: 'radio not found' });
+  }
   if (radioId === bridgeManager.getDefaultRadioId()) {
-    return res.status(409).json({ error: 'cannot delete the currently auto-connected singleton radio' });
+    console.log(`[Radios] DELETE radio_id="${radioId}" by user=${actor} result=REFUSED reason=singleton_held`);
+    return res.status(409).json({ error: 'cannot delete the currently auto-connected singleton radio. Use the Promote button on a different radio first to free this one up.' });
   }
   const ok = db.deleteRadio(radioId);
-  if (!ok) return res.status(500).json({ error: 'delete failed' });
+  if (!ok) {
+    console.log(`[Radios] DELETE radio_id="${radioId}" by user=${actor} result=DB_ERROR`);
+    return res.status(500).json({ error: 'delete failed' });
+  }
+  console.log(`[Radios] DELETE radio_id="${radioId}" by user=${actor} result=OK previous_target="${existing.transport}:${existing.target}"`);
   return res.json({ ok: true });
 });
 
@@ -1395,21 +1463,45 @@ app.post('/api/mesh/radios/:radioId/default', (req, res) => {
 // the unified node/message/event view via the BridgeManager aggregator.
 
 app.post('/api/mesh/radios/:radioId/connect', async (req, res) => {
-  const result = await bridgeManager.spawnSecondary(req.params.radioId);
-  if (!result.ok) return res.status(409).json({ error: (result as { ok: false; error: string }).error });
+  const { radioId } = req.params;
+  const actor = req.user ? `${req.user.username}#${req.user.id}` : '<unauthenticated>';
+  const row = meshDb().getRadio(radioId);
+  console.log(`[Radios] CONNECT radio_id="${radioId}" by user=${actor} target="${row?.transport ?? '?'}:${row?.target ?? '?'}"`);
+  const result = await bridgeManager.spawnSecondary(radioId);
+  if (!result.ok) {
+    const err = (result as { ok: false; error: string }).error;
+    console.log(`[Radios] CONNECT radio_id="${radioId}" by user=${actor} result=REFUSED reason="${err}"`);
+    return res.status(409).json({ error: err });
+  }
+  console.log(`[Radios] CONNECT radio_id="${radioId}" by user=${actor} result=OK`);
   return res.json({ ok: true });
 });
 
 app.post('/api/mesh/radios/:radioId/disconnect', async (req, res) => {
-  const result = await bridgeManager.disconnectRadio(req.params.radioId);
-  if (!result.ok) return res.status(409).json({ error: (result as { ok: false; error: string }).error });
+  const { radioId } = req.params;
+  const actor = req.user ? `${req.user.username}#${req.user.id}` : '<unauthenticated>';
+  const result = await bridgeManager.disconnectRadio(radioId);
+  if (!result.ok) {
+    const err = (result as { ok: false; error: string }).error;
+    console.log(`[Radios] DISCONNECT radio_id="${radioId}" by user=${actor} result=REFUSED reason="${err}"`);
+    return res.status(409).json({ error: err });
+  }
+  console.log(`[Radios] DISCONNECT radio_id="${radioId}" by user=${actor} result=OK`);
   return res.json({ ok: true });
 });
 
 // v2.0 Beta 2: hot-swap the singleton. See BridgeManager.promoteToSingleton.
 app.post('/api/mesh/radios/:radioId/promote-to-singleton', async (req, res) => {
-  const result = await bridgeManager.promoteToSingleton(req.params.radioId);
-  if (!result.ok) return res.status(409).json({ error: (result as { ok: false; error: string }).error });
+  const { radioId } = req.params;
+  const actor = req.user ? `${req.user.username}#${req.user.id}` : '<unauthenticated>';
+  const previousSingleton = bridgeManager.getDefaultRadioId();
+  const result = await bridgeManager.promoteToSingleton(radioId);
+  if (!result.ok) {
+    const err = (result as { ok: false; error: string }).error;
+    console.log(`[Radios] PROMOTE radio_id="${radioId}" by user=${actor} result=REFUSED reason="${err}"`);
+    return res.status(409).json({ error: err });
+  }
+  console.log(`[Radios] PROMOTE radio_id="${radioId}" by user=${actor} result=OK previous_singleton="${previousSingleton ?? 'none'}"`);
   return res.json(result);
 });
 

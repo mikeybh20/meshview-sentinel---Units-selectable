@@ -327,6 +327,15 @@ class BridgeManager extends EventEmitter {
     if (!existingRow) {
       const firstWs = db.listWorkspaces()[0];
       if (firstWs) db.setRadioWorkspace(shortName, firstWs.id);
+      // v2.0 Beta 5 Radios (logging): surface the auto-register event in
+      // the same [Radios] stream as explicit Add/Edit/Delete actions so
+      // grepping `docker logs | grep '[Radios]'` answers "where did this
+      // row come from?" — previously the auto-register was invisible to
+      // anyone but a code reader, and operators kept hitting "already
+      // exists" on Add Radio without realizing the system had inserted
+      // the row for them on first identity exchange.
+      const wsName = firstWs?.name ?? 'no workspace';
+      console.log(`[Radios] AUTO_REGISTER radio_id="${shortName}" by user=<singleton-identity> target="${row.transport}:${row.target}" assigned_workspace="${wsName}" long_name="${row.long_name}"`);
     }
 
     // If this is the first radio ever (no rows previously), backfill legacy

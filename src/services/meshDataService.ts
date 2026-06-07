@@ -852,15 +852,38 @@ export class MeshDataService {
     target: string;
     color_hex?: string;
     network_label?: string;
-  }): Promise<{ ok: boolean; row?: any; error?: string }> {
+    /** v2.0 Beta 5 Radios (fix): when true, the server upgrades an
+     *  existing row with the same radio_id instead of refusing — used
+     *  by AddRadioForm's "Claim existing" button when it detects the
+     *  initial Add returned a 409 collision. */
+    claim?: boolean;
+  }): Promise<{ ok: boolean; row?: any; error?: string; collision?: { existingWorkspaceId: number | null; existingWorkspaceName: string; existingTransport: string; existingTarget: string; canClaim: boolean } }> {
     try {
-      const res = await fetch(`${API_BASE}/api/mesh/radios`, {
+      const qs = input.claim ? '?claim=true' : '';
+      const res = await fetch(`${API_BASE}/api/mesh/radios${qs}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(input),
       });
       const body = await res.json().catch(() => ({}));
-      if (!res.ok) return { ok: false, error: body.error || `HTTP ${res.status}` };
+      if (!res.ok) {
+        // Surface the collision metadata so the form can pivot to a
+        // "Claim existing" CTA instead of just showing the error string.
+        if (res.status === 409 && body.canClaim) {
+          return {
+            ok: false,
+            error: body.error || `HTTP ${res.status}`,
+            collision: {
+              existingWorkspaceId: body.existingWorkspaceId ?? null,
+              existingWorkspaceName: body.existingWorkspaceName ?? 'unknown',
+              existingTransport: body.existingTransport ?? '?',
+              existingTarget: body.existingTarget ?? '?',
+              canClaim: true,
+            },
+          };
+        }
+        return { ok: false, error: body.error || `HTTP ${res.status}` };
+      }
       return { ok: true, row: body };
     } catch (err: any) {
       return { ok: false, error: err?.message || 'request failed' };

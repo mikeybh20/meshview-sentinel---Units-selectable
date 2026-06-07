@@ -20,7 +20,13 @@ const API_BASE = import.meta.env.VITE_API_URL || '';
 // 'radios' was removed in Beta 2 — it lives in the top-level nav now.
 // See [./views/RadiosView.tsx](./views/RadiosView.tsx) for the component
 // and the App.tsx nav for the route.
-type SectionKey = 'connection' | 'mode' | 'modules' | 'notifications' | 'display' | 'blocked' | 'data' | 'disk' | 'guide' | 'jetson' | 'ai' | 'bbs' | 'users' | 'workspaces';
+// v2.0 Beta 5 Radios (fix): 'connection' section removed from the
+// settings sidebar — every radio operation (add, edit, connect,
+// disconnect, hot-swap-primary, delete) now lives in the top-level
+// Radios tab so there's a single source of truth. The old single-
+// radio TCP form here was a 1.x leftover that confused operators
+// running multiple radios. See the Radios tab's guidance banner.
+type SectionKey = 'mode' | 'modules' | 'notifications' | 'display' | 'blocked' | 'data' | 'disk' | 'guide' | 'jetson' | 'ai' | 'bbs' | 'users' | 'workspaces';
 
 interface SectionDef {
   key: SectionKey;
@@ -29,7 +35,6 @@ interface SectionDef {
 }
 
 const SECTIONS: SectionDef[] = [
-  { key: 'connection',    label: 'Connection',    icon: <Wifi size={14} /> },
   { key: 'mode',          label: 'Mode',          icon: <Radio size={14} /> },
   { key: 'modules',       label: 'Modules',       icon: <Network size={14} /> },
   { key: 'notifications', label: 'Notifications', icon: <Bell size={14} /> },
@@ -89,7 +94,7 @@ interface SettingsModalProps {
 }
 
 export function SettingsModal(props: SettingsModalProps) {
-  const [active, setActive] = React.useState<SectionKey>('connection');
+  const [active, setActive] = React.useState<SectionKey>('mode');
 
   return (
     <motion.div
@@ -140,7 +145,6 @@ export function SettingsModal(props: SettingsModalProps) {
 
           {/* Content */}
           <div className="flex-1 overflow-y-auto p-5">
-            {active === 'connection'    && <ConnectionSection {...props} />}
             {active === 'modules'       && <ModulesSection {...props} />}
             {active === 'notifications' && <NotificationsSection {...props} />}
             {active === 'display'       && <DisplaySection {...props} />}
@@ -162,17 +166,18 @@ export function SettingsModal(props: SettingsModalProps) {
 }
 
 // ============================================================================
-// Connection
+// Connection (REMOVED — see top of file). ConnectionSection function
+// kept as a non-rendered helper so any stray external import doesn't
+// hard-break the build. The Settings sidebar no longer routes to it;
+// all radio management lives in the top-level Radios tab.
 // ============================================================================
-function ConnectionSection({ transport, radioConnected, onTcpConnected, onClose }: SettingsModalProps) {
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function _ConnectionSectionLegacy({ transport, radioConnected, onTcpConnected, onClose }: SettingsModalProps) {
   const [host, setHost] = React.useState(transport?.tcp?.host ?? '');
   const [port, setPort] = React.useState(String(transport?.tcp?.port ?? 4403));
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
-  // Live-subscribe to bridge status so we can show the radio's firmware version
-  // and reboot count once they arrive (newer firmware sends them via DeviceMetadata,
-  // older firmware via MyNodeInfo — either path lands in MeshStatus).
   const [status, setStatus] = React.useState(meshDataService.getStatus());
   React.useEffect(() => meshDataService.onStatus(setStatus), []);
 
@@ -1847,6 +1852,17 @@ function BbsSection() {
               )}
             />
             {weatherErr && <div className="text-[10px] text-brand-error">{weatherErr}</div>}
+            {/* v2.0 Beta 5 BBS (alias): :wx ↔ :weather always work as
+                aliases for each other regardless of which one is saved
+                here, so a subscriber's muscle memory keeps working when
+                you (or a co-admin) rename the trigger. */}
+            <div className="text-[10px] text-brand-muted leading-relaxed">
+              {cfg.weatherTrigger === ':wx'
+                ? <><code className="text-brand-accent">:weather</code> also works as an alias.</>
+                : cfg.weatherTrigger === ':weather'
+                ? <><code className="text-brand-accent">:wx</code> also works as an alias.</>
+                : <>Built-in aliases <code className="text-brand-accent">:wx</code> and <code className="text-brand-accent">:weather</code> both route here.</>}
+            </div>
           </div>
           <div className="space-y-1">
             <label className="text-[10px] uppercase font-bold tracking-widest text-brand-muted">Command index</label>

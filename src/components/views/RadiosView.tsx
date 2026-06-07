@@ -574,6 +574,14 @@ export function RadiosView() {
             <p className="text-[11px] text-brand-muted mt-0.5 max-w-2xl">
               Each configured radio appears here with its 4-char short name. The <strong>primary radio</strong> (marked with the star) handles the main bridge — by default the one Sentinel auto-discovers on boot. Secondary radios connect on demand via the buttons below. Use <strong>Make Primary</strong> to hot-swap which radio is primary.
             </p>
+            {/* v2.0 Beta 5 Radios (fix): single-source-of-truth banner. Settings
+                → Connection used to host a 1-radio TCP form; it's now removed
+                because every operation (add, edit, connect, disconnect,
+                make-primary, delete) lives on this page. The banner reminds
+                operators who muscle-memory'd to Settings → Connection. */}
+            <p className="text-[10px] text-brand-muted mt-1.5 max-w-2xl border-l-2 border-brand-accent/40 pl-2">
+              <strong className="text-brand-ink">This is the single management page for every radio.</strong> Add new radios, edit metadata, connect/disconnect, hot-swap which is primary, and delete entries all live here. Settings → Connection has been retired.
+            </p>
           </div>
           <div className="flex items-center gap-1.5 flex-shrink-0">
             <button
@@ -2441,19 +2449,33 @@ function AddRadioForm({ existing, onCancel, onCreated }: {
     setDetectMsg(`Selected ${svc.name} (${svc.ipv4}:${svc.port}) — click Detect Identity to verify.`);
   };
 
-  const submit = async () => {
-    setBusy(true); setErr(null);
+  // v2.0 Beta 5 Radios (fix): track the collision so we can render a
+  // "Claim existing" button next to the error message. Without this the
+  // operator gets a wall of text explaining the conflict and no clear
+  // action — they have to copy the workspace name, navigate elsewhere,
+  // find the row, then come back. The Claim flow does it in-place.
+  const [collision, setCollision] = React.useState<NonNullable<Awaited<ReturnType<typeof meshDataService.addRadio>>['collision']> | null>(null);
+
+  const doSubmit = async (claim: boolean) => {
+    setBusy(true); setErr(null); setCollision(null);
     const r = await meshDataService.addRadio({
       radio_id: radioId.trim(),
       long_name: longName.trim(),
       transport,
       target: target.trim(),
       network_label: networkLabel.trim() || undefined,
+      claim,
     });
     setBusy(false);
-    if (!r.ok) { setErr(r.error || 'add failed'); return; }
+    if (!r.ok) {
+      setErr(r.error || 'add failed');
+      if (r.collision) setCollision(r.collision);
+      return;
+    }
     onCreated();
   };
+  const submit = () => doSubmit(false);
+  const claimExisting = () => doSubmit(true);
 
   const detectIdentity = async () => {
     setDetectMsg(null); setErr(null);
@@ -2575,8 +2597,31 @@ function AddRadioForm({ existing, onCancel, onCreated }: {
         </div>
       </div>
       {err && (
-        <div className="flex items-center gap-2 bg-red-500/10 border border-red-500/40 rounded px-3 py-2 text-[11px] text-red-300">
-          <AlertCircle size={12} /> {err}
+        <div className="flex flex-col gap-2 bg-red-500/10 border border-red-500/40 rounded px-3 py-2 text-[11px] text-red-300">
+          <div className="flex items-start gap-2">
+            <AlertCircle size={12} className="mt-0.5 flex-shrink-0" />
+            <span>{err}</span>
+          </div>
+          {/* v2.0 Beta 5 Radios (fix): when the server returns a 409 with
+              canClaim:true, render an inline button that re-POSTs with
+              ?claim=true. The server then overwrites the existing row with
+              the values entered above and moves it into the operator's
+              current workspace. */}
+          {collision && (
+            <div className="flex flex-wrap items-center gap-2 pl-5">
+              <button
+                onClick={claimExisting}
+                disabled={busy}
+                className="bg-amber-500/15 hover:bg-amber-500/25 disabled:opacity-40 border border-amber-500/40 text-amber-300 text-[10px] font-bold uppercase tracking-widest rounded px-3 py-1"
+                title={`Overwrite ${radioId} in ${collision.existingWorkspaceName} with the values above and move it to your current workspace.`}
+              >
+                {busy ? 'Claiming…' : `Claim & Move to My Workspace`}
+              </button>
+              <span className="text-[10px] text-brand-muted">
+                will overwrite {collision.existingTransport}:{collision.existingTarget} in {collision.existingWorkspaceName}
+              </span>
+            </div>
+          )}
         </div>
       )}
       <div className="flex items-center gap-2 flex-wrap">
