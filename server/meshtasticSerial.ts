@@ -731,6 +731,15 @@ export class MeshtasticSerialBridge extends EventEmitter {
   private rxBuffer = Buffer.alloc(0);
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private staleCheckTimer: ReturnType<typeof setInterval> | null = null;
+  /** v2.0 Beta 5 (flap fix #2): Meshtastic firmware closes idle TCP
+   *  clients ~15 seconds after the last received frame — the official
+   *  client and `meshtastic --tcp` both send a ToRadio.heartbeat
+   *  (proto field 7) periodically to keep the link alive. We weren't
+   *  sending one, so right after the post-identity admin-readback
+   *  burst completed the link went silent and the firmware dropped us.
+   *  Our 5s reconnect timer then made it look like the radio was
+   *  "dropping every 5 or 6 seconds." See sendHeartbeat / startHeartbeat. */
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private _connected = false;
   private localNodeId: string | null = null;
   private localNodeNum: number = 0;
@@ -1176,6 +1185,12 @@ export class MeshtasticSerialBridge extends EventEmitter {
         // Start stale node checker
         this.staleCheckTimer = setInterval(() => this.markStaleNodesOffline(), 60_000);
 
+        // v2.0 Beta 5 (flap fix #2): same heartbeat as the TCP path —
+        // serial firmware doesn't drop us on idle in the same way, but
+        // sending the heartbeat costs nothing and keeps both transports
+        // on the same lifecycle invariants.
+        this.startHeartbeat();
+
         resolve();
       });
     });
@@ -1224,6 +1239,10 @@ export class MeshtasticSerialBridge extends EventEmitter {
 
         this.requestConfig();
         this.staleCheckTimer = setInterval(() => this.markStaleNodesOffline(), 60_000);
+        // v2.0 Beta 5 (flap fix #2): keep the firmware from closing the
+        // idle TCP socket after the post-identity admin-readback burst
+        // completes. See startHeartbeat / sendHeartbeat for context.
+        this.startHeartbeat();
         resolve();
       });
     });
@@ -1238,6 +1257,9 @@ export class MeshtasticSerialBridge extends EventEmitter {
       clearInterval(this.staleCheckTimer);
       this.staleCheckTimer = null;
     }
+    // v2.0 Beta 5 (flap fix #2): tear down the heartbeat interval so
+    // it can't fire into a closed socket after disconnect.
+    this.stopHeartbeat();
 
     const closeSerial = (): Promise<void> => new Promise(resolve => {
       if (this.port?.isOpen) {
@@ -1575,6 +1597,10 @@ export class MeshtasticSerialBridge extends EventEmitter {
   private onClose() {
     console.log(`[MeshtasticSerial] Port closed`);
     this._connected = false;
+    // v2.0 Beta 5 (flap fix #2): stop heartbeats so the timer doesn't
+    // keep trying to write into a closed socket between close + next
+    // connectTcp. The next connect() restarts a fresh interval.
+    this.stopHeartbeat();
     this.emit('disconnected');
     this.addEvent('NODE_LOST', 'local', 'Serial port closed');
     this.scheduleReconnect();
@@ -3865,6 +3891,48 @@ export class MeshtasticSerialBridge extends EventEmitter {
 
     this.sendToRadio(body);
     console.log(`[MeshtasticSerial] Requested config (id=${configId})`);
+  }
+
+  /**
+   * v2.0 Beta 5 (flap fix #2): emit a ToRadio.heartbeat frame.
+   *
+   * Wire format: ToRadio { heartbeat: Heartbeat{} }
+   *   - field 7 (oneof payload_variant.heartbeat), wire type 2 (LEN)
+   *   - empty embedded message → tag 0x3a, length 0x00
+   *
+   * The Meshtastic firmware uses this frame both as a liveness signal
+   * (so it doesn't close the TCP socket as idle) and as a no-op reply
+   * trigger that won't be processed for routing. The official client
+   * sends one every 5 seconds; we match.
+   *
+   * Quiet on the wire (~1 byte every 5s) — no noticeable bandwidth or
+   * radio CPU cost.
+   */
+  private sendHeartbeat(): void {
+    if (!this.isLinkOpen()) return;
+    // ToRadio { heartbeat: Heartbeat{} } — single empty embedded message.
+    const body = Buffer.from([0x3a, 0x00]);
+    this.sendToRadio(body);
+  }
+
+  /** Start the periodic heartbeat that keeps the firmware from closing
+   *  our idle TCP socket. Idempotent — re-arming clears the prior timer
+   *  so a reconnect doesn't stack handlers. */
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    this.heartbeatTimer = setInterval(() => this.sendHeartbeat(), 5_000);
+    // .unref() so a hung connection during shutdown doesn't keep the
+    // process alive waiting for the next tick.
+    this.heartbeatTimer.unref?.();
+  }
+
+  /** Stop the heartbeat timer. Called from disconnect() and onClose()
+   *  so a stale interval can't keep firing into a closed socket. */
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
   }
 
   private encodeVarint(value: number): number[] {
