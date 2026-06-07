@@ -740,6 +740,21 @@ export class MeshtasticSerialBridge extends EventEmitter {
    *  Our 5s reconnect timer then made it look like the radio was
    *  "dropping every 5 or 6 seconds." See sendHeartbeat / startHeartbeat. */
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  /** v2.0 Beta 5 (flap fix #3) diagnostic: epoch-ms of the last frame
+   *  we *received* from the radio. onClose reports the idle gap so the
+   *  operator can distinguish "firmware idle-kicked us" (long gap)
+   *  from "firmware actively bailed mid-traffic" (no gap). */
+  private lastRxAt: number = 0;
+  /** v2.0 Beta 5 (flap fix #3) diagnostic: most recent socket error
+   *  message, captured by the 'error' handler so onClose can include
+   *  it in the disconnect log line. Cleared on successful connect. */
+  private lastSocketError: string | null = null;
+  /** v2.0 Beta 5 (flap fix #3): exponential reconnect backoff. After
+   *  consecutive failures the delay grows 5s → 10s → 20s → 60s (cap),
+   *  so a permanently-unreachable radio (EHOSTUNREACH 192.168.1.56)
+   *  doesn't burn one reconnect attempt every 5 seconds forever. Reset
+   *  to 0 on any successful connect. */
+  private reconnectFailureStreak: number = 0;
   private _connected = false;
   private localNodeId: string | null = null;
   private localNodeNum: number = 0;
@@ -1147,8 +1162,14 @@ export class MeshtasticSerialBridge extends EventEmitter {
         autoOpen: false,
       });
 
-      this.port.on('data', (chunk: Buffer) => this.onData(chunk));
-      this.port.on('error', (err) => this.onError(err));
+      this.port.on('data', (chunk: Buffer) => {
+        this.lastRxAt = Date.now();
+        this.onData(chunk);
+      });
+      this.port.on('error', (err) => {
+        this.lastSocketError = err.message;
+        this.onError(err);
+      });
       this.port.on('close', () => this.onClose());
 
       this.port.open((err) => {
@@ -1175,6 +1196,10 @@ export class MeshtasticSerialBridge extends EventEmitter {
           return;
         }
         this._connected = true;
+        // Reset flap-tracking state — same rationale as in connectTcp.
+        this.reconnectFailureStreak = 0;
+        this.lastSocketError = null;
+        this.lastRxAt = Date.now();
         console.log(`[MeshtasticSerial] Connected to ${portPath}`);
         this.addEvent('NODE_JOINED', 'local', `Serial connected to ${portPath}`);
         this.emit('connected', portPath);
@@ -1220,19 +1245,31 @@ export class MeshtasticSerialBridge extends EventEmitter {
 
       let resolved = false;
 
-      sock.on('data', (chunk: Buffer) => this.onData(chunk));
+      sock.on('data', (chunk: Buffer) => {
+        // Track the last receive timestamp so onClose can report how
+        // long the link was idle before the firmware kicked us — key
+        // signal for "is this a heartbeat timeout or a fresh kick?"
+        this.lastRxAt = Date.now();
+        this.onData(chunk);
+      });
       sock.on('error', (err) => {
+        this.lastSocketError = err.message;
         this.onError(err);
         if (!resolved) {
           resolved = true;
           reject(err);
         }
       });
-      sock.on('close', () => this.onClose());
+      sock.on('close', (hadError) => this.onClose(hadError));
 
       sock.connect(port, host, () => {
         resolved = true;
         this._connected = true;
+        // Reset flap-tracking state on successful connect — see
+        // scheduleReconnect / onClose for what these feed.
+        this.reconnectFailureStreak = 0;
+        this.lastSocketError = null;
+        this.lastRxAt = Date.now();
         console.log(`[MeshtasticSerial] Connected to tcp://${host}:${port}`);
         this.addEvent('NODE_JOINED', 'local', `TCP connected to ${host}:${port}`);
         this.emit('connected', `${host}:${port}`);
@@ -1594,21 +1631,46 @@ export class MeshtasticSerialBridge extends EventEmitter {
     this.addEvent('NODE_LOST', 'local', `Serial error: ${err.message}`);
   }
 
-  private onClose() {
-    console.log(`[MeshtasticSerial] Port closed`);
+  private onClose(hadError?: boolean) {
+    // v2.0 Beta 5 (flap fix #3): include diagnostic context so the
+    // operator can grep `[MeshtasticSerial] Port closed` and see WHY.
+    // - hadError: did the socket emit 'error' before close? If false,
+    //   the firmware did a clean FIN — almost always an idle timeout
+    //   or "another client connected" kick. If true, network-layer
+    //   problem (NAT timeout, host unreachable, broken pipe).
+    // - idleMs: how long since we last received a frame. Long gap +
+    //   clean close → firmware idle timeout (heartbeat should help).
+    //   Short gap + close → another client kicked us / firmware bug.
+    // - lastSocketError: the actual errno when hadError is true.
+    const idleMs = this.lastRxAt > 0 ? Date.now() - this.lastRxAt : -1;
+    const tgt = this.tcpEndpoint
+      ? `${this.tcpEndpoint.host}:${this.tcpEndpoint.port}`
+      : (this.portPath ?? '<unknown>');
+    const errPart = this.lastSocketError ? ` err="${this.lastSocketError}"` : '';
+    const idlePart = idleMs >= 0 ? ` idle=${idleMs}ms` : '';
+    console.log(`[MeshtasticSerial] Port closed target=${tgt} hadError=${hadError ?? '?'}${idlePart}${errPart}`);
     this._connected = false;
-    // v2.0 Beta 5 (flap fix #2): stop heartbeats so the timer doesn't
-    // keep trying to write into a closed socket between close + next
-    // connectTcp. The next connect() restarts a fresh interval.
     this.stopHeartbeat();
     this.emit('disconnected');
-    this.addEvent('NODE_LOST', 'local', 'Serial port closed');
+    this.addEvent('NODE_LOST', 'local', `Port closed target=${tgt}${idleMs >= 0 ? ` idle=${idleMs}ms` : ''}${this.lastSocketError ? ` err=${this.lastSocketError}` : ''}`);
     this.scheduleReconnect();
   }
 
   private scheduleReconnect() {
     if (this.reconnectTimer) return;
-    console.log(`[MeshtasticSerial] Will retry in 5s...`);
+    // v2.0 Beta 5 (flap fix #3): exponential backoff capped at 60s.
+    // 5s → 10s → 20s → 40s → 60s (cap). Resets to 0 on successful
+    // connect (see connectTcp / connect). Keeps a permanently-
+    // unreachable radio (EHOSTUNREACH because it's powered off or has
+    // a stale IP in its row) from burning a reconnect attempt every
+    // 5s forever — which we observed on installs with 3+ radios in
+    // the registry where one was rebooting / off.
+    this.reconnectFailureStreak++;
+    const delay = Math.min(60_000, 5_000 * Math.pow(2, this.reconnectFailureStreak - 1));
+    const target = this.tcpEndpoint
+      ? `${this.tcpEndpoint.host}:${this.tcpEndpoint.port}`
+      : (this.portPath ?? '<unknown>');
+    console.log(`[MeshtasticSerial] Will retry ${target} in ${Math.round(delay / 1000)}s (failure #${this.reconnectFailureStreak})`);
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
       try {
@@ -1618,9 +1680,10 @@ export class MeshtasticSerialBridge extends EventEmitter {
           await this.connect(this.portPath);
         }
       } catch {
-        // connect/connectTcp will schedule another retry on failure
+        // connect/connectTcp will schedule another retry via onClose
       }
-    }, 5000);
+    }, delay);
+    this.reconnectTimer.unref?.();
   }
 
   /**
@@ -3916,14 +3979,30 @@ export class MeshtasticSerialBridge extends EventEmitter {
   }
 
   /** Start the periodic heartbeat that keeps the firmware from closing
-   *  our idle TCP socket. Idempotent — re-arming clears the prior timer
-   *  so a reconnect doesn't stack handlers. */
+   *  our idle TCP socket.
+   *
+   *  v2.0 Beta 5 (flap fix #3): fire FIRST heartbeat aggressively (1s
+   *  after connect) and then every 3s. The earlier 5s-only cadence
+   *  meant radios that closed us within 3-5 seconds (observed via the
+   *  dashboard event stream — connect→drop cycles of ~3s) never even
+   *  saw the first heartbeat. Faster cadence costs maybe ~12 extra
+   *  bytes/minute on the wire — trivial vs. a flapping link.
+   *
+   *  Idempotent — re-arming clears the prior timer so a reconnect
+   *  doesn't stack handlers. */
   private startHeartbeat(): void {
     this.stopHeartbeat();
-    this.heartbeatTimer = setInterval(() => this.sendHeartbeat(), 5_000);
-    // .unref() so a hung connection during shutdown doesn't keep the
-    // process alive waiting for the next tick.
-    this.heartbeatTimer.unref?.();
+    // Kick the first one out at 1s so a quick firmware idle check
+    // (some forks close within 3-5s) still gets a beat before drop.
+    const first = setTimeout(() => {
+      this.sendHeartbeat();
+      this.heartbeatTimer = setInterval(() => this.sendHeartbeat(), 3_000);
+      this.heartbeatTimer.unref?.();
+    }, 1_000);
+    first.unref?.();
+    // Park the setTimeout handle in heartbeatTimer too so stopHeartbeat
+    // tears it down even if we never reached the setInterval step.
+    this.heartbeatTimer = first as unknown as ReturnType<typeof setInterval>;
   }
 
   /** Stop the heartbeat timer. Called from disconnect() and onClose()
