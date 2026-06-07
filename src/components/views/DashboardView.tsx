@@ -1419,7 +1419,25 @@ export function DashboardView({
                     }
                     icon={<Wifi size={20} className="text-brand-accent"/>}
                   />
-                  <StatCard label="Total Messages" value={`${messages.length}`} subValue="Last hour" icon={<MessageSquare size={20} className="text-blue-400"/>} />
+                  {/* v2.0 Beta 5 (fix): the card claimed "Last hour" but
+                      actually showed messages.length — the entire in-memory
+                      buffer (capped at 500). For an active mesh this could
+                      mean it reported "112" when the actual last-hour count
+                      was 4. Filter on timestamp here so the value matches
+                      the subtitle. */}
+                  {(() => {
+                    const HOUR_MS = 60 * 60 * 1000;
+                    const cutoff = Date.now() - HOUR_MS;
+                    const lastHour = messages.filter(m => (m.timestamp ?? 0) >= cutoff).length;
+                    return (
+                      <StatCard
+                        label="Total Messages"
+                        value={`${lastHour}`}
+                        subValue="Last hour"
+                        icon={<MessageSquare size={20} className="text-blue-400"/>}
+                      />
+                    );
+                  })()}
                   <StatCard label="Favorites" value={`${stats.favorites}`} subValue="Prioritized" icon={<Star size={20} className="text-yellow-400"/>} />
                 </div>
               )}
