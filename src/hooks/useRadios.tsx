@@ -10,6 +10,7 @@
  */
 import React from 'react';
 import { meshDataService } from '../services/meshDataService';
+import { useWorkspaces } from './useWorkspaces';
 import type { RadioRow } from '../types';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
@@ -84,6 +85,20 @@ export function RadiosProvider({ children }: { children: React.ReactNode }) {
       es.close();
     };
   }, [reload]);
+
+  // v2.0 Beta 5 Workspaces (fix): refire the radios reload whenever the
+  // current workspace changes. The /api/mesh/radios response is
+  // workspace-filtered (see visibleRadioIdsForUser); without this
+  // listener, the RadioBar kept showing the prior workspace's pills
+  // until an unrelated SSE event ('node', 'radios', or 'loraConfig')
+  // happened to fire and trigger a reload as a side effect. Symptom:
+  // switch Household → Mike's, RadioBar still shows 3bec until you
+  // wait for a node update. Now the switch itself drives the refresh.
+  const { currentWorkspaceId } = useWorkspaces();
+  React.useEffect(() => {
+    if (currentWorkspaceId == null) return;
+    reload();
+  }, [currentWorkspaceId, reload]);
 
   const value: RadiosState = {
     radios, defaultRadioId, connectionStates, selectedRadioId, setSelectedRadioId, reload,

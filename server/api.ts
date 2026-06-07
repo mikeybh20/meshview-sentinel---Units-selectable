@@ -4673,22 +4673,84 @@ app.post('/api/mesh/send', async (req, res) => {
   if (!text) return res.status(400).json({ error: 'Missing text' });
 
   const radioId = typeof radioIdRaw === 'string' && radioIdRaw ? radioIdRaw : null;
-  // Resolve the target bridge: explicit radio_id → that context's bridge;
-  // otherwise the singleton (= default radio).
-  const ctx = radioId ? bridgeManager.get(radioId) : null;
-  const bridge = ctx?.bridge ?? meshBridge;
-  if (radioId && !ctx) {
-    return res.status(404).json({ error: `radio "${radioId}" is not currently connected` });
+  const actor = req.user ? `${req.user.username}#${req.user.id}` : '<unauthenticated>';
+
+  // v2.0 Beta 5 Send (fix): three-tier bridge resolution. The original
+  // path 404'd on "radio not connected" whenever the operator's
+  // selected radio_id didn't have a live context — common when a
+  // radio's firmware short_name changes (e.g. WRTJ → 67A4 at the same
+  // IP), leaving the DB row keyed by the OLD name while BridgeManager
+  // tracks the live identity. Workspace operators in Mike's Radio Space
+  // (containing the orphan-named row) couldn't send because the
+  // endpoint refused on a name mismatch even though the same physical
+  // radio was online.
+  //
+  // Order:
+  //   1. Explicit radio_id → bridgeManager.get(radioId). If hit, use it.
+  //   2. Explicit radio_id missed: look up the row's target and find
+  //      any connected context with the same target. Handles the
+  //      rename / duplicate-row case.
+  //   3. No radio_id (or both above missed): workspace primary bridge
+  //      — what the rest of the workspace UI is reading from. Keeps
+  //      "send" coherent with what the user can SEE.
+  //   4. Final fallback: meshBridge (cold-boot path).
+  let bridge: MeshtasticSerialBridge | null = null;
+  let resolvedVia = '';
+  if (radioId) {
+    const ctx = bridgeManager.get(radioId);
+    if (ctx) {
+      bridge = ctx.bridge;
+      resolvedVia = `explicit radio_id="${radioId}"`;
+    } else {
+      // Look up the row's target and try to find any context serving the same target.
+      const row = meshDb().getRadio(radioId);
+      if (row) {
+        for (const otherCtx of bridgeManager.list()) {
+          const ot = otherCtx.bridge.getTransport();
+          const otherTarget = ot.mode === 'tcp' && ot.tcp
+            ? `${ot.tcp.host}:${ot.tcp.port}`
+            : ot.mode === 'serial' && ot.serial ? ot.serial.port : null;
+          if (otherTarget && otherTarget === row.target && otherCtx.bridge.connected) {
+            bridge = otherCtx.bridge;
+            resolvedVia = `target-match radio_id="${radioId}" → live="${otherCtx.radioId}" target="${row.target}"`;
+            break;
+          }
+        }
+      }
+    }
   }
-  if (!bridge.connected) return res.status(503).json({ error: 'Radio not connected' });
+  if (!bridge && req.user) {
+    const primary = workspacePrimaryBridge(req);
+    if (primary?.bridge.connected) {
+      bridge = primary.bridge;
+      resolvedVia = `workspace primary radio_id="${primary.radioId}"`;
+    }
+  }
+  if (!bridge) {
+    if (meshBridge.connected) {
+      bridge = meshBridge;
+      resolvedVia = 'meshBridge fallback';
+    }
+  }
+
+  if (!bridge || !bridge.connected) {
+    console.log(`[Send] REFUSED user=${actor} requested_radio_id="${radioId ?? '<none>'}" reason=no_connected_bridge`);
+    return res.status(503).json({
+      error: radioId
+        ? `radio "${radioId}" is not currently connected, and no workspace-primary bridge is available either`
+        : 'No connected radio in your workspace',
+    });
+  }
 
   try {
     const messageId = await bridge.sendMessage(text, to || '!ffffffff', channel ?? 0, {
       replyTo: typeof replyTo === 'number' ? replyTo : undefined,
       isReaction: !!isReaction,
     });
+    console.log(`[Send] OK user=${actor} via=${resolvedVia} to=${to || '!ffffffff'} channel=${channel ?? 0} bytes=${text.length}`);
     return res.json({ ok: true, messageId, radioId: bridge.getRadioId() });
   } catch (err: any) {
+    console.log(`[Send] FAILED user=${actor} via=${resolvedVia} reason="${err.message}"`);
     return res.status(500).json({ error: err.message });
   }
 });
