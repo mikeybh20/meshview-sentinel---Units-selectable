@@ -1863,45 +1863,62 @@ export class MeshtasticSerialBridge extends EventEmitter {
 
             // Read the local module configs once we know the local node id.
             //
-            // v2.0 Beta 5 (flap fix): these used to all fire inside a
-            // single setTimeout, which blasted ~12 admin ToRadio frames
-            // at the radio in <5ms. ESP32-based Meshtastic firmware
-            // has a small TCP receive buffer and a slower admin
-            // dispatcher than that — under the flood, the radio
-            // dropped the TCP socket. Our 5s reconnect loop then
-            // reconnected, re-blasted the 12 reads, the radio dropped
-            // again, repeat. That's the "primary radio 3bec is
-            // continuously disconnecting" symptom.
+            // v2.0 Beta 5 (flap fix #4): GATE each admin read on whether
+            // we already have that module's config cached. The firmware
+            // streams every ModuleConfig variant in response to the
+            // initial want_config_id, populating localModuleConfig.X
+            // long BEFORE this post-identity block runs — so all 12
+            // admin reads here were re-requesting data we already had,
+            // doubling the boot-time TCP traffic and overwhelming the
+            // firmware's admin dispatcher. Symptom: TCP cleanly closed
+            // ~5 seconds after each connect with idle gaps of 1-2s —
+            // the firmware actively bailing under the duplicate-request
+            // load, NOT a heartbeat-style idle kick.
             //
-            // Staggering the reads at 250ms apart gives the firmware
-            // time to dispatch each admin packet, build the response,
-            // and clear its buffer before the next one arrives. Total
-            // sweep time goes from ~5ms to ~3s — well worth it for a
-            // link that actually stays up.
-            const moduleReads: Array<() => Promise<void>> = [
-              () => this.requestNeighborInfoConfig(),
-              () => this.requestRangeTestConfig(),
-              () => this.requestTelemetryConfig(),
-              () => this.requestStoreForwardConfig(),
-              () => this.requestExternalNotificationConfig(),
-              () => this.requestMqttConfig(),
-              () => this.requestDetectionSensorConfig(),
-              () => this.requestAudioConfig(),
-              () => this.requestSerialConfig(),
-              () => this.requestAmbientLightingConfig(),
-              () => this.requestPaxcounterConfig(),
-              () => this.requestRemoteHardwareConfig(),
+            // The pre-existing stagger (250ms apart) is kept as a
+            // safety net for any reads that DO need to fire (older
+            // firmware that omits a variant from want_config_id, or
+            // a deliberate refresh after a SET commit). Total sweep
+            // tops out at ~3s if every read is needed, ~0ms if the
+            // firmware already gave us everything.
+            //
+            // Filtering is keyed on `lastReadAt` rather than truthiness
+            // so a config that exists but is stale (older than 1 hour)
+            // still gets refreshed — useful for very long uptime where
+            // the operator might have changed something via another
+            // client.
+            const STALE_MS = 60 * 60 * 1000;
+            const now = Date.now();
+            const fresh = (entry: { lastReadAt?: number } | undefined): boolean => {
+              if (!entry) return false;
+              const ts = entry.lastReadAt ?? 0;
+              return ts > 0 && (now - ts) < STALE_MS;
+            };
+            const moduleReads: Array<{ key: string; have: boolean; read: () => Promise<void> }> = [
+              { key: 'neighborInfo',         have: fresh(this.localModuleConfig.neighborInfo),         read: () => this.requestNeighborInfoConfig() },
+              { key: 'rangeTest',            have: fresh(this.localModuleConfig.rangeTest),            read: () => this.requestRangeTestConfig() },
+              { key: 'telemetry',            have: fresh(this.localModuleConfig.telemetry),            read: () => this.requestTelemetryConfig() },
+              { key: 'storeForward',         have: fresh(this.localModuleConfig.storeForward),         read: () => this.requestStoreForwardConfig() },
+              { key: 'externalNotification', have: fresh(this.localModuleConfig.externalNotification), read: () => this.requestExternalNotificationConfig() },
+              { key: 'mqtt',                 have: fresh(this.localModuleConfig.mqtt),                 read: () => this.requestMqttConfig() },
+              { key: 'detectionSensor',      have: fresh(this.localModuleConfig.detectionSensor),      read: () => this.requestDetectionSensorConfig() },
+              { key: 'audio',                have: fresh(this.localModuleConfig.audio),                read: () => this.requestAudioConfig() },
+              { key: 'serial',               have: fresh(this.localModuleConfig.serial),               read: () => this.requestSerialConfig() },
+              { key: 'ambientLighting',      have: fresh(this.localModuleConfig.ambientLighting),      read: () => this.requestAmbientLightingConfig() },
+              { key: 'paxcounter',           have: fresh(this.localModuleConfig.paxcounter),           read: () => this.requestPaxcounterConfig() },
+              { key: 'remoteHardware',       have: fresh(this.localModuleConfig.remoteHardware),       read: () => this.requestRemoteHardwareConfig() },
             ];
+            const needed = moduleReads.filter(m => !m.have);
+            const skippedCount = moduleReads.length - needed.length;
+            if (skippedCount > 0) {
+              console.log(`[MeshtasticSerial] post-identity admin reads: ${needed.length} needed, ${skippedCount} already have via want_config_id stream`);
+            }
             const READ_STAGGER_MS = 250;
             const READ_START_DELAY_MS = 500;
-            moduleReads.forEach((read, i) => {
+            needed.forEach((m, i) => {
               setTimeout(() => {
-                // Bail out if the link dropped before this scheduled
-                // tick fired — otherwise we'd queue admin packets at
-                // a closed/reconnecting bridge and either error out or
-                // pollute the next connection's identity window.
                 if (!this.isLinkOpen()) return;
-                read().catch(() => { /* best-effort */ });
+                m.read().catch(() => { /* best-effort */ });
               }, READ_START_DELAY_MS + i * READ_STAGGER_MS);
             });
           }
