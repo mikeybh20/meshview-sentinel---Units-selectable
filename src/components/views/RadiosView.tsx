@@ -456,8 +456,25 @@ export function RadiosView() {
   const [statusRadioId, setStatusRadioId] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
 
-  const reload = React.useCallback(async () => {
-    setLoading(true);
+  // v2.0 Beta 5 (fix): split into a "loud" reload (toggles the Loading…
+  // spinner — used for first mount only) and a "quiet" reload (swaps the
+  // data in place — used by SSE-driven refreshes).
+  //
+  // Background: the previous single-reload path called setLoading(true)
+  // on every SSE event. With the radio flap loop we just fixed in
+  // meshtasticSerial.ts, `node` SSE events fired many times per second,
+  // each one ran reload, flipped loading to true, blanked the radio
+  // list to a spinner, then back. Users opening the Add Radio form
+  // couldn't focus a field for long enough to type because the page
+  // was thrashing under them. The Add Radio form's state is preserved
+  // across re-renders, but the visual flicker made it feel as though
+  // their typing was being lost.
+  //
+  // The 'node' SSE event is also unrelated to the radios list — it
+  // fires for every mesh node update (thousands per hour on a busy
+  // network). Per-radio metadata only changes on 'loraConfig' or
+  // 'radios' events, so we no longer subscribe to 'node' at all.
+  const reloadCore = React.useCallback(async () => {
     const data = await meshDataService.listRadios();
     if (data) {
       setRadios(data.radios);
@@ -476,22 +493,31 @@ export function RadiosView() {
         arch:       info.arch,
       });
     }
-    setLoading(false);
   }, [sysInfo]);
 
-  React.useEffect(() => { reload(); }, [reload]);
+  const reload = React.useCallback(async () => {
+    setLoading(true);
+    await reloadCore();
+    setLoading(false);
+  }, [reloadCore]);
+
+  React.useEffect(() => { reload(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
 
   React.useEffect(() => {
     const es = new EventSource(`${API_BASE}/api/mesh/stream`);
-    const handler = () => { reload(); };
+    // Quiet reload — no loading-spinner flash. Subscribes ONLY to events
+    // that actually change radio metadata; 'node' updates are excluded
+    // because they fire per-mesh-node-update and have nothing to do
+    // with which radios are registered or their LoRa config.
+    const handler = () => { reloadCore(); };
     es.addEventListener('loraConfig', handler);
-    es.addEventListener('node', handler);
+    es.addEventListener('radios', handler);
     return () => {
       es.removeEventListener('loraConfig', handler);
-      es.removeEventListener('node', handler);
+      es.removeEventListener('radios', handler);
       es.close();
     };
-  }, [reload]);
+  }, [reloadCore]);
 
   const handleDelete = async (id: string) => {
     if (!confirm(`Delete radio "${id}"? This only removes the metadata row; the firmware on the radio itself is not touched.`)) return;
