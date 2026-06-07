@@ -868,11 +868,21 @@ function RadioRowCard({
           >
             {isEditing ? <Check size={14} /> : <Pencil size={14} />}
           </button>
-          {!isSingleton && (
+          {/* v2.0 Beta 5 Radios (fix): allow deleting a singleton row when
+              it isn't currently connected. The previous "never delete the
+              singleton" rule left a stale auto-registered row (radio
+              that's been physically renamed / replaced) un-deletable —
+              the user could see it stuck in the list with no controls.
+              Gate the delete on "actively serving" — singleton + connected
+              — instead of just "singleton". A disconnected singleton has
+              no bridge to break by removing the row. */}
+          {!(isSingleton && isConnected) && (
             <button
               onClick={onDelete}
               className="p-1 text-red-400 hover:text-red-300 hover:bg-red-500/10 rounded"
-              title="Delete radio"
+              title={isSingleton
+                ? 'Delete this radio. It is currently marked as primary but disconnected — the next live radio identity will auto-claim primary.'
+                : 'Delete radio'}
             >
               <Trash2 size={12} />
             </button>

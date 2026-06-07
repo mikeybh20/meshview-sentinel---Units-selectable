@@ -228,6 +228,29 @@ class BridgeManager extends EventEmitter {
     return this.defaultRadioId;
   }
 
+  /**
+   * v2.0 Beta 5 Radios (fix): wipe the cached default so a subsequent
+   * identity exchange (next time the singleton bridge receives
+   * MyNodeInfo) can claim primary freely.
+   *
+   * Called from the radios DELETE endpoint when the operator deletes a
+   * DISCONNECTED row that happens to be the cached default. Without
+   * this, defaultRadioId would point at a row that no longer exists in
+   * the DB, and the next auto-register would refuse to write because
+   * `defaultRegistered` is still true. Result: silently-dead default
+   * pointer, no live primary, surprises operator on the next reconnect.
+   *
+   * Safe to call when there's no live singleton: tryAutoRegisterDefault
+   * is idempotent and will re-arm next time it sees an identity packet.
+   */
+  clearDefault(): void {
+    if (this.defaultRadioId) {
+      console.log(`[BridgeManager] clearing cached default radio_id="${this.defaultRadioId}"`);
+    }
+    this.defaultRadioId = null;
+    this.defaultRegistered = false;
+  }
+
   list(): RadioContext[] {
     return Array.from(this.contexts.values());
   }

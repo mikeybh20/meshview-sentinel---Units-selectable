@@ -1436,9 +1436,26 @@ app.delete('/api/mesh/radios/:radioId', (req, res) => {
     console.log(`[Radios] DELETE radio_id="${radioId}" by user=${actor} result=NOT_FOUND`);
     return res.status(404).json({ error: 'radio not found' });
   }
+  // v2.0 Beta 5 Radios (fix): only refuse deletion when the singleton
+  // bridge is ACTIVELY CONNECTED to this radio. A disconnected default
+  // (e.g. an auto-registered row from a radio that's been renamed or
+  // unplugged) should be deletable so stale registry entries can be
+  // cleaned up. The "ActivelyConnected singleton" check protects the
+  // live transport from being yanked out from under the running app.
   if (radioId === bridgeManager.getDefaultRadioId()) {
-    console.log(`[Radios] DELETE radio_id="${radioId}" by user=${actor} result=REFUSED reason=singleton_held`);
-    return res.status(409).json({ error: 'cannot delete the currently auto-connected singleton radio. Use the Promote button on a different radio first to free this one up.' });
+    const defaultCtx = bridgeManager.getDefault();
+    if (defaultCtx?.bridge.connected) {
+      console.log(`[Radios] DELETE radio_id="${radioId}" by user=${actor} result=REFUSED reason=singleton_active`);
+      return res.status(409).json({ error: 'cannot delete the currently auto-connected primary radio while it is connected. Use Make Primary on a different radio first, or disconnect this one.' });
+    }
+    // Disconnected singleton — proceed, but log so the operator can
+    // grep [Radios] for "stale-default" cleanups if a duplicate row
+    // appears later (firmware reconnecting with the same identity).
+    console.log(`[Radios] DELETE radio_id="${radioId}" by user=${actor} note=stale_default_cleanup`);
+    // Clear BridgeManager's cached default so a subsequent live
+    // identity exchange can claim primary freely instead of trying
+    // to reconnect to a row that no longer exists.
+    bridgeManager.clearDefault();
   }
   const ok = db.deleteRadio(radioId);
   if (!ok) {
