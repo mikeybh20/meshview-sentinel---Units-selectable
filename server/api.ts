@@ -491,6 +491,22 @@ function workspacePrimaryBridge(req: express.Request): { bridge: MeshtasticSeria
   const visible = visibleRadioIdsForUser(req);
   if (visible.size === 0) return null;
 
+  // 0. v2.0 Beta 5 (per-workspace primary): operator's explicit
+  // choice. Stored on workspaces.primary_radio_id. Beats every other
+  // heuristic when set — that's the whole point of the explicit
+  // choice. We still validate the stored value is in the workspace
+  // (defensive: if the radio was moved to a different workspace
+  // after being picked here, fall through rather than route to a
+  // bridge the user can no longer see).
+  const wsId = currentWorkspaceIdForUser(req);
+  if (wsId != null) {
+    const ws = meshDb().getWorkspace(wsId);
+    if (ws?.primaryRadioId && visible.has(ws.primaryRadioId)) {
+      const ctx = bridgeManager.get(ws.primaryRadioId);
+      if (ctx) return { bridge: ctx.bridge, radioId: ws.primaryRadioId };
+    }
+  }
+
   // 1. Install default if it's in the workspace
   const defaultRadioId = bridgeManager.getDefaultRadioId();
   if (defaultRadioId && visible.has(defaultRadioId)) {
@@ -688,6 +704,49 @@ app.post('/api/workspaces/:id/radios/:radioId', requireAdmin, (req, res) => {
   if (!meshDb().getRadio(req.params.radioId)) return res.status(404).json({ error: 'radio not found' });
   meshDb().setRadioWorkspace(req.params.radioId, id);
   return res.json({ ok: true });
+});
+
+/**
+ * v2.0 Beta 5 Workspaces — explicit per-workspace primary radio.
+ *
+ * Body: { radio_id: string | null }
+ *   - string  : sets this radio as the workspace's primary. Validates
+ *               the radio exists AND is currently assigned to this
+ *               workspace (refuse "set primary of Mike's to 3bec"
+ *               when 3bec lives in Household).
+ *   - null    : clears the explicit choice; workspacePrimaryBridge()
+ *               falls back to the heuristic.
+ *
+ * The choice is read by workspacePrimaryBridge() as step 0 — beats
+ * the install-default check. So an operator can have 3bec be install-
+ * primary AND also be Household's workspace-primary, while WRTJ is
+ * Mike's workspace-primary, without the install primary "leaking"
+ * across workspace views.
+ */
+app.post('/api/workspaces/:id/primary-radio', requireAdmin, (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'id must be an integer' });
+  const ws = meshDb().getWorkspace(id);
+  if (!ws) return res.status(404).json({ error: 'workspace not found' });
+  const actor = req.user ? `${req.user.username}#${req.user.id}` : '<unauthenticated>';
+
+  const raw = req.body?.radio_id;
+  const radioId = raw === null ? null : (typeof raw === 'string' && raw ? raw : undefined);
+  if (radioId === undefined) {
+    return res.status(400).json({ error: 'radio_id required (string or explicit null to clear)' });
+  }
+  if (radioId !== null) {
+    const row = meshDb().getRadio(radioId);
+    if (!row) return res.status(404).json({ error: `radio "${radioId}" not found` });
+    if (row.workspace_id !== id) {
+      return res.status(400).json({
+        error: `radio "${radioId}" is in a different workspace — assign it to this workspace first via Settings → Workspaces`,
+      });
+    }
+  }
+  meshDb().setWorkspacePrimaryRadio(id, radioId);
+  console.log(`[Workspaces] PRIMARY_RADIO workspace_id=${id} ("${ws.name}") set to "${radioId ?? '<cleared>'}" by user=${actor}`);
+  return res.json({ ok: true, workspace: meshDb().getWorkspace(id) });
 });
 
 /** GET /api/workspaces/:id — single workspace + members + assigned
@@ -1234,15 +1293,22 @@ app.get('/api/mesh/radios', (req, res) => {
         const visible = visibleRadioIdsForUser(req);
         return all.filter(r => visible.has(r.radio_id));
       })();
-  // Annotate each row with its workspace name so the Radios page can
-  // label "(in workspace X)" on rows the operator isn't currently
-  // viewing through. Saves a second roundtrip to fetch workspaces.
-  const wsById = new Map(meshDb().listWorkspaces().map(w => [w.id, w.name]));
+  // Annotate each row with its workspace name + whether it's marked as
+  // that workspace's explicit primary radio. The UI shows a badge on
+  // workspace-primary rows so an admin sees "WRTJ is Mike's primary,
+  // 3bec is Household's primary" at a glance without expanding each
+  // workspace's row in Settings → Workspaces.
+  const allWs = meshDb().listWorkspaces();
+  const wsById = new Map(allWs.map(w => [w.id, w]));
   return res.json({
-    radios: rows.map(r => ({
-      ...r,
-      workspace_name: r.workspace_id ? (wsById.get(r.workspace_id) ?? null) : null,
-    })),
+    radios: rows.map(r => {
+      const ws = r.workspace_id ? wsById.get(r.workspace_id) : null;
+      return {
+        ...r,
+        workspace_name: ws?.name ?? null,
+        is_workspace_primary: !!ws && ws.primaryRadioId === r.radio_id,
+      };
+    }),
     defaultRadioId: bridgeManager.getDefaultRadioId(),
     palette: RADIO_COLOR_PALETTE,
     currentWorkspaceId: currentWorkspaceIdForUser(req),
@@ -1456,6 +1522,14 @@ app.delete('/api/mesh/radios/:radioId', (req, res) => {
     // identity exchange can claim primary freely instead of trying
     // to reconnect to a row that no longer exists.
     bridgeManager.clearDefault();
+  }
+  // v2.0 Beta 5 (per-workspace primary): clear any workspaces.primary_radio_id
+  // that points at this radio before removing the row, so we don't leave
+  // dangling pointers. workspacePrimaryBridge will fall back to the
+  // heuristic for any workspace that just lost its explicit primary.
+  const clearedPrimaries = db.clearWorkspacePrimaryForRadio(radioId);
+  if (clearedPrimaries > 0) {
+    console.log(`[Radios] DELETE radio_id="${radioId}" by user=${actor} note=cleared_workspace_primary_in=${clearedPrimaries}_workspace(s)`);
   }
   const ok = db.deleteRadio(radioId);
   if (!ok) {

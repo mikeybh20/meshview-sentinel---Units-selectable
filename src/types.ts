@@ -495,6 +495,17 @@ export interface RadioRow {
    *  command index. Lets an operator dedicate one radio to BBS while
    *  others stay general chat nodes. */
   bbs_only: number;
+  /** v2.0 Beta 5 Workspaces: which workspace this radio belongs to.
+   *  Null only for very brief windows between auto-register and the
+   *  bootstrap migration assigning it to Household. */
+  workspace_id?: number | null;
+  /** v2.0 Beta 5 Workspaces (response annotation): human-readable
+   *  workspace name, surfaced by /api/mesh/radios for UI display. Not
+   *  stored on the row itself. */
+  workspace_name?: string | null;
+  /** v2.0 Beta 5 (per-workspace primary): true when this radio is the
+   *  explicit primary for its workspace. Surfaced by /api/mesh/radios. */
+  is_workspace_primary?: boolean;
   created_at: number;
   updated_at: number;
 }

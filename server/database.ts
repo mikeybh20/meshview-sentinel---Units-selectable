@@ -459,6 +459,16 @@ export class MeshDatabase {
         }
       }
     };
+    // v2.0 Beta 5 Workspaces (per-workspace primary): explicit choice of
+    // which radio is "the primary" for this workspace, used by
+    // workspacePrimaryBridge() to override the implicit heuristic.
+    // NULL means fall back to the heuristic (install default in this
+    // workspace → first connected → first assigned).
+    //
+    // Foreign-key behavior on radio deletion: SET NULL via app-layer
+    // because SQLite can't add FKs to existing tables. The radios
+    // DELETE endpoint runs a clearing UPDATE.
+    addColumnIfMissing('workspaces', 'primary_radio_id TEXT');
     addColumnIfMissing('messages', 'status TEXT');
     addColumnIfMissing('messages', 'error_code INTEGER');
     addColumnIfMissing('messages', 'is_own INTEGER NOT NULL DEFAULT 0');
@@ -2585,6 +2595,10 @@ export class MeshDatabase {
     id: number; name: string; slug: string;
     ownerUserId: number | null; createdAt: number;
     memberCount: number; radioCount: number;
+    /** v2.0 Beta 5 (per-workspace primary): operator's explicit pick of
+     *  the workspace's primary radio. NULL when the heuristic in
+     *  workspacePrimaryBridge() should still apply. */
+    primaryRadioId: string | null;
     /** True only when forUserId was supplied — useful for "all
      *  workspaces I'm a member of" queries. */
     isMember?: boolean;
@@ -2595,6 +2609,7 @@ export class MeshDatabase {
           w.id, w.name, w.slug,
           w.owner_user_id AS ownerUserId,
           w.created_at AS createdAt,
+          w.primary_radio_id AS primaryRadioId,
           (SELECT COUNT(*) FROM workspace_members m WHERE m.workspace_id = w.id) AS memberCount,
           (SELECT COUNT(*) FROM radios r WHERE r.workspace_id = w.id) AS radioCount
         FROM workspaces w
@@ -2606,6 +2621,7 @@ export class MeshDatabase {
         w.id, w.name, w.slug,
         w.owner_user_id AS ownerUserId,
         w.created_at AS createdAt,
+        w.primary_radio_id AS primaryRadioId,
         (SELECT COUNT(*) FROM workspace_members m WHERE m.workspace_id = w.id) AS memberCount,
         (SELECT COUNT(*) FROM radios r WHERE r.workspace_id = w.id) AS radioCount,
         1 AS isMember
@@ -2615,12 +2631,36 @@ export class MeshDatabase {
     `).all(opts.forUserId) as any;
   }
 
-  getWorkspace(id: number): { id: number; name: string; slug: string; ownerUserId: number | null; createdAt: number } | null {
+  getWorkspace(id: number): { id: number; name: string; slug: string; ownerUserId: number | null; createdAt: number; primaryRadioId: string | null } | null {
     const row = this.db.prepare(`
-      SELECT id, name, slug, owner_user_id AS ownerUserId, created_at AS createdAt
+      SELECT id, name, slug, owner_user_id AS ownerUserId, created_at AS createdAt,
+             primary_radio_id AS primaryRadioId
       FROM workspaces WHERE id = ?
     `).get(id) as any;
     return row ?? null;
+  }
+
+  /** v2.0 Beta 5 Workspaces: set or clear a workspace's primary radio.
+   *  Caller validates that radioId (when non-null) belongs to the
+   *  workspace; this helper just runs the UPDATE. Returns true on a
+   *  row change. */
+  setWorkspacePrimaryRadio(workspaceId: number, radioId: string | null): boolean {
+    const r = this.db.prepare(
+      `UPDATE workspaces SET primary_radio_id = ? WHERE id = ?`
+    ).run(radioId, workspaceId);
+    return r.changes > 0;
+  }
+
+  /** v2.0 Beta 5 Workspaces: clear the primary_radio_id pointer on
+   *  every workspace that currently references the given radio. Called
+   *  from the radios DELETE endpoint so deleted radios don't leave a
+   *  dangling primary_radio_id pointer. Returns number of rows
+   *  cleared. */
+  clearWorkspacePrimaryForRadio(radioId: string): number {
+    const r = this.db.prepare(
+      `UPDATE workspaces SET primary_radio_id = NULL WHERE primary_radio_id = ?`
+    ).run(radioId);
+    return Number(r.changes ?? 0);
   }
 
   createWorkspace(input: { name: string; slug: string; ownerUserId: number | null }): number {

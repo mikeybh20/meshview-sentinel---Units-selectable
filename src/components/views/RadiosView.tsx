@@ -16,7 +16,7 @@
 import React from 'react';
 import {
   Star, Plus, Trash2, AlertCircle, Loader2, RefreshCw, HelpCircle, X, Check, Copy,
-  Pencil, Plug, Unplug, Activity,
+  Pencil, Plug, Unplug, Activity, Layers as LayersIcon,
 } from 'lucide-react';
 
 import { meshDataService } from '../../services/meshDataService';
@@ -565,6 +565,26 @@ export function RadiosView() {
     reload();
   };
 
+  /** v2.0 Beta 5 (per-workspace primary): mark this radio as the
+   *  primary for its workspace. Distinct from handlePromote — that
+   *  hot-swaps the install singleton, this one sets a workspace
+   *  routing preference without touching transport state. */
+  const handleSetWorkspacePrimary = async (r: RadioRow) => {
+    if (r.workspace_id == null) {
+      setError(`"${r.radio_id}" is not assigned to a workspace — assign it first via Settings → Workspaces.`);
+      return;
+    }
+    setError(null);
+    setBusyRadioId(r.radio_id);
+    const result = await meshDataService.setWorkspacePrimaryRadio(r.workspace_id, r.radio_id);
+    setBusyRadioId(null);
+    if (!result.ok) {
+      setError(result.error || 'failed to set workspace primary');
+      return;
+    }
+    reload();
+  };
+
   return (
     <div className="h-full overflow-y-auto">
       <div className="max-w-4xl mx-auto p-6 space-y-4">
@@ -638,6 +658,7 @@ export function RadiosView() {
                 onConnect={() => handleConnect(r.radio_id)}
                 onDisconnect={() => handleDisconnect(r.radio_id)}
                 onPromote={() => handlePromote(r.radio_id)}
+                onSetWorkspacePrimary={() => handleSetWorkspacePrimary(r)}
                 onShowStatus={() => setStatusRadioId(r.radio_id)}
                 onChanged={reload}
               />
@@ -665,7 +686,7 @@ export function RadiosView() {
 }
 
 function RadioRowCard({
-  row, isSingleton, isConnected, health, isEditing, busy, onEdit, onDelete, onConnect, onDisconnect, onPromote, onShowStatus, onChanged,
+  row, isSingleton, isConnected, health, isEditing, busy, onEdit, onDelete, onConnect, onDisconnect, onPromote, onSetWorkspacePrimary, onShowStatus, onChanged,
 }: {
   row: RadioRow;
   /** This radio is held by the auto-discovered singleton bridge. Gates the star + suppresses Connect/Disconnect/Delete since the singleton can't be torn down from this panel. */
@@ -689,6 +710,9 @@ function RadioRowCard({
   /** Hot-swap this radio into the singleton role. */
   onPromote: () => void;
   onShowStatus: () => void;
+  /** v2.0 Beta 5 (per-workspace primary): mark this radio as the
+   *  primary for the workspace it lives in. */
+  onSetWorkspacePrimary: () => void;
   onChanged: () => void;
 }) {
   return (
@@ -732,6 +756,18 @@ function RadioRowCard({
                   title={`This radio belongs to the ${(row as any).workspace_name} workspace. Move it via Settings → Workspaces if it should live elsewhere.`}
                 >
                   ws: {(row as any).workspace_name}
+                </span>
+              )}
+              {/* v2.0 Beta 5 (per-workspace primary): show the badge when
+                  this radio is the explicit primary for its workspace.
+                  Distinct from the install ★ (handled elsewhere): this
+                  controls workspace routing, not the singleton bridge. */}
+              {(row as any).is_workspace_primary && (
+                <span
+                  className="text-[9px] font-bold uppercase tracking-widest px-1.5 py-0.5 rounded border border-sky-500/40 text-sky-300 bg-sky-500/10"
+                  title={`Primary radio for the ${(row as any).workspace_name} workspace. Status, channels, and outbound sends in that workspace route through this radio.`}
+                >
+                  ws-primary
                 </span>
               )}
             </div>
@@ -851,9 +887,31 @@ function RadioRowCard({
               onClick={onPromote}
               disabled={busy}
               className="text-amber-400 hover:bg-amber-400/15 disabled:opacity-40 p-2 rounded"
-              title="Make this radio the primary — hot-swaps which radio Sentinel's singleton bridge serves"
+              title="Make this radio the install primary — hot-swaps which radio Sentinel's singleton bridge serves"
             >
               {busy ? <Loader2 size={14} className="animate-spin" /> : <Star size={14} />}
+            </button>
+          )}
+          {/* v2.0 Beta 5 (per-workspace primary): mark this radio as
+              the primary for the workspace it sits in. Only meaningful
+              when the radio is assigned to a workspace AND isn't
+              already the primary. Disabled (but visible) when it's
+              already primary so the operator sees it's chosen. */}
+          {(row as any).workspace_id != null && (
+            <button
+              onClick={onSetWorkspacePrimary}
+              disabled={busy || !!(row as any).is_workspace_primary}
+              className={cn(
+                "p-2 rounded transition-colors",
+                (row as any).is_workspace_primary
+                  ? "text-sky-300 bg-sky-500/10 cursor-default"
+                  : "text-sky-400 hover:bg-sky-400/15 disabled:opacity-40"
+              )}
+              title={(row as any).is_workspace_primary
+                ? `Workspace primary for ${(row as any).workspace_name}. Status, channels, and sends in that workspace route through this radio.`
+                : `Set as workspace primary for ${(row as any).workspace_name}. Routes dashboard status + sends through this radio when that workspace is active.`}
+            >
+              <LayersIcon size={14} />
             </button>
           )}
           <button

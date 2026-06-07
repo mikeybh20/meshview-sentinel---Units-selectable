@@ -759,6 +759,25 @@ export class MeshDataService {
     }
   }
 
+  /** v2.0 Beta 5 Workspaces (per-workspace primary): set or clear a
+   *  workspace's primary radio. Pass null to clear and fall back to
+   *  the workspacePrimaryBridge() heuristic. */
+  async setWorkspacePrimaryRadio(workspaceId: number, radioId: string | null): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/workspaces/${workspaceId}/primary-radio`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ radio_id: radioId }),
+      });
+      const b = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: b.error || `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'Network error' };
+    }
+  }
+
   // -------------------------------------------------------------------
   // v2.0 Beta 5 Phase 3: user management (admin-only)
   // -------------------------------------------------------------------
