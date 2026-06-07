@@ -475,7 +475,13 @@ export function RadiosView() {
   // network). Per-radio metadata only changes on 'loraConfig' or
   // 'radios' events, so we no longer subscribe to 'node' at all.
   const reloadCore = React.useCallback(async () => {
-    const data = await meshDataService.listRadios();
+    // Settings → Radios is the cross-workspace management page —
+    // pass allWorkspaces:true so an admin sees every radio in the
+    // registry, including ones in workspaces they're not currently
+    // viewing. Otherwise auto-registered or backup-restored radios
+    // silently disappear from the list and Add Radio refuses them
+    // with a confusing "already exists" error.
+    const data = await meshDataService.listRadios({ allWorkspaces: true });
     if (data) {
       setRadios(data.radios);
       setDefaultRadioId(data.defaultRadioId);
@@ -707,6 +713,19 @@ function RadioRowCard({
               >
                 {isConnected ? '● connected' : '○ disconnected'}
               </span>
+              {/* v2.0 Beta 5 Workspaces (fix): show workspace label so an
+                  admin sees at a glance which workspace each radio is
+                  scoped to — answers "why don't I see this on the
+                  dashboard?" without making them dig through Settings →
+                  Workspaces. Hidden for unassigned (rare) radios. */}
+              {(row as any).workspace_name && (
+                <span
+                  className="text-[9px] font-bold uppercase tracking-widest px-1.5 py-0.5 rounded border border-brand-line/60 text-brand-muted"
+                  title={`This radio belongs to the ${(row as any).workspace_name} workspace. Move it via Settings → Workspaces if it should live elsewhere.`}
+                >
+                  ws: {(row as any).workspace_name}
+                </span>
+              )}
             </div>
             <p className="text-[11px] text-brand-muted truncate">
               {row.long_name}

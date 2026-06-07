@@ -828,9 +828,18 @@ export class MeshDataService {
   // v2.0 multi-radio
   // -------------------------------------------------------------------
 
-  async listRadios(): Promise<{ radios: any[]; defaultRadioId: string | null; palette: string[] } | null> {
+  async listRadios(opts?: { allWorkspaces?: boolean }): Promise<{ radios: any[]; defaultRadioId: string | null; palette: string[]; scopedToAll?: boolean } | null> {
+    // v2.0 Beta 5 Workspaces (fix): admin pages (Settings → Radios)
+    // pass allWorkspaces=true so the management list shows every
+    // radio in the registry, not just the ones in the active
+    // workspace. Without this, a radio auto-registered into a
+    // workspace the admin isn't currently viewing is invisible —
+    // they try to add it, get "already exists", and have no list
+    // entry to find it in. The Dashboard's RadioBar still uses the
+    // default (workspace-filtered) form so the pill bar stays scoped.
+    const qs = opts?.allWorkspaces ? '?scope=all' : '';
     try {
-      const res = await fetch(`${API_BASE}/api/mesh/radios`);
+      const res = await fetch(`${API_BASE}/api/mesh/radios${qs}`);
       if (!res.ok) return null;
       return await res.json();
     } catch { return null; }

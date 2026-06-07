@@ -1218,19 +1218,35 @@ function nextAvailableColor(existing: string[]): string {
 const SHORT_NAME_RE = /^[A-Za-z0-9_!-]{1,4}$/;
 
 app.get('/api/mesh/radios', (req, res) => {
-  // v2.0 Beta 5 Workspaces: filter to the user's current workspace.
-  // Admins see only their current workspace's radios in the dashboard
-  // too — they can switch workspaces from the top bar, or use the
-  // Settings → Workspaces panel for cross-workspace administration.
-  // Empty visibleSet (user not in any workspace, edge case) returns
-  // an empty list, which the UI handles gracefully.
-  const visible = visibleRadioIdsForUser(req);
-  const rows = meshDb().listRadios().filter(r => visible.has(r.radio_id));
+  // v2.0 Beta 5 Workspaces: dashboard uses workspace-filtered list
+  // (RadioBar pills, message-send scope). The Radios MANAGEMENT page
+  // needs to see everything — otherwise a radio auto-registered into
+  // Household is invisible to an admin who's currently viewing Mike's
+  // Radio Space, so they try to re-add it and get "already exists"
+  // with no list to find it in. Admins pass ?scope=all from the
+  // Settings → Radios page to bypass the filter.
+  const scope = typeof req.query?.scope === 'string' ? req.query.scope : null;
+  const showAll = scope === 'all' && req.user?.role === 'admin';
+  const all = meshDb().listRadios();
+  const rows = showAll
+    ? all
+    : (() => {
+        const visible = visibleRadioIdsForUser(req);
+        return all.filter(r => visible.has(r.radio_id));
+      })();
+  // Annotate each row with its workspace name so the Radios page can
+  // label "(in workspace X)" on rows the operator isn't currently
+  // viewing through. Saves a second roundtrip to fetch workspaces.
+  const wsById = new Map(meshDb().listWorkspaces().map(w => [w.id, w.name]));
   return res.json({
-    radios: rows,
+    radios: rows.map(r => ({
+      ...r,
+      workspace_name: r.workspace_id ? (wsById.get(r.workspace_id) ?? null) : null,
+    })),
     defaultRadioId: bridgeManager.getDefaultRadioId(),
     palette: RADIO_COLOR_PALETTE,
     currentWorkspaceId: currentWorkspaceIdForUser(req),
+    scopedToAll: showAll,
   });
 });
 
@@ -1251,8 +1267,29 @@ app.post('/api/mesh/radios', (req, res) => {
   if (!target) return res.status(400).json({ error: 'target is required' });
 
   const db = meshDb();
-  if (db.getRadio(radio_id)) {
-    return res.status(409).json({ error: `radio_id "${radio_id}" already exists` });
+  const existing = db.getRadio(radio_id);
+  if (existing) {
+    // v2.0 Beta 5 Workspaces (fix): the prior message just said
+    // 'already exists' which was confusing when the radio was hidden
+    // from the operator's current workspace view — they'd see an
+    // empty radios list, try to add the radio, and get a "but it's
+    // already here" error with no hint where to find it.
+    //
+    // The two common ways a row appears without an explicit add:
+    //   1. BridgeManager.tryAutoRegisterDefault() inserted it when
+    //      the auto-discovered singleton's MyNodeInfo arrived.
+    //   2. The operator restored an encrypted backup from another
+    //      install — every radios row came with it.
+    //
+    // Tell them WHERE the row lives so they can act.
+    const wsName = existing.workspace_id
+      ? (db.listWorkspaces().find(w => w.id === existing.workspace_id)?.name ?? `workspace #${existing.workspace_id}`)
+      : 'no workspace (unassigned)';
+    return res.status(409).json({
+      error: `radio_id "${radio_id}" is already in the registry — assigned to ${wsName} at ${existing.transport}:${existing.target}. ` +
+        `If you can't see it in your Radios list, it's because your current workspace doesn't contain it; switch via the workspace dropdown, ` +
+        `or reassign it via Settings → Workspaces. If this is a stale auto-discovered row, delete it from there first, then re-add here.`,
+    });
   }
 
   const existingColors = db.listRadios().map(r => r.color_hex).filter((c): c is string => !!c);
