@@ -219,6 +219,11 @@ export default function App() {
   }, [dataSource]);
   const [radioConnected, setRadioConnected] = React.useState(false);
   const [transport, setTransport] = React.useState<TransportInfo | null>(null);
+  /** v2.0 Beta 5 (per-workspace primary): the short-name of the radio
+   *  whose state the sidebar's LIVE RADIO widget is mirroring. Tracks
+   *  the active workspace's primary, not the install ★, so switching
+   *  workspaces flips the label as well as the IP. */
+  const [primaryRadioId, setPrimaryRadioId] = React.useState<string | null>(null);
   const [notificationsEnabled, setNotificationsEnabled] = React.useState<boolean>(() => {
     try { return localStorage.getItem('mesh.notificationsEnabled') !== 'false'; }
     catch { return true; }
@@ -295,6 +300,7 @@ export default function App() {
       const unsubStatus = meshDataService.onStatus((status) => {
         setRadioConnected(status?.radioConnected ?? false);
         setTransport(status?.transport ?? null);
+        setPrimaryRadioId(status?.primaryRadioId ?? null);
       });
       const unsubChannels = meshDataService.onChannels((list) => {
         setChannels(list);
@@ -768,12 +774,19 @@ export default function App() {
                         // v2.0 Beta 2: surface the singleton's radio_id alongside
                         // the transport type so this badge matches the star in
                         // the Radios panel. e.g. "SERIAL · WRTJ" or "TCP · MBNT".
+                        //
+                        // v2.0 Beta 5 Workspaces (fix): prefer primaryRadioId
+                        // (from /api/mesh/status, workspace-scoped) so this
+                        // label flips when the operator switches workspaces.
+                        // The install ★ defaultRadioId stays as a fallback for
+                        // the cold-boot window before status responses arrive.
                         ? (() => {
                             const transportLabel = transport?.mode === 'tcp' ? 'TCP'
                               : transport?.mode === 'serial' ? 'SERIAL'
                               : 'RADIO';
-                            return defaultRadioId
-                              ? `${transportLabel} · ${defaultRadioId}`
+                            const label = primaryRadioId ?? defaultRadioId;
+                            return label
+                              ? `${transportLabel} · ${label}`
                               : `${transportLabel} RADIO`;
                           })()
                         : 'LIVE RADIO')

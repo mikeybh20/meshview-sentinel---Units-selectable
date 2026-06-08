@@ -460,12 +460,87 @@ Bugs + features surfaced while exercising the multi-radio stack against real Hel
 - ✅ **BBS subscriber / mail CSV export.** Commit `3614cc8`. New `/api/mesh/bbs/mail/export.csv` and `/api/mesh/bbs/weather/subscribers/export.csv` endpoints stream RFC 4180 CSV with optional `?radio_id=` + `?from=&to=` filters. Frontend Export buttons in MailView + WeatherView use the currently-selected radio scope.
 - ✅ **Selective restore.** Commit `b1ee5b0`. The `/api/mesh/restore` body accepts an optional `sections` object opting each piece in/out. Frontend shows a "Sections to restore" disclosure under the passphrase input when a backup is loaded. Default all-on preserves back-compat.
 - ✅ **Schema-drift recovery in restore.** Commit `b1ee5b0`. `loadTable` now intersects the backup row's columns with the current schema via `PRAGMA table_info` and INSERTs only the overlap. Missing-from-backup columns get the column default; backup-only columns are dropped with a one-time warning per table.
+- ✅ **Server-side CSV export from SQLite.** Closed in Beta 5. New `/api/mesh/export/messages.csv`, `/api/mesh/export/events.csv`, `/api/mesh/export/telemetry.csv` stream directly from SQLite with optional `?radio_id=&from=&to=` filters. The dashboard ExportModal now uses an `<a download>` against these endpoints, so a 30-day-old date range works regardless of what's in the in-memory React snapshot.
 
 ---
 
-### Phase 6 — AI + sidecar expansion (target 2.0 GA, after Beta 4 stabilizes)
+## 2.0.0 Beta 3 status update — Wave 1 closed during Beta 4/5
+
+The "Close the parity baseline" wave is effectively complete. Subsequent commits and the Beta 4/5 cycles delivered the remaining editors:
+
+- ✅ **Device config editor** — `DeviceConfigSection` in [RadiosView.tsx](src/components/views/RadiosView.tsx). Role / rebroadcast mode / NTP / node-info-broadcast interval / button GPIO.
+- ✅ **Position config editor** — `PositionConfigSection`. Smart-broadcast tuning, fixed-position lat/lng/alt, GPS update intervals, broadcast precision bits.
+- ✅ **Display config editor** — `DisplayConfigSection`. Orientation, screen-on time, units, 12/24h, OLED type, auto-brightness.
+- ✅ **Bluetooth config editor** — `BluetoothConfigSection`. Mode (PIN/NoPIN) + saved fixed PIN.
+- ✅ **Settings → Modules: Remote Hardware** — `RemoteHardwareModuleCard` in [SettingsModal.tsx](src/components/SettingsModal.tsx). GPIO remote control.
+- ✅ **Markdown formatting toolbar** — bold / italic / code / link in [MessagesView.tsx](src/components/views/MessagesView.tsx) (line 1017).
+- ✅ **Node-list Compact density mode** — toggle in [DashboardView.tsx](src/components/views/DashboardView.tsx) (line 1260).
+
+Waves 2 / 3 / 4 / Tier 5 are unchanged from the original Beta 3 plan and remain open. They are the primary scope for the 2.1 cycle.
+
+---
+
+## 2.0.0 GA — Beta 5 shipping notes
+
+The Beta 5 cycle was a substantial set of additions; everything below was shipped in `main` between the Beta 4 closeout and the 2.0.0 tag. No further beta milestones are planned — this is the GA release.
+
+### Multi-tenant + auth
+- ✅ **Local-account authentication.** Admin/viewer roles, scrypt password hashing (N=16384), HMAC-signed session cookies with 30-day sliding expiry. `AUTH_SECRET` persists to `data/auth-secret` (chmod 0600). First-run bootstrap creates the install admin via `/api/auth/bootstrap`. Default-deny middleware over `/api`; auth subtree public; viewer-write allowlist for read-only roles that still need to send messages and update labels.
+- ✅ **Workspaces — tenant scoping for radios + messages + nodes.** New `workspaces` + `workspace_members` tables. Each radio belongs to one workspace; users can be members of multiple. Snapshot endpoint filters nodes (by `heardByRadios` intersection with the workspace's radio set), messages + events (by `radioId` stamp). Dashboard, RadioBar, ExportModal, etc. all observe the active workspace. Settings → Workspaces lets admins create, rename, delete, reassign radios, and manage membership.
+- ✅ **Smart default workspace selection.** Logging in lands you on a workspace you OWN before falling back to first-joined membership — a mike-owns-mikes-workspace user defaults to Mike's, not Household.
+- ✅ **Per-workspace primary radio.** New `workspaces.primary_radio_id` column. Sidebar widget, MQTT pill, status footer, channels list, and `Send` routing in each workspace follow the workspace primary. Sky-blue layers-icon button on each radio row in Settings → Radios sets this; clearing falls back to the install-default-in-workspace → first-connected → first-assigned heuristic. All radios stay physically connected install-wide regardless of which workspace anyone is viewing — switching is a view/routing change, not a connect/disconnect.
+- ✅ **Per-user prefs persistence.** `user_prefs` table + `useUserPref(key, default)` hook with debounced server PUT, localStorage mirror, one-time migration. Survives across browsers + machines.
+
+### BBS expansion
+- ✅ **Services Pattern — single BBS node install-wide.** New `radios.is_bbs_node` mutex with `bridgeManager.getBbsNode()` resolver. Only the designated radio's `BbsService.isCommand()` returns true; others stay inert so `:mail` lands as plain DM on non-BBS radios. Weather alert poller + daily forecast push route through this bridge specifically. Designation picker in Settings → BBS.
+- ✅ **`:wx ↔ :weather` alias.** Permanent aliases for each other regardless of which is the configured `weatherTrigger`. Per-prefix rewrite at `handleInboundDm` entry so every downstream comparator works without duplication.
+- ✅ **Multi-time daily forecast push.** `dailyForecastTime: string` migrated to `dailyForecastTimes: string[]`. Defaults to `['07:30', '12:00', '17:30']` (morning/midday/evening). Per-time fire-marker so missing one slot doesn't suppress the next. Comma-separated UI in Settings → BBS with per-entry HH:MM validation.
+
+### Radios management
+- ✅ **Settings → Connection retired.** Every radio operation (add, edit, connect, disconnect, hot-swap primary, delete) lives in the top-level Radios tab as the single source of truth. Beta 5 banner in the page header reminds operators who muscle-memory'd to the old location.
+- ✅ **Cross-workspace radio visibility.** `GET /api/mesh/radios?scope=all` for admins, used by Settings → Radios so an admin sees every radio in the registry (regardless of workspace) plus a `ws: <name>` chip per row. Solves the "I added a radio and it disappeared" confusion when the radio landed in a workspace the admin wasn't viewing.
+- ✅ **Claim-existing flow.** `POST /api/mesh/radios?claim=true` upgrades an existing row with submitted values + reassigns it to the operator's current workspace. The 409 collision response carries `existingWorkspaceId/Name/Transport/Target + canClaim:true` so the form can pivot to a "Claim & Move to My Workspace" button instead of dead-ending.
+- ✅ **Auto-register row cleanup.** Deleting a disconnected install-primary row now works; `BridgeManager.clearDefault()` wipes the cached default so the next live identity exchange can claim primary cleanly. Also auto-clears `workspaces.primary_radio_id` pointers to the deleted radio.
+- ✅ **Structured `[Radios]` logging.** Every Add/Edit/Delete/Connect/Disconnect/Promote logs actor + outcome + reason. Auto-register from `BridgeManager.tryAutoRegisterDefault` also surfaces in the same `[Radios]` stream so "where did this row come from?" is grep-able.
+
+### Stability fixes
+- ✅ **Flap fix #1 — staggered admin reads.** Post-identity module-config reads now fire 250ms apart instead of 12-in-a-millisecond, preventing the ESP32 admin dispatcher from overflowing and dropping the TCP socket. Plus a "skip if already cached" gate (1h freshness check) so reads that the firmware already streamed via `want_config_id` don't fire at all — common case is zero outbound admin reads after identity.
+- ✅ **Flap fix #2 — ToRadio heartbeat.** New `startHeartbeat()` emits the ToRadio.heartbeat (proto field 7) at +1s then every 3s after connect. Keeps the firmware from idle-closing the TCP socket. Wired to both TCP and serial connect paths.
+- ✅ **Flap fix #3 — diagnostic onClose + exponential backoff.** `Port closed target=… hadError=… idle=Nms err=…` log line tells the operator whether the firmware idle-kicked, the network errored, or another client took the socket. Reconnect backoff grows 5s → 10s → 20s → 40s → 60s for unreachable radios (`EHOSTUNREACH`) so a powered-off radio doesn't burn a retry every 5 seconds forever.
+
+### Operator polish
+- ✅ **Labeled Devices module.** Lightweight management page for Heltec Vision Master E213 e-ink boards repurposed as physical signage (beer tap labels, station IDs). Transient bridge pattern — open TCP → wait identity → AdminMessage.set_owner → disconnect — to scale past the bridge ceiling on a Jetson Nano 2GB. Per-device label-push form with admin/viewer write gating.
+- ✅ **Jetson live stats panel.** `readJetsonStats()` reads `/proc/stat` (200ms diff for CPU%), `/proc/meminfo`, `/proc/loadavg`, `/sys/class/thermal/*`, `/sys/devices/gpu.0/load`. 2s server-side cache + in-flight promise dedup. No sudo required — replaces `tegrastats`.
+- ✅ **`update.sh` installer.** Bash with preflight (uncommitted changes / diverged branches → exit), FF-only pull, `docker compose up --build`, documented exit codes 1-4. Detects `docker compose` vs `docker-compose`.
+- ✅ **MQTT pill `STALE` state.** When the local module config has `mqtt.enabled = true` but the radio is currently disconnected, the pill shows `MQTT: STALE` (muted) instead of `ACTIVE`, eliminating the misleading header/footer disagreement.
+- ✅ **"Last hour" stats card actually filters by 1h.** Was previously rendering `messages.length` (full in-memory buffer) under a "Last hour" label.
+- ✅ **No-workspace + viewer banners.** Friendly empty state when a logged-in user has zero workspace memberships, plus a read-only viewer banner so the disabled buttons feel intentional rather than broken.
+- ✅ **`express.json` limit raised to `50mb`.** Solves HTTP 413 on encrypted backup restore for installs with thousands of mail rows.
+
+### Infrastructure
+- ✅ **Settings → Workspaces UI.** Members + radios per workspace, owner assignment / transfer, radio reassign dropdown.
+- ✅ **Settings → Users UI.** Local user CRUD, role chip, lock/unlock, no orphan-the-install protection (refuses to demote the last unlocked admin or delete the currently-authenticated user).
+- ✅ **`?scope=all` admin path** generalizes to other listing endpoints as a pattern.
+
+### Known limitations carried into 2.0 GA
+- 🔲 **ESP32-S3 USB-CDC frame parser drops frames** (Beta 4 carry-over). Workaround: use TCP transport on affected radios.
+- 🚧 **Detection Sensor event timeline** — blocked on wiring a physical GPIO sensor.
+
+---
+
+## 2.1.0 roadmap — direction after 2.0 GA
+
+Primary scope: Beta 3 Wave 2 (operator features) + Wave 4 TCP virtual-radio proxy. Specifically:
+
+- 🔲 **TCP virtual-radio proxy** (L) — expose Sentinel's radios as a Meshtastic TCP server so phones running the official app and `meshtastic --tcp` can connect through Sentinel instead of pairing with each radio directly. Per the original Wave 4 note, "likely the highest-leverage single feature for the multi-radio architecture."
+- 🔲 **Web Push notifications** (M) — service-worker + SSE bridge so DM alerts arrive when the dashboard tab is closed.
+- 🔲 **Telemetry alert rules engine** (M) — threshold + cooldown rules over battery / SNR / voltage / temperature / channel-util. Off-by-default per rule. Generalizes the existing OUTAGE pattern.
+
+Wave 3 (offline tiles, geofencing, network intelligence), the remaining Wave 4 items, and Tier 5 are still planned but slotted after 2.1.
+
+### Phase 6 — AI + sidecar expansion (target post-2.1)
 Unchanged from original plan. AI evaluation + decision point (keep / evolve / remove), anomaly detection, AGX Orin + GB10 deployment guides.
 
 ---
 
-*See [ROADMAP.md](ROADMAP.md) for the 1.0 historical roadmap. Beta 1 git tag: `v2.0.0-beta.1` on the `v2-dev` branch.*
+*See [ROADMAP.md](ROADMAP.md) for the 1.0 historical roadmap. Beta 1 git tag: `v2.0.0-beta.1`. GA git tag: `v2.0.0`.*

@@ -1615,7 +1615,9 @@ interface BbsConfigShape {
   retentionDays: number;
   replyPaceMs: number;
   homeZipCode: string;
-  dailyForecastTime: string;
+  /** v2.0 Beta 5: array of "HH:MM" push times. Empty disables daily
+   *  push (NWS alerts still fire). */
+  dailyForecastTimes: string[];
 }
 
 /**
@@ -1742,10 +1744,14 @@ function BbsSection() {
   const zipErr = cfg && cfg.homeZipCode && !/^\d{5}$/.test(cfg.homeZipCode)
     ? 'Must be exactly 5 digits (or empty)'
     : null;
-  // Daily forecast time: HH:MM 24-hour, or empty to disable.
-  const timeErr = cfg && cfg.dailyForecastTime && !/^([01]?\d|2[0-3]):[0-5]\d$/.test(cfg.dailyForecastTime)
-    ? 'Use HH:MM (24-hour) or leave empty to disable'
-    : null;
+  // v2.0 Beta 5: array of HH:MM 24-hour push times. The Settings UI
+  // edits this as a comma-separated text field; each entry must parse.
+  // Empty array = daily push disabled (NWS alerts still fire).
+  const timeErr = cfg && (() => {
+    const list = cfg.dailyForecastTimes ?? [];
+    const bad = list.find(t => !/^([01]?\d|2[0-3]):[0-5]\d$/.test(t));
+    return bad ? `"${bad}" isn't a valid HH:MM time` : null;
+  })();
 
   const canSave = cfg && !mailErr && !weatherErr && !cmdErr && !triggersIdentical && !zipErr && !timeErr;
 
@@ -1955,15 +1961,27 @@ function BbsSection() {
 
         {/* Daily forecast push */}
         <div className="space-y-1 pt-2 border-t border-brand-line/40">
-          <label className="text-[10px] uppercase font-bold tracking-widest text-brand-muted">Daily forecast push time</label>
+          <label className="text-[10px] uppercase font-bold tracking-widest text-brand-muted">Daily forecast push times</label>
           <div className="flex items-center gap-2 flex-wrap">
+            {/* v2.0 Beta 5: comma-separated list of HH:MM times. Each
+                entry fires once per day. Default '07:30, 12:00, 17:30'
+                (morning, midday, evening). Empty = daily push off,
+                NWS alerts still fire. */}
             <input
               type="text"
-              value={cfg.dailyForecastTime}
-              onChange={e => update('dailyForecastTime', e.target.value.trim())}
-              placeholder="07:30"
+              value={(cfg.dailyForecastTimes ?? []).join(', ')}
+              onChange={e => {
+                // Split on comma, trim, drop empties. Validation runs in
+                // timeErr above — bad entries show the error inline and
+                // disable Save. We keep the raw split here so the user
+                // can type "07:30, 12:" without us erasing their input
+                // mid-edit.
+                const parts = e.target.value.split(',').map(s => s.trim()).filter(Boolean);
+                update('dailyForecastTimes' as any, parts as any);
+              }}
+              placeholder="07:30, 12:00, 17:30"
               className={cn(
-                "w-24 bg-brand-line/50 border rounded px-2 py-1.5 text-sm mono-text focus:outline-none",
+                "w-56 bg-brand-line/50 border rounded px-2 py-1.5 text-sm mono-text focus:outline-none",
                 timeErr ? "border-brand-error" : "border-brand-line focus:border-brand-accent"
               )}
             />
@@ -1993,11 +2011,11 @@ function BbsSection() {
           </div>
           {timeErr && <div className="text-[10px] text-brand-error">{timeErr}</div>}
           <p className="text-[10px] text-brand-muted leading-snug pt-1">
-            <code className="text-brand-accent">HH:MM</code> in 24-hour <strong>server-local time</strong> (set via <code className="text-brand-accent">TZ</code> in docker-compose).
-            Fires once per day, fetches the current NWS forecast for your home ZIP, and DMs it to every
-            <code className="text-brand-accent"> :weather subscribe</code>d node — same delivery path as alerts
-            (DM + persistent mail row, sender shown as <code className="text-brand-accent">FX</code> for forecast vs <code className="text-brand-accent">WX</code> for alert).
-            Leave empty to disable. Requires Home ZIP above to be set.
+            Comma-separated list of <code className="text-brand-accent">HH:MM</code> times in 24-hour <strong>server-local time</strong> (set via <code className="text-brand-accent">TZ</code> in docker-compose).
+            Each entry fires once per day and DMs the current NWS forecast for your home ZIP to every
+            <code className="text-brand-accent"> :weather subscribe</code>d node (also reachable via <code className="text-brand-accent">:wx subscribe</code> — same flow).
+            Sender shown as <code className="text-brand-accent">FX</code> for forecast vs <code className="text-brand-accent">WX</code> for alert.
+            Leave empty to disable daily push (NWS alerts still fire). Requires Home ZIP above to be set.
           </p>
         </div>
       </div>

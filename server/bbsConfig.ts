@@ -55,13 +55,19 @@ export interface BbsConfig {
   /** 5-digit US ZIP for home-area weather alert polling. Empty disables the
    *  alert poller (the :weather command is unaffected). */
   homeZipCode: string;
-  /** Daily forecast push to weather subscribers, "HH:MM" 24-hour local time.
-   *  Empty disables the daily push (subscribers still get NWS alerts).
-   *  Default "07:30" — matches operator request for morning weather. The
-   *  scheduler uses the server's local timezone (set via `TZ` in
-   *  docker-compose); subscribers see the forecast in the operator's
-   *  zone, not their own. Skipped when homeZipCode is empty. */
-  dailyForecastTime: string;
+  /** v2.0 Beta 5: array of daily forecast push times, each "HH:MM"
+   *  24-hour local time. Default ['07:30', '12:00', '17:30'] — morning,
+   *  midday, evening per operator request. Empty array disables the
+   *  daily push (subscribers still get NWS alerts). Scheduler fires
+   *  each entry once per day; tracked per-time so a 12:00 push fires
+   *  even if the 07:30 one was missed. Timezone is the server's local
+   *  zone (set via `TZ` in docker-compose); subscribers see the
+   *  forecast in the operator's zone, not their own. Skipped when
+   *  homeZipCode is empty.
+   *
+   *  Back-compat: the old `dailyForecastTime: string` field still loads
+   *  — normalizeBbsConfig migrates it into a single-element array. */
+  dailyForecastTimes: string[];
 }
 
 const DEFAULTS: BbsConfig = {
@@ -74,7 +80,7 @@ const DEFAULTS: BbsConfig = {
   replyPaceMs: 2_000,
   sessionTimeoutSecs: 300,
   homeZipCode: '',
-  dailyForecastTime: '07:30',
+  dailyForecastTimes: ['07:30', '12:00', '17:30'],
 };
 
 /** Validate + clamp config inputs to safe ranges so a bad POST body can't
@@ -118,20 +124,42 @@ export function normalizeBbsConfig(partial: Partial<BbsConfig>): BbsConfig {
   const zip = String(merged.homeZipCode ?? '').trim();
   merged.homeZipCode = /^\d{5}$/.test(zip) ? zip : '';
 
-  // Daily-forecast time: "HH:MM" 24h, or empty to disable. Reject anything
-  // that's not a valid clock time so a bad value can't silently DOS the
-  // scheduler with "never fires" or fire at 99:99.
-  const t = String(merged.dailyForecastTime ?? '').trim();
-  if (t === '') {
-    merged.dailyForecastTime = '';
-  } else {
+  // Daily-forecast times: array of "HH:MM" 24h strings. Invalid entries
+  // are silently dropped (rather than snapping to defaults) so partial
+  // updates from the UI don't blow away the operator's good values.
+  // Empty array disables the daily push entirely; subscribers still
+  // get NWS alerts on the regular poll cadence.
+  //
+  // Back-compat: if the input only has the old singular
+  // `dailyForecastTime` field (string), promote it to a one-element
+  // array. Lets pre-Beta-5 configs upgrade without surgery.
+  const normalizeTime = (raw: unknown): string | null => {
+    if (typeof raw !== 'string') return null;
+    const t = raw.trim();
+    if (!t) return null;
     const m = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(t);
-    if (m) {
-      // Normalize "7:30" → "07:30" so equality checks downstream are simpler.
-      merged.dailyForecastTime = `${m[1].padStart(2, '0')}:${m[2]}`;
-    } else {
-      merged.dailyForecastTime = DEFAULTS.dailyForecastTime;
-    }
+    if (!m) return null;
+    return `${m[1].padStart(2, '0')}:${m[2]}`;
+  };
+  let rawTimes: unknown[] = [];
+  if (Array.isArray((partial as any).dailyForecastTimes)) {
+    rawTimes = (partial as any).dailyForecastTimes;
+  } else if (Array.isArray((merged as any).dailyForecastTimes)) {
+    rawTimes = (merged as any).dailyForecastTimes;
+  } else if (typeof (partial as any).dailyForecastTime === 'string') {
+    // Pre-Beta-5 singular field — migrate.
+    rawTimes = [(partial as any).dailyForecastTime];
+  }
+  const normalized = Array.from(new Set(
+    rawTimes.map(normalizeTime).filter((x): x is string => !!x)
+  )).sort();
+  // If the caller sent something but every entry was invalid, fall back
+  // to defaults rather than silently disabling. If they sent an
+  // explicit empty array, honor it (disables).
+  if (rawTimes.length > 0 && normalized.length === 0) {
+    merged.dailyForecastTimes = [...DEFAULTS.dailyForecastTimes];
+  } else {
+    merged.dailyForecastTimes = normalized;
   }
 
   return merged;
@@ -152,7 +180,7 @@ export function loadBbsConfig(): BbsConfig {
     const raw = readFileSync(CONFIG_PATH, 'utf-8');
     const parsed = JSON.parse(raw) as Partial<BbsConfig>;
     const normalized = normalizeBbsConfig(parsed);
-    console.log(`[BBSConfig] Loaded from ${CONFIG_PATH}: enabled=${normalized.enabled} mailTrigger="${normalized.mailTrigger}" weatherTrigger="${normalized.weatherTrigger}" homeZip="${normalized.homeZipCode || '(unset)'}"`);
+    console.log(`[BBSConfig] Loaded from ${CONFIG_PATH}: enabled=${normalized.enabled} mailTrigger="${normalized.mailTrigger}" weatherTrigger="${normalized.weatherTrigger}" homeZip="${normalized.homeZipCode || '(unset)'}" dailyForecastTimes=[${normalized.dailyForecastTimes.join(',') || '<disabled>'}]`);
     return normalized;
   } catch (err: any) {
     console.error(`[BBSConfig] Load failed (${err.message}) — using defaults`);

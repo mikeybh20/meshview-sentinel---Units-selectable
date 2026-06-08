@@ -96,14 +96,18 @@ http://<dell-gb10-ip>:3000
 
 On first load you land on the Dashboard. Open **Settings** (gear icon, sidebar) for first-time setup:
 
-- **Connection** — confirms the radio is detected. Switches between serial auto-discover and a TCP endpoint (\`host:port\`, default Meshtastic TCP port is \`4403\`).
+- **Mode** — sim vs. live data source toggle.
 - **Modules** — enable / disable / tune the eight Meshtastic firmware modules from the browser: NeighborInfo, Range Test, Telemetry, Store & Forward, External Notification, MQTT, Detection Sensor, Audio. Admin writes go directly to the local radio; nothing crosses the mesh.
 - **Notifications** — desktop notifications for new messages, mentions, and node-lost events.
 - **Display** — light / dark / auto theme, message retention window, unit system (metric / imperial).
-- **BBS** — bulletin-board state machine that handles \`:mail\` and \`:weather\` DMs from other nodes (see Phase 6 for the full feature set).
+- **BBS** — bulletin-board state machine that handles \`:mail\` and \`:weather\`/\`:wx\` DMs from other nodes (see Phase 6 for the full feature set).
+- **Users** — local user accounts (admin/viewer roles). First-run bootstrap creates the install admin.
+- **Workspaces** — tenant scopes for radios + messages + nodes. Per-user landing space; see Phase 6.5.
 - **Blocked** — node-level mute list; blocked senders are dropped before reaching the UI.
 - **Data** — retention windows + DB stats; export / import for backup.
 - **AI** — drop in your Anthropic or Google Gemini API key (or point at a local Ollama instance) if you want the AI assistant. Keys are stored server-side at \`data/ai-config.json\`; nothing about them ever reaches the browser.
+
+> **Note:** the legacy *Settings → Connection* panel has been retired in Beta 5. Adding, editing, connecting, disconnecting, hot-swapping primary, and deleting radios all live in the top-level **Radios** tab — single source of truth.
 
 ---
 
@@ -115,7 +119,7 @@ The container watches \`/dev\` and \`/run/udev\`, so devices are picked up live:
 2. Within ~5 seconds, the \`[SerialDiscovery]\` log line should report it.
 3. The dashboard's status pill flips from \`OFFLINE\` to \`RADIO CONNECTED\`.
 
-If your radio sits on another machine and is reachable via TCP, open **Settings → Connection → TCP** and enter \`<host>:<port>\` (default \`4403\`). The endpoint is persisted to \`data/tcp-endpoint.json\` and re-attempted on container restart until you explicitly disconnect.
+If your radio sits on another machine and is reachable via TCP, open the **Radios** tab → **Add Radio** → set transport to \`tcp\` and target to \`<host>:<port>\` (default \`4403\`). Click **Detect Identity** to auto-fill the radio's short_name + long_name from its firmware, then Add. The first radio added becomes the install primary; subsequent radios connect on demand via the per-row Connect button.
 
 ---
 
@@ -248,16 +252,17 @@ DM "X"      →  exits the session.
 
 Shortcuts: \`:mail send\`, \`:mail read\`, \`:mail BH20\` (skip the menu and prompt for body), \`!02eb3bec\` instead of a short name (hex form bypasses short-name lookup), reply-by-typing during a read session.
 
-### Weather (\`:weather\`)
+### Weather (\`:weather\` or \`:wx\`)
 
-On-demand US weather lookup against the National Weather Service + zippopotam.us. Returns ≤200-char compact summary:
+On-demand US weather lookup against the National Weather Service + zippopotam.us. Both \`:weather\` and \`:wx\` are accepted everywhere — built-in aliases for each other regardless of which one the operator has saved as the configured Weather trigger in Settings → BBS. Returns ≤200-char compact summary:
 
 \`\`\`text
-DM ":weather"      →  "WEATHER: send 5-digit US ZIP or X to cancel."
+DM ":wx"           →  "WX: send 5-digit US ZIP or X to cancel."
 DM "21001"         →  "Aberdeen, MD: 42°F now, Sunny. High 48°/Low 31° today."
 
-# Shortcut form (skips the prompt)
+# Shortcut form (skips the prompt) — both aliases work
 DM ":weather 60601" →  "Chicago, IL: 58°F now, Partly Cloudy. High 64°/Low 49° today."
+DM ":wx 60601"      →  same
 \`\`\`
 
 ### Weather subscriptions
@@ -265,10 +270,10 @@ DM ":weather 60601" →  "Chicago, IL: 58°F now, Partly Cloudy. High 64°/Low 4
 Remote nodes can opt in to **proactive alerts** for the operator's configured home ZIP:
 
 \`\`\`text
-DM ":weather subscribe"    →  "Subscribed to Aberdeen, MD alerts. Reply :weather stop to unsubscribe."
-DM ":weather status"        →  "Subscribed to Aberdeen, MD alerts. :weather stop to opt out."
-DM ":weather unsubscribe"   →  "Unsubscribed. You'll no longer receive weather alerts."
-                              # Also accepted: ":weather stop", ":weather off"
+DM ":wx subscribe"      →  "Subscribed to Aberdeen, MD alerts. Reply :wx stop to unsubscribe."
+DM ":wx status"          →  "Subscribed to Aberdeen, MD alerts. :wx stop to opt out."
+DM ":wx unsubscribe"     →  "Unsubscribed. You'll no longer receive weather alerts."
+                            # Also accepted: ":wx stop", ":wx off". And ":weather …" still works.
 \`\`\`
 
 When a new NWS alert (warning / watch / advisory) fires for the home ZIP, every subscriber receives **both**:
@@ -277,6 +282,8 @@ When a new NWS alert (warning / watch / advisory) fires for the home ZIP, every 
 2. A **mail row** in their inbox with sender_short_name = \`WX\` (persistent — survives offline periods)
 
 The poller runs every 20 minutes. Alerts active at container start are silently absorbed (no spam after restart); only newly-issued alerts trigger fanout.
+
+**Daily forecast push** — Beta 5: subscribers also receive the current NWS forecast at every time configured in Settings → BBS → *Daily forecast push times* (default \`07:30, 12:00, 17:30\` server-local time = morning / midday / evening). Each slot fires independently — missing one doesn't suppress the next. The sender_short_name on these is \`FX\` to distinguish "scheduled forecast" from \`WX\` (issued alert) in subscribers' mail histories.
 
 ### Operator-side dashboard surfaces
 
@@ -294,11 +301,14 @@ The poller runs every 20 minutes. Alerts active at container start are silently 
 |---|---|---|---|
 | **Enabled** | on | toggle | Master switch. When off, all \`:\`-prefixed DMs flow through to the normal message log instead of the BBS state machine. |
 | **Mail trigger** | \`:mail\` | colon + 1-15 chars, lowercase | Validated client-side. Custom triggers let you match a network convention. |
-| **Weather trigger** | \`:weather\` | colon + 1-15 chars, lowercase | Must differ from the mail trigger. |
+| **Weather trigger** | \`:wx\` | colon + 1-15 chars, lowercase | Must differ from the mail trigger. \`:wx\` and \`:weather\` are built-in aliases regardless of which is configured. |
+| **Command index** | \`:cmd\` | colon + 1-15 chars, lowercase | DMing this returns a one-packet list of every active root trigger. |
 | **Body cap** | 200 chars | 50-228 | Hard limit on mail body length. 228 = the firmware payload ceiling. |
 | **Retention** | 30 days | 1-365 | Mail older than this is pruned automatically, regardless of read state. |
 | **Reply pace** | 2000 ms | 0-10000 | Minimum gap between successive BBS replies to the same destination. Prevents tripping the firmware's per-destination rate limiter. |
-| **Home ZIP** | (empty) | 5 digits or empty | When set, the alert poller runs every 20 min for this ZIP. Subscribers receive alerts from here. Leave empty to disable the proactive alert path (the on-demand \`:weather\` command is unaffected). |
+| **Session timeout** | 300 s | 30-1800 | How long a half-finished mail session stays alive before the reaper sweeps it. |
+| **Home ZIP** | (empty) | 5 digits or empty | When set, the alert poller runs every 20 min for this ZIP. Subscribers receive alerts from here. Leave empty to disable the proactive alert path (the on-demand \`:wx\` command is unaffected). |
+| **Daily forecast push times** | \`07:30, 12:00, 17:30\` | comma-separated HH:MM list | Each entry fires once per day in server-local time (\`TZ\` env). Subscribers receive the current NWS forecast as a DM + persistent mail row (\`FX\` sender). Empty list disables daily push; NWS alerts still fire. |
 
 All changes apply immediately — no radio restart needed.
 
@@ -316,15 +326,16 @@ Sentinel v2.0 can bridge two or more Meshtastic radios simultaneously, even when
 
 ### Concepts
 
-- **Default radio**: the radio Sentinel auto-discovers on boot via USB serial. It's the singleton bridge — no manual configuration needed.
-- **Secondary radio(s)**: any additional radio you connect via TCP (or another serial port). Configured in **Settings → Radios** and connected on demand with the **Connect** button per row.
+- **Install primary** (★ in Radios tab): the radio Sentinel auto-discovers on boot via USB serial. It's the singleton bridge — no manual configuration needed. Hot-swap which radio is primary via the per-row **Make Primary** button.
+- **Secondary radio(s)**: any additional radio you connect via TCP (or another serial port). Configured in the **Radios** tab and connected on demand with the **Connect** button per row.
 - **radio_id**: the 4-character \`short_name\` from each radio's firmware. Used as the identity for that radio everywhere: pill in the RadioBar, "Heard By" badge on nodes it has heard, log prefix on its events. Must be unique across your configured radios.
 - **Frequency Slot ≠ Primary Channel**: the slot (\`config.lora.channel_num\`) is the physical RF channel. Two radios with the same primary-channel name (\`LongFast\`) but different slots will never hear each other.
+- **Workspace primary** (Beta 5+): each workspace can mark one of its radios as its primary. Status footer, MQTT pill, channels, and \`Send\` routing in that workspace all follow this choice. Set via the layers-icon button on each radio row in the **Radios** tab. All radios stay connected install-wide regardless of which workspace anyone is viewing — switching is a view/routing change, not a connect/disconnect.
 
 ### Adding a secondary radio
 
 1. Make sure the second radio is reachable. For TCP: it must be running with \`Meshtastic IP\` enabled (typically on port 4403). For serial: it must be on a port that the Sentinel container's \`/dev\` mount can see (the existing \`device_cgroup_rules\` cover \`ttyUSB*\` and \`ttyACM*\`).
-2. Open **Settings → Radios** and click **Add Radio**.
+2. Open the **Radios** tab and click **Add Radio**.
 3. Pick \`tcp\` or \`serial\` transport and enter the target (\`192.168.1.50:4403\` for TCP, \`/dev/ttyUSB1\` for serial).
 4. Click **Detect Identity** — Sentinel opens a transient connection, reads the radio's \`User\` config (short_name + long_name) and \`LoRaConfig\` (region / preset / slot / hops), disconnects, and pre-fills the form.
 5. Optional: add a **Network Label** like "NOVA Mesh" so the RadioBar pill carries human context, and pick a different palette color than your default radio's.
@@ -353,9 +364,9 @@ Each connected radio adds ~150–250 MB of resident memory to the Sentinel conta
 
 - **Disconnect**: click the **Disconnect** button on the secondary radio's row. The bridge shuts down cleanly; the row stays in the registry so you can reconnect with one click.
 - **Disable**: toggle the **Enabled** checkbox off in the per-radio editor. Disabled radios stay in the registry but are skipped by Refresh and won't auto-connect on next boot.
-- **Delete**: only allowed for non-default radios that aren't currently connected.
+- **Delete**: allowed for any radio that isn't the actively-connected install primary. A *disconnected* install primary (stale auto-registered row from a renamed/replaced radio) can be deleted — the next live identity exchange will auto-claim primary cleanly.
 
-The default radio cannot be disconnected from this panel — use the **Connection** panel (Phase 1's serial / TCP toggle) instead.
+To hot-swap which radio is the install primary, click the **Make Primary** (★) button on a different row instead of disconnecting the current primary directly.
 
 ---
 

@@ -40,7 +40,10 @@ Plus **per-channel position precision** (privacy control: 0 = disabled, 32 = ful
 
 ### Operator features
 - **TCP transport** alongside serial (Meshtastic firmware 2.7.4+); persists last endpoint and auto-reconnects.
-- **Settings hub** — unified Connection / Modules / Notifications / Display / Blocked / Data / AI sections.
+- **Multi-radio**: bridge two or more Meshtastic radios simultaneously, even on different RF channels. Per-radio Connect/Disconnect/Make-Primary controls live in the top-level **Radios** tab — single source of truth.
+- **Workspaces**: tenant scopes for radios + messages + nodes. Each user lands in their own workspace; per-workspace primary radio choice routes status, channels, and sends to the right bridge.
+- **Local-account auth**: admin/viewer roles, scrypt-hashed passwords, signed session cookies. First-run bootstrap creates the install admin.
+- **Settings hub** — unified Mode / Modules / Notifications / Display / BBS / Users / Workspaces / Blocked / Data / AI sections.
 - **Light / Dark / Auto theme** with OS `prefers-color-scheme` watching.
 - **Favorite nodes** with one-click toggle; favorites get amber rings on the map and topology graph.
 - **Node groups** with operator-defined names + colors, persistent server-side; per-node assignment dropdown plus **bulk-select multi-assign** in the dashboard node list; group color overrides marker/topology color so groupings are obvious at a glance. Inline rename via double-click in the sidebar.
@@ -79,7 +82,7 @@ SERIAL_AUTO_DISCOVER=true npm run dev:server
 
 Or specify a port directly: `SERIAL_PORT=/dev/ttyUSB0 npm run dev:server`.
 
-For TCP-mode radios, leave both env vars unset — the server will reconnect to the last endpoint stored in `data/tcp-endpoint.json`, or you can configure one in **Settings → Connection**.
+For TCP-mode radios, leave both env vars unset — the server will reconnect to the last endpoint stored in `data/tcp-endpoint.json`, or you can configure one in the **Radios** tab (Add Radio → transport `tcp` → `<host>:<port>`).
 
 ---
 

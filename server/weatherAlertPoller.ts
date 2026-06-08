@@ -65,10 +65,11 @@ export class WeatherAlertPoller {
 
   /** Daily-forecast scheduler state. */
   private dailyTimer: ReturnType<typeof setInterval> | null = null;
-  /** Date key (YYYY-MM-DD in server-local time) for the last day we sent
-   *  the daily forecast. Prevents double-fire when the minute tick
-   *  straddles the target time. */
-  private lastDailySentDay: string | null = null;
+  /** v2.0 Beta 5: per-time daily-fire ledger. Key is "HH:MM" → dayKey
+   *  of the last day that slot fired. Lets each configured push time
+   *  (morning, midday, evening …) track independently so missing the
+   *  07:30 slot doesn't suppress the 12:00 one. */
+  private lastDailySentByTime: Map<string, string> = new Map();
 
   constructor(bm: BridgeManagerLike, getConfig: () => BbsConfig) {
     this.bm = bm;
@@ -87,12 +88,19 @@ export class WeatherAlertPoller {
     // 7:30am morning push doesn't block on the 20-minute alert cadence.
     if (!this.dailyTimer) {
       console.log(`[WeatherPoller] Daily forecast scheduler enabled (tick=${Math.round(DAILY_TICK_MS / 1000)}s)`);
-      // Seed lastDailySentDay to "today" so if we boot AFTER the target
-      // time we don't immediately fire a stale forecast at startup —
-      // operator gets it tomorrow morning instead. Boot-time push is
-      // the wrong behavior: subscribers got their morning fresh, they
-      // don't need it again at 2pm.
-      this.lastDailySentDay = this.todayKey();
+      // Seed the per-time ledger so any slot whose target time has
+      // already passed today gets skipped at boot. Without this, a
+      // container restart at 14:00 would immediately fire the 07:30
+      // AND 12:00 forecasts back-to-back — subscribers already got
+      // their morning + noon fresh and don't need a duplicate.
+      const cfg = this.getConfig();
+      const nowKey = this.todayKey();
+      const nowMins = new Date().getHours() * 60 + new Date().getMinutes();
+      for (const t of cfg.dailyForecastTimes ?? []) {
+        const [h, m] = t.split(':').map(Number);
+        const targetMins = (h ?? 0) * 60 + (m ?? 0);
+        if (targetMins <= nowMins) this.lastDailySentByTime.set(t, nowKey);
+      }
       this.dailyTimer = setInterval(() => this.dailyTick(), DAILY_TICK_MS);
       this.dailyTimer.unref?.();
     }
@@ -175,24 +183,33 @@ export class WeatherAlertPoller {
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
   }
 
-  /** Minute-resolution scheduler tick. Fires the daily forecast when the
-   *  wall clock crosses the configured HH:MM and we haven't sent today
-   *  yet. Per-minute polling instead of next-fire setTimeout because
-   *  timeout drift over a 24h window is unreliable (system sleep, NTP
-   *  steps, container restarts) — a minute tick is robust and cheap. */
+  /** Minute-resolution scheduler tick. Fires each configured daily
+   *  forecast slot when the wall clock crosses its HH:MM and that
+   *  slot hasn't sent today yet. Per-minute polling instead of
+   *  next-fire setTimeout because timeout drift over a 24h window is
+   *  unreliable (system sleep, NTP steps, container restarts) — a
+   *  minute tick is robust and cheap.
+   *
+   *  v2.0 Beta 5: multi-time scheduler. Each entry in
+   *  cfg.dailyForecastTimes fires once per day, tracked independently
+   *  in lastDailySentByTime. Adding/removing/editing times in
+   *  Settings → BBS takes effect on the next minute tick — no
+   *  scheduler restart required. */
   private async dailyTick(): Promise<void> {
     const cfg = this.getConfig();
-    if (!cfg.enabled || !cfg.dailyForecastTime) return;
+    if (!cfg.enabled) return;
+    const times = cfg.dailyForecastTimes ?? [];
+    if (times.length === 0) return;
 
     const now = new Date();
     const hh = String(now.getHours()).padStart(2, '0');
     const mm = String(now.getMinutes()).padStart(2, '0');
     const clock = `${hh}:${mm}`;
-    if (clock !== cfg.dailyForecastTime) return;
+    if (!times.includes(clock)) return;
 
     const dayKey = this.todayKey();
-    if (this.lastDailySentDay === dayKey) return;
-    this.lastDailySentDay = dayKey;
+    if (this.lastDailySentByTime.get(clock) === dayKey) return;
+    this.lastDailySentByTime.set(clock, dayKey);
 
     const subs = meshDb.listWeatherSubscribers();
     if (subs.length === 0) {
@@ -211,9 +228,10 @@ export class WeatherAlertPoller {
       console.log(`[WeatherPoller] Daily forecast (${clock}) sent to ${r.subscribers} subscriber(s): ${zipSummary || '(none)'}`);
     } catch (err: any) {
       console.warn(`[WeatherPoller] daily forecast fan-out failed: ${err?.message}`);
-      // Roll back the dayKey so we'll retry on the next tick. NWS hiccups
-      // shouldn't cost the operator a day of forecasts.
-      this.lastDailySentDay = null;
+      // Clear this slot's fire-marker so we'll retry on the next tick.
+      // NWS hiccups shouldn't cost the operator a slot of forecasts.
+      // Other slots' state stays intact.
+      this.lastDailySentByTime.delete(clock);
     }
   }
 

@@ -50,6 +50,15 @@ export interface MeshStatus {
   rebootCount?: number | null;
   /** Local node `!hex` id, once MyNodeInfo has been received. */
   localNodeId?: string | null;
+  /** v2.0 Beta 5 Workspaces: install-wide default radio (the ★ on the
+   *  Radios page). Stays constant across workspace switches. */
+  defaultRadioId?: string | null;
+  /** v2.0 Beta 5 (per-workspace primary): the radio whose state
+   *  populates the rest of this status payload — workspace-scoped, so
+   *  it changes when the operator switches workspaces. UI badges that
+   *  used to read `defaultRadioId` should now read `primaryRadioId` so
+   *  they reflect the workspace the user is actually viewing. */
+  primaryRadioId?: string | null;
 }
 
 export type AckStatus = 'sending' | 'sent' | 'acked' | 'error';
