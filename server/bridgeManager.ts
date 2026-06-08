@@ -34,6 +34,10 @@ const FORWARDED_EVENTS = [
   'localModuleConfigUpdate', 'loraConfigUpdate',
   'networkConfigUpdate', 'powerConfigUpdate', 'cannedMessagesUpdate',
   'deviceConfigUpdate', 'positionConfigUpdate', 'displayConfigUpdate', 'bluetoothConfigUpdate',
+  // v2.0.0 Web Push: 'message' carries the parsed MeshMessage object
+  // so the api.ts push-dispatcher hook can fire on DM-to-local-node
+  // without re-parsing the underlying packet.
+  'message',
   'ackUpdate', 'bbsMail', 'bbsSubscriber',
 ] as const;
 

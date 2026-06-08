@@ -14,6 +14,13 @@ import type { RadioRow, LoRaConfigLive } from '../types';
 import { meshDataService, TransportInfo, DataSource } from '../services/meshDataService';
 import { LocalModuleConfigSnapshot, Node, UnitSystem } from '../types';
 import { cn } from '../lib/utils';
+import {
+  browserPushSupported,
+  getCurrentSubscription,
+  enableBrowserPush,
+  disableBrowserPush,
+  sendTestPush,
+} from '../lib/webPushClient';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
@@ -388,7 +395,133 @@ function NotificationsSection({
         <div className="text-[11px] text-brand-muted leading-relaxed border-t border-brand-line/50 pt-3 space-y-1">
           <p><strong className="text-brand-ink">Triggers:</strong> incoming DMs to the local node (suppressed if you're already viewing that chat) and OUTAGE events for favorited nodes — fired when a favorite goes silent past the staleness threshold and again when it returns.</p>
           <p>Notifications include a "click to open chat" action that switches to the messages tab with the sender's chat active.</p>
+          <p className="text-brand-muted/80">Only works while a dashboard tab is open. Use <strong className="text-brand-ink">Background Push</strong> below to get alerted when no tab is open.</p>
         </div>
+      </div>
+
+      <WebPushPanel />
+    </div>
+  );
+}
+
+/**
+ * v2.0.0 Web Push — server → OS push channel that survives tab close.
+ *
+ * Distinct from the in-page Notification API above:
+ *   - In-page notifications fire from the running tab via SSE +
+ *     useMeshNotifications. They stop the moment the tab closes.
+ *   - Web Push fires from the SERVER through Apple/Google/Mozilla
+ *     push services straight to the OS. Works with the browser
+ *     closed (depending on platform — see help text below).
+ *
+ * Both can be on at the same time; the in-page path suppresses if
+ * the user is actively viewing the source chat, the push path doesn't
+ * (it has no knowledge of what tab is foreground).
+ */
+function WebPushPanel() {
+  const [supported] = React.useState(() => browserPushSupported());
+  const [subscribed, setSubscribed] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+  const [msg, setMsg] = React.useState<{ tone: 'ok' | 'err'; text: string } | null>(null);
+
+  React.useEffect(() => {
+    if (!supported) return;
+    let alive = true;
+    getCurrentSubscription().then(sub => {
+      if (alive) setSubscribed(!!sub);
+    });
+    return () => { alive = false; };
+  }, [supported]);
+
+  const handleEnable = async () => {
+    setBusy(true); setMsg(null);
+    const r = await enableBrowserPush();
+    setBusy(false);
+    if (!r.ok) {
+      setMsg({ tone: 'err', text: r.error || 'Enable failed' });
+      return;
+    }
+    setSubscribed(true);
+    setMsg({ tone: 'ok', text: 'Push enabled. Try Send Test to verify the path.' });
+  };
+
+  const handleDisable = async () => {
+    setBusy(true); setMsg(null);
+    await disableBrowserPush();
+    setBusy(false);
+    setSubscribed(false);
+    setMsg({ tone: 'ok', text: 'Push disabled on this browser.' });
+  };
+
+  const handleTest = async () => {
+    setBusy(true); setMsg(null);
+    const r = await sendTestPush();
+    setBusy(false);
+    if (!r.ok) {
+      setMsg({ tone: 'err', text: r.error || 'Test failed' });
+      return;
+    }
+    const n = r.delivered ?? 0;
+    setMsg({ tone: 'ok', text: `Sent test push (${n} subscription${n === 1 ? '' : 's'} delivered).` });
+  };
+
+  return (
+    <div className="bg-brand-line/60 border border-brand-line rounded p-4 space-y-3">
+      <div className="flex items-center justify-between">
+        <div>
+          <p className="text-xs font-bold text-brand-ink uppercase tracking-wide">Background Push (Web Push)</p>
+          <p className={cn(
+            'text-[11px] mt-0.5',
+            !supported ? 'text-brand-error'
+              : subscribed ? 'text-brand-accent'
+              : 'text-brand-muted',
+          )}>
+            {!supported ? 'Not supported in this browser'
+              : subscribed ? 'On — this browser will receive push alerts even when the tab is closed'
+              : 'Off on this browser'}
+          </p>
+        </div>
+        <div className="flex items-center gap-2 flex-shrink-0">
+          {subscribed && (
+            <button
+              onClick={handleTest}
+              disabled={busy}
+              className="text-[10px] font-bold uppercase tracking-widest border border-brand-accent/40 text-brand-accent hover:bg-brand-accent/10 disabled:opacity-40 rounded px-2.5 py-1.5"
+            >
+              {busy ? '…' : 'Send Test'}
+            </button>
+          )}
+          <button
+            onClick={subscribed ? handleDisable : handleEnable}
+            disabled={!supported || busy}
+            className={cn(
+              'text-xs font-bold uppercase tracking-widest rounded px-3 py-1.5 transition-colors disabled:opacity-40 disabled:cursor-not-allowed border',
+              subscribed
+                ? 'bg-brand-line hover:bg-brand-line border-brand-line text-brand-ink'
+                : 'bg-brand-accent/20 hover:bg-brand-accent/30 border-brand-accent/50 text-brand-accent',
+            )}
+          >
+            {busy ? '…' : subscribed ? 'Disable' : 'Enable'}
+          </button>
+        </div>
+      </div>
+
+      {msg && (
+        <div className={cn(
+          'flex items-start gap-2 text-[11px] rounded border px-2.5 py-1.5',
+          msg.tone === 'ok'
+            ? 'border-brand-accent/40 bg-brand-accent/10 text-brand-accent'
+            : 'border-red-500/40 bg-red-500/10 text-red-300',
+        )}>
+          <AlertCircle size={12} className="mt-0.5 flex-shrink-0" />
+          <span>{msg.text}</span>
+        </div>
+      )}
+
+      <div className="text-[11px] text-brand-muted leading-relaxed border-t border-brand-line/50 pt-3 space-y-1">
+        <p><strong className="text-brand-ink">What fires push:</strong> DMs to your local node, OUTAGE events on favorite nodes, and WEATHER_ALERTs.</p>
+        <p><strong className="text-brand-ink">Where it works:</strong> Chrome / Firefox / Edge on desktop reliably deliver even when the browser is closed. Safari delivers when the browser is open in the background. On mobile, behavior depends on the browser + battery-saver settings.</p>
+        <p><strong className="text-brand-ink">Per-browser:</strong> enable separately on each browser / device that should receive alerts. Disabling here only removes this browser's subscription.</p>
       </div>
     </div>
   );

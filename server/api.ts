@@ -79,6 +79,12 @@ import { attachUser, requireAuth, requireAdmin, hashPassword, verifyPassword,
          createSession, destroySession, sessionCookieAttrs, clearSessionCookieHeader,
          getSessionCookieValue, validateUsername, validatePassword, isValidRole,
          type SessionUser } from './auth.js';
+// v2.0.0 Web Push: lazy-loads the VAPID keypair on first use and
+// exposes the dispatch fn that DM / OUTAGE / WEATHER_ALERT handlers
+// fan out through. The dispatcher is renamed locally so it's obvious
+// at the call site that it's the Web Push path (vs. the in-browser
+// Notification API path).
+import { dispatch as pushDispatch, getVapidPublicKey, PUSH_CATEGORIES } from './webPush.js';
 app.use(attachUser);
 
 /** Format the Set-Cookie value with the session token interpolated in. */
@@ -380,6 +386,145 @@ app.put('/api/auth/prefs/:key', requireAuth, (req, res) => {
 app.delete('/api/auth/prefs/:key', requireAuth, (req, res) => {
   meshDb().deleteUserPref(req.user!.id, req.params.key);
   return res.json({ ok: true });
+});
+
+// =============================================
+// v2.0.0 Web Push notifications
+// =============================================
+//
+// Flow:
+//   1. Browser fetches the VAPID public key (unauthenticated — it's
+//      install-wide and the service worker needs it before login).
+//   2. After login + Notification.requestPermission grant, the browser
+//      calls pushManager.subscribe({applicationServerKey: <vapidPub>})
+//      then POSTs the subscription JSON to /api/push/subscribe.
+//   3. We upsert keyed on (user_id, endpoint) so reload doesn't dupe.
+//   4. Settings → Notifications PATCHes the categories mask without
+//      re-prompting the browser.
+//   5. Logout / "unregister this browser" DELETEs by endpoint.
+//   6. The dispatcher fires from event sources (DMs, OUTAGE,
+//      WEATHER_ALERT) and prunes any subscription returning 404/410.
+
+/** GET /api/push/vapid-public — install-wide VAPID public key.
+ *  Unauthenticated: the browser needs this BEFORE it can subscribe,
+ *  and the key is by definition public. */
+app.get('/api/push/vapid-public', (_req, res) => {
+  try {
+    return res.json({ publicKey: getVapidPublicKey() });
+  } catch (err: any) {
+    console.error('[WebPush] vapid-public failed:', err.message);
+    return res.status(500).json({ error: 'failed to load VAPID key' });
+  }
+});
+
+/** POST /api/push/subscribe — register a PushSubscription for the
+ *  current user. Body: { subscription: {endpoint, keys:{p256dh,auth}},
+ *  categories?: string[], userAgent?: string }. Returns the saved row
+ *  shape so the client can confirm. */
+app.post('/api/push/subscribe', requireAuth, (req, res) => {
+  const body = req.body ?? {};
+  const sub = body.subscription;
+  if (!sub || typeof sub.endpoint !== 'string' || !sub.endpoint) {
+    return res.status(400).json({ error: 'subscription.endpoint required' });
+  }
+  const p256dh = sub.keys?.p256dh;
+  const authSecret = sub.keys?.auth;
+  if (typeof p256dh !== 'string' || typeof authSecret !== 'string') {
+    return res.status(400).json({ error: 'subscription.keys.p256dh + auth required' });
+  }
+  // Categories: validate against the canonical list — silently drops
+  // unknown entries rather than rejecting so a future server release
+  // adding a category stays back-compat with old client builds.
+  const rawCats = Array.isArray(body.categories) ? body.categories : PUSH_CATEGORIES;
+  const cats = rawCats.filter((c: unknown): c is string =>
+    typeof c === 'string' && (PUSH_CATEGORIES as readonly string[]).includes(c));
+  const ua = typeof body.userAgent === 'string' ? body.userAgent.slice(0, 200) : null;
+  try {
+    const id = meshDb().upsertPushSubscription({
+      userId: req.user!.id,
+      endpoint: sub.endpoint,
+      p256dh,
+      authSecret,
+      categories: cats,
+      userAgent: ua,
+    });
+    console.log(`[WebPush] subscribe id=${id} user=${req.user!.username}#${req.user!.id} cats=[${cats.join(',')}] ua="${ua ?? ''}"`);
+    return res.status(201).json({ id, categories: cats });
+  } catch (err: any) {
+    console.error('[WebPush] subscribe failed:', err.message);
+    return res.status(500).json({ error: err.message ?? 'subscribe failed' });
+  }
+});
+
+/** PATCH /api/push/subscriptions/:id/categories — update opt-in mask.
+ *  Lets the user mute a category without re-prompting the browser. */
+app.patch('/api/push/subscriptions/:id/categories', requireAuth, (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'id must be an integer' });
+  const cats = Array.isArray(req.body?.categories) ? req.body.categories : null;
+  if (!cats) return res.status(400).json({ error: 'categories: string[] required' });
+  // Verify ownership before mutating — protects against horizontal
+  // privilege escalation (one user editing another's subscription).
+  const mine = meshDb().listPushSubscriptions({ userIds: [req.user!.id] });
+  if (!mine.some(s => s.id === id)) return res.status(404).json({ error: 'subscription not found' });
+  const validated = cats.filter((c: unknown): c is string =>
+    typeof c === 'string' && (PUSH_CATEGORIES as readonly string[]).includes(c));
+  meshDb().setPushSubscriptionCategories(id, validated);
+  return res.json({ ok: true, categories: validated });
+});
+
+/** GET /api/push/subscriptions — list THIS user's subscriptions for
+ *  Settings → Notifications. */
+app.get('/api/push/subscriptions', requireAuth, (req, res) => {
+  const list = meshDb().listPushSubscriptions({ userIds: [req.user!.id] })
+    .map(s => ({
+      id: s.id,
+      endpoint: s.endpoint.slice(0, 60) + (s.endpoint.length > 60 ? '…' : ''),
+      categories: s.categories,
+      userAgent: s.userAgent,
+      createdAt: s.createdAt,
+      updatedAt: s.updatedAt,
+    }));
+  return res.json({ subscriptions: list });
+});
+
+/** DELETE /api/push/subscriptions/:id — remove a single subscription. */
+app.delete('/api/push/subscriptions/:id', requireAuth, (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'id must be an integer' });
+  const mine = meshDb().listPushSubscriptions({ userIds: [req.user!.id] });
+  const target = mine.find(s => s.id === id);
+  if (!target) return res.status(404).json({ error: 'subscription not found' });
+  meshDb().deletePushSubscription(id);
+  return res.json({ ok: true });
+});
+
+/** POST /api/push/unsubscribe — DELETE by endpoint (the browser's
+ *  pushManager.unsubscribe path). Body: { endpoint }. */
+app.post('/api/push/unsubscribe', requireAuth, (req, res) => {
+  const endpoint = String(req.body?.endpoint ?? '');
+  if (!endpoint) return res.status(400).json({ error: 'endpoint required' });
+  meshDb().deletePushSubscriptionByEndpoint(req.user!.id, endpoint);
+  return res.json({ ok: true });
+});
+
+/** POST /api/push/test — fire a test notification to all of the
+ *  current user's subscriptions. Used by the Settings → Notifications
+ *  "Send test" button so operators can verify the path end-to-end
+ *  before assuming push works. */
+app.post('/api/push/test', requireAuth, async (req, res) => {
+  try {
+    const report = await pushDispatch([req.user!.id], {
+      title: 'MeshView Sentinel',
+      body: `Test push from ${req.user!.username} at ${new Date().toLocaleTimeString()}`,
+      category: 'dm',
+      url: '/',
+      tag: 'test',
+    });
+    return res.json({ ok: true, ...report });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 // =============================================
@@ -4902,6 +5047,94 @@ bridgeManager.on('bbsMail',                 fanOut('bbsMail'));
 bridgeManager.on('bbsSubscriber',           fanOut('bbsSubscriber'));
 // v2.0: LoRa config readback completed — Settings → Radios re-fetches.
 bridgeManager.on('loraConfigUpdate',        fanOut('loraConfig'));
+
+// =============================================
+// v2.0.0 Web Push — server-side dispatch hooks
+// =============================================
+//
+// Fire push notifications to operators' browsers (even when the tab
+// is closed) for events that warrant attention:
+//   - 'dm'      : DM addressed to the local node of any connected radio
+//                 (excluding messages from ourselves echoed back, and
+//                 reactions which are noise)
+//   - 'outage'  : NODE_LOST events on favorited nodes
+//   - 'weather' : new NWS WEATHER_ALERT events
+//
+// Targeting: we fan out to EVERY user whose workspace contains the
+// radio the event fired on. Per-user category opt-in is enforced at
+// the dispatcher (subscription.categories includes payload.category).
+//
+// The in-page Notification API path in useMeshNotifications still
+// fires for foreground tabs; the two paths are independent and the
+// user can disable either independently.
+function usersForRadio(radioId: string | null | undefined): number[] {
+  if (!radioId) {
+    // Legacy 1.x messages without a radioId stamp belong to "everyone"
+    // semantically — fan out to every user with at least one workspace.
+    return meshDb().listUsers().map(u => u.id);
+  }
+  const row = meshDb().getRadio(radioId);
+  if (!row || row.workspace_id == null) return [];
+  const members = meshDb().listWorkspaceMembers(row.workspace_id);
+  return members.map(m => m.userId);
+}
+
+bridgeManager.on('message', (msg: any, radioId: string | null) => {
+  if (!msg || msg.isReaction) return;
+  // Only DMs to local — skip broadcasts (channel chatter would be a
+  // notification firehose). Local node id is per-bridge; resolve via
+  // the receiving radio's context.
+  const ctx = radioId ? bridgeManager.get(radioId) : bridgeManager.getDefault();
+  const localId = ctx?.bridge.getLocalNodeId();
+  if (!localId || msg.to !== localId) return;
+  // Skip our own DMs echoed back (the radio sometimes loops sends).
+  if (msg.from === localId) return;
+  const userIds = usersForRadio(radioId);
+  if (userIds.length === 0) return;
+  const senderName = ctx?.bridge.getNodes().find(n => n.id === msg.from)?.shortName ?? msg.from?.slice(-4) ?? '????';
+  pushDispatch(userIds, {
+    title: `DM from ${senderName}`,
+    // Truncate hard so the push payload stays under 4KB and the OS
+    // notification surface doesn't get an essay.
+    body: String(msg.text ?? '').slice(0, 120),
+    category: 'dm',
+    url: `/#chat=${encodeURIComponent(msg.from)}`,
+    tag: `dm:${msg.from}`,
+  }).catch(err => console.warn('[WebPush] dm dispatch failed:', err?.message));
+});
+
+bridgeManager.on('event', (evt: any, radioId: string | null) => {
+  if (!evt) return;
+  if (evt.type === 'NODE_LOST') {
+    // Only fire for favorites — generic NODE_LOST on the open mesh
+    // is too chatty to push. nodeId on the event is the lost node's id.
+    const lostId = evt.nodeId;
+    if (!lostId) return;
+    const ctx = radioId ? bridgeManager.get(radioId) : bridgeManager.getDefault();
+    const node = ctx?.bridge.getNodes().find(n => n.id === lostId);
+    if (!node?.favorite) return;
+    const userIds = usersForRadio(radioId);
+    if (userIds.length === 0) return;
+    pushDispatch(userIds, {
+      title: `Favorite offline: ${node.shortName ?? lostId.slice(-4)}`,
+      body: evt.details || 'Stopped reporting.',
+      category: 'outage',
+      url: '/',
+      tag: `outage:${lostId}`,
+    }).catch(err => console.warn('[WebPush] outage dispatch failed:', err?.message));
+  } else if (evt.type === 'WEATHER_ALERT') {
+    // Weather alerts are install-wide (poller runs against the BBS
+    // node), so fan out to ALL users — let the per-user opt-out
+    // handle it.
+    pushDispatch('all', {
+      title: 'Weather alert',
+      body: String(evt.details ?? '').slice(0, 200),
+      category: 'weather',
+      url: '/',
+      tag: `weather:${evt.id ?? evt.timestamp ?? 'alert'}`,
+    }).catch(err => console.warn('[WebPush] weather dispatch failed:', err?.message));
+  }
+});
 
 app.get('/api/mesh/stream', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');

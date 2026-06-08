@@ -447,6 +447,38 @@ export class MeshDatabase {
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
       );
       CREATE INDEX IF NOT EXISTS idx_user_prefs_user ON user_prefs(user_id);
+
+      -- v2.0.0 (post-GA) Web Push: per-user browser push subscriptions.
+      --
+      -- A single user can have multiple subscriptions (phone, laptop,
+      -- desktop browser) so the natural key is (user_id, endpoint).
+      -- The endpoint is the URL the push service hands back from
+      -- pushManager.subscribe(); p256dh + auth are the per-subscription
+      -- crypto material the push service expects on every send.
+      --
+      -- categories holds the per-subscription opt-in mask as a JSON
+      -- array of strings — empty array means "subscribed but muted,"
+      -- letting the user disable without re-prompting the browser for
+      -- permission. user_agent is informational (helps the operator
+      -- recognize "this is my work laptop" in Settings → Notifications).
+      --
+      -- Cascade-delete with the user so deleting an account drops their
+      -- push subscriptions too — no orphaned rows pinging dead push
+      -- endpoints forever.
+      CREATE TABLE IF NOT EXISTS push_subscriptions (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id          INTEGER NOT NULL,
+        endpoint         TEXT NOT NULL,
+        p256dh           TEXT NOT NULL,
+        auth_secret      TEXT NOT NULL,
+        categories_json  TEXT NOT NULL DEFAULT '["dm","mention","outage","weather"]',
+        user_agent       TEXT,
+        created_at       INTEGER NOT NULL,
+        updated_at       INTEGER NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        UNIQUE (user_id, endpoint)
+      );
+      CREATE INDEX IF NOT EXISTS idx_push_subs_user ON push_subscriptions(user_id);
     `);
 
     // Additive migrations for older DBs. SQLite throws if the column already
@@ -2913,6 +2945,99 @@ export class MeshDatabase {
     return r.changes > 0;
   }
 
+  // -- v2.0.0 Web Push: per-user browser push subscriptions ---------
+
+  /**
+   * Idempotent upsert keyed on (user_id, endpoint). The browser hands
+   * the same endpoint back across page reloads as long as the
+   * underlying ServiceWorkerRegistration survives, so re-subscribing
+   * from the same browser updates the row instead of stacking dupes.
+   * Returns the resulting row's id.
+   */
+  upsertPushSubscription(input: {
+    userId: number;
+    endpoint: string;
+    p256dh: string;
+    authSecret: string;
+    categories: string[];
+    userAgent: string | null;
+  }): number {
+    const now = Date.now();
+    const existing = this.db.prepare(
+      `SELECT id FROM push_subscriptions WHERE user_id = ? AND endpoint = ?`
+    ).get(input.userId, input.endpoint) as { id: number } | undefined;
+    if (existing) {
+      this.db.prepare(`
+        UPDATE push_subscriptions
+        SET p256dh = ?, auth_secret = ?, categories_json = ?, user_agent = ?, updated_at = ?
+        WHERE id = ?
+      `).run(input.p256dh, input.authSecret, JSON.stringify(input.categories), input.userAgent, now, existing.id);
+      return existing.id;
+    }
+    const r = this.db.prepare(`
+      INSERT INTO push_subscriptions
+        (user_id, endpoint, p256dh, auth_secret, categories_json, user_agent, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.userId, input.endpoint, input.p256dh, input.authSecret,
+      JSON.stringify(input.categories), input.userAgent, now, now
+    );
+    return Number(r.lastInsertRowid);
+  }
+
+  /** List subscriptions for a given user (Settings → Notifications) or
+   *  for the dispatch fanout. Pass userIds: undefined to fetch ALL. */
+  listPushSubscriptions(opts: { userIds?: number[] } = {}): PushSubscriptionRow[] {
+    let rows;
+    if (opts.userIds && opts.userIds.length > 0) {
+      const placeholders = opts.userIds.map(() => '?').join(',');
+      rows = this.db.prepare(`
+        SELECT id, user_id AS userId, endpoint, p256dh, auth_secret AS authSecret,
+               categories_json AS categoriesJson, user_agent AS userAgent,
+               created_at AS createdAt, updated_at AS updatedAt
+        FROM push_subscriptions
+        WHERE user_id IN (${placeholders})
+        ORDER BY created_at ASC
+      `).all(...opts.userIds) as any[];
+    } else {
+      rows = this.db.prepare(`
+        SELECT id, user_id AS userId, endpoint, p256dh, auth_secret AS authSecret,
+               categories_json AS categoriesJson, user_agent AS userAgent,
+               created_at AS createdAt, updated_at AS updatedAt
+        FROM push_subscriptions
+        ORDER BY created_at ASC
+      `).all() as any[];
+    }
+    return rows.map(r => ({
+      ...r,
+      categories: safeParseJsonArray(r.categoriesJson),
+    }));
+  }
+
+  /** Update just the categories mask for a single subscription. The UI
+   *  toggles individual categories without re-prompting the browser. */
+  setPushSubscriptionCategories(id: number, categories: string[]): boolean {
+    const r = this.db.prepare(
+      `UPDATE push_subscriptions SET categories_json = ?, updated_at = ? WHERE id = ?`
+    ).run(JSON.stringify(categories), Date.now(), id);
+    return r.changes > 0;
+  }
+
+  deletePushSubscription(id: number): boolean {
+    const r = this.db.prepare(`DELETE FROM push_subscriptions WHERE id = ?`).run(id);
+    return r.changes > 0;
+  }
+
+  /** Helper for the API endpoint: delete the row matching (user, endpoint).
+   *  Avoids handing the subscription id back to the client just for
+   *  unsubscribe. */
+  deletePushSubscriptionByEndpoint(userId: number, endpoint: string): boolean {
+    const r = this.db.prepare(
+      `DELETE FROM push_subscriptions WHERE user_id = ? AND endpoint = ?`
+    ).run(userId, endpoint);
+    return r.changes > 0;
+  }
+
   /**
    * Delete the radios row. v2.0 bugfix: the DB layer no longer enforces an
    * `is_default = 0` guard — that conflated "operator-preferred default"
@@ -2958,6 +3083,38 @@ export class MeshDatabase {
     });
     tx();
     return results;
+  }
+}
+
+// ---------------------------------------------------------------------
+// v2.0.0 Web Push: push subscription row shape (mirrors the
+// push_subscriptions table with categoriesJson already parsed to an
+// array for caller convenience).
+// ---------------------------------------------------------------------
+export interface PushSubscriptionRow {
+  id: number;
+  userId: number;
+  endpoint: string;
+  p256dh: string;
+  authSecret: string;
+  /** Parsed from categories_json. Use one of the strings the dispatcher
+   *  recognises ('dm' | 'mention' | 'outage' | 'weather') — empty
+   *  array means "subscribed but muted." */
+  categories: string[];
+  userAgent: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** Defensive parse for categories_json. Bad / missing JSON falls back
+ *  to an empty array (subscription kept, silent until user opts back in). */
+function safeParseJsonArray(raw: unknown): string[] {
+  if (typeof raw !== 'string') return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter(x => typeof x === 'string') : [];
+  } catch {
+    return [];
   }
 }
 
