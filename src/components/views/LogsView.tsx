@@ -85,7 +85,8 @@ export function LogsView({ events }: LogsViewProps) {
                 event.type === 'TELEMETRY' ? "text-brand-accent" :
                 event.type === 'NODE_JOINED' ? "text-brand-warning" :
                 event.type === 'OUTAGE' ? "text-brand-error" :
-                event.type === 'WEATHER_ALERT' ? "text-brand-error" : "text-brand-muted"
+                event.type === 'WEATHER_ALERT' ? "text-brand-error" :
+                event.type === 'WEATHER_DELIVERY' ? "text-sky-300" : "text-brand-muted"
               )}>{event.type}</span>
               <span className="text-brand-ink truncate">{event.details}</span>
               <span className="ml-auto opacity-0 group-hover:opacity-100 text-brand-muted text-[10px] shrink-0">{event.nodeId}</span>

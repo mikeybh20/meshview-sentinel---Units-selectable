@@ -615,6 +615,10 @@ export class MeshDataService {
 
   async getBbsServiceNode(): Promise<{
     radioId: string | null;
+    /** v2.1: BBS bridge's local node id (`!hex` form). Lets the UI
+     *  detect "operator self-subscribed" rows so we can explain that
+     *  no DM arrives for those (firmware absorbs self-DMs). */
+    localNodeId: string | null;
     candidates: Array<{ radio_id: string; long_name: string; workspace_id: number | null }>;
   } | null> {
     try {

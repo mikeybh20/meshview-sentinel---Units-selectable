@@ -15,6 +15,7 @@
  *   - NWS/zippopotam is unreachable (logs the error but doesn't crash)
  */
 
+import { randomUUID } from 'crypto';
 import { weatherService, type NwsAlert } from './weather.js';
 import type { BbsConfig } from './bbsConfig.js';
 import { meshDb as meshDbFactory } from './database.js';
@@ -406,6 +407,7 @@ export class WeatherAlertPoller {
 
     console.log(`[WeatherPoller] Fanning out to ${subscribers.length} subscriber(s) via BBS node "${bbsRadioId}"`);
     let delivered = 0;
+    let selfSubscribed = 0;
     let skipped = 0;
     for (const sub of subscribers) {
       // Persist mail row first — even if the DM fails, the subscriber can pull
@@ -432,20 +434,138 @@ export class WeatherAlertPoller {
       const bridge = bbsBridge;
       if (!bridge) { skipped++; continue; }
 
-      // Best-effort DM. sendMessage handles auto-retry on rate limit + transient
-      // routing errors internally.
-      try {
-        await bridge.sendMessage(compact, sub.nodeId, sub.channelIndex);
-        meshDb.touchWeatherSubscriberAlert(sub.nodeId);
+      // v2.1 fix: defensive guard — the weather poller MUST NEVER send
+      // to the broadcast address. sendMessage interprets to='!ffffffff'
+      // as a primary-channel broadcast, which would spam everyone on
+      // LongFast. Subscriber rows should always carry a hex node id;
+      // bail loudly if anything else slipped in.
+      if (!sub.nodeId || !/^![0-9a-f]{8}$/i.test(sub.nodeId) || sub.nodeId.toLowerCase() === '!ffffffff') {
+        console.warn(`[WeatherPoller] Refusing send: subscriber.nodeId="${sub.nodeId}" is not a valid hex DM target. Skipping.`);
+        skipped++;
+        continue;
+      }
+
+      // v2.1 fix: skip the over-the-air sendMessage when the subscriber IS
+      // the BBS node's local node. Meshtastic firmware silently absorbs
+      // self-DMs — they never fire a notification on the operator's
+      // physical device, even though the mail row above persists fine.
+      if (localNodeId && sub.nodeId === localNodeId) {
         if (mailId !== undefined) meshDb.markMailDelivered(mailId);
-        delivered++;
+        meshDb.touchWeatherSubscriberAlert(sub.nodeId);
+        selfSubscribed++;
+        continue;
+      }
+
+      // v2.1: full ACK lifecycle. sendMessage hands the packet to the
+      // firmware and returns immediately with a localId; we then await
+      // the bridge's terminal ackUpdate ('acked' | 'error') or our own
+      // 60s 'noack' timeout. Each phase logs to the Event Log as
+      // WEATHER_DELIVERY so the operator can grep "did 7fba ACK?"
+      // without parsing docker logs.
+      const subShort = sub.nodeId.slice(-4);
+      let localId: string;
+      try {
+        localId = await bridge.sendMessage(compact, sub.nodeId, sub.channelIndex);
+        meshDb.touchWeatherSubscriberAlert(sub.nodeId);
+        bridge.recordEvent({
+          id: randomUUID(),
+          type: 'WEATHER_DELIVERY',
+          nodeId: sub.nodeId,
+          timestamp: Date.now(),
+          details: `SENT alert to ${subShort} via ${bbsRadioId} ch=${sub.channelIndex} (awaiting ACK)`,
+        });
+        console.log(`[WeatherPoller] SENT alert to ${sub.nodeId} via ${bbsRadioId} ch=${sub.channelIndex} localId=${localId} (awaiting ACK)`);
       } catch (err: any) {
-        console.warn(`[WeatherPoller] DM to ${sub.nodeId} via BBS node ${bbsRadioId} failed: ${err?.message}`);
+        console.warn(`[WeatherPoller] sendMessage threw for ${sub.nodeId}: ${err?.message}`);
+        bridge.recordEvent({
+          id: randomUUID(),
+          type: 'WEATHER_DELIVERY',
+          nodeId: sub.nodeId,
+          timestamp: Date.now(),
+          details: `SEND FAILED to ${subShort}: ${err?.message ?? 'unknown error'} — mail row left in inbox`,
+        });
+        continue;
+      }
+
+      const ack = await bridge.waitForAckOutcome(localId, 60_000);
+      if (ack.outcome === 'acked') {
+        if (mailId !== undefined) meshDb.markMailDelivered(mailId);
+        bridge.recordEvent({
+          id: randomUUID(),
+          type: 'WEATHER_DELIVERY',
+          nodeId: sub.nodeId,
+          timestamp: Date.now(),
+          details: `ACKed by ${subShort} — alert delivered`,
+        });
+        console.log(`[WeatherPoller] ACKed by ${sub.nodeId} for localId=${localId}`);
+        delivered++;
+        await new Promise(r => setTimeout(r, 500));
+        continue;
+      }
+
+      // v2.1: ACK failure (noack timeout OR firmware error). Send the
+      // short mail-notice DM as a fallback — same DM channel, no
+      // broadcast — on the theory that a 50-char packet has a better
+      // chance of getting through a marginal link than the 200-char
+      // alert body. The mail row is already in the inbox; this notice
+      // tells the recipient to come read it.
+      const failDetail = ack.outcome === 'error'
+        ? `firmware error code=${ack.errorCode}`
+        : 'no ACK in 60s';
+      console.warn(`[WeatherPoller] No ACK from ${sub.nodeId} for alert (${failDetail}). Trying mail-notice fallback.`);
+      bridge.recordEvent({
+        id: randomUUID(),
+        type: 'WEATHER_DELIVERY',
+        nodeId: sub.nodeId,
+        timestamp: Date.now(),
+        details: `NO ACK from ${subShort} (${failDetail}) — trying mail-notice fallback`,
+      });
+
+      const notice = `✉ Weather alert. DM :mail R to read.`;
+      let noticeLocalId: string | null = null;
+      try {
+        noticeLocalId = await bridge.sendMessage(notice, sub.nodeId, sub.channelIndex);
+      } catch (err: any) {
+        console.warn(`[WeatherPoller] Mail-notice sendMessage threw for ${sub.nodeId}: ${err?.message}`);
+        bridge.recordEvent({
+          id: randomUUID(),
+          type: 'WEATHER_DELIVERY',
+          nodeId: sub.nodeId,
+          timestamp: Date.now(),
+          details: `MAIL-NOTICE SEND FAILED to ${subShort}: ${err?.message ?? 'unknown'} — left in inbox`,
+        });
+      }
+      if (noticeLocalId) {
+        const noticeAck = await bridge.waitForAckOutcome(noticeLocalId, 30_000);
+        if (noticeAck.outcome === 'acked') {
+          if (mailId !== undefined) meshDb.markMailDelivered(mailId);
+          bridge.recordEvent({
+            id: randomUUID(),
+            type: 'WEATHER_DELIVERY',
+            nodeId: sub.nodeId,
+            timestamp: Date.now(),
+            details: `ACKed mail-notice from ${subShort} — fallback delivered (alert body still in inbox)`,
+          });
+          console.log(`[WeatherPoller] Mail-notice ACKed by ${sub.nodeId}`);
+          delivered++;
+        } else {
+          const notice2Detail = noticeAck.outcome === 'error'
+            ? `firmware error code=${noticeAck.errorCode}`
+            : 'no ACK in 30s';
+          bridge.recordEvent({
+            id: randomUUID(),
+            type: 'WEATHER_DELIVERY',
+            nodeId: sub.nodeId,
+            timestamp: Date.now(),
+            details: `NO ACK from ${subShort} on fallback (${notice2Detail}) — left in inbox`,
+          });
+          console.warn(`[WeatherPoller] No ACK from ${sub.nodeId} on mail-notice fallback either (${notice2Detail}). Mail row stays in inbox.`);
+        }
       }
 
       // Small inter-subscriber pause so we don't slam the firmware queue.
       await new Promise(r => setTimeout(r, 500));
     }
-    console.log(`[WeatherPoller] Subscriber fanout complete: ${delivered}/${subscribers.length} DM delivered`);
+    console.log(`[WeatherPoller] Subscriber fanout complete: ${delivered} DM, ${selfSubscribed} self-subscribed (mail only), ${skipped} skipped, of ${subscribers.length} total`);
   }
 }

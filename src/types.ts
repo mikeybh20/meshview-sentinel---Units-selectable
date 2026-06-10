@@ -163,7 +163,9 @@ export interface Message {
 
 export interface RadioEvent {
   id: string;
-  type: 'NODE_JOINED' | 'NODE_LOST' | 'MESSAGE' | 'TELEMETRY' | 'POSITION_UPDATE' | 'WEATHER_ALERT' | 'OUTAGE';
+  /** v2.1: WEATHER_DELIVERY tracks each weather-alert send end-to-end
+   *  (SENT → ACK / NO ACK → optional fallback mail-notice outcome). */
+  type: 'NODE_JOINED' | 'NODE_LOST' | 'MESSAGE' | 'TELEMETRY' | 'POSITION_UPDATE' | 'WEATHER_ALERT' | 'WEATHER_DELIVERY' | 'OUTAGE';
   nodeId: string;
   timestamp: number;
   details: string;

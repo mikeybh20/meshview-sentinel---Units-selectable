@@ -145,7 +145,12 @@ interface ResendContext {
 
 export interface MeshEvent {
   id: string;
-  type: 'NODE_JOINED' | 'NODE_LOST' | 'MESSAGE' | 'TELEMETRY' | 'POSITION_UPDATE' | 'WEATHER_ALERT' | 'OUTAGE';
+  /** v2.1: WEATHER_DELIVERY tracks every weather-alert send attempt
+   *  end-to-end — the initial SENT log, the ACKed / NoACK outcome,
+   *  and the fallback mail-notice attempt. Lets the operator grep
+   *  the Event Log for "did the alert actually reach 7fba?" instead
+   *  of having to dig in docker logs. */
+  type: 'NODE_JOINED' | 'NODE_LOST' | 'MESSAGE' | 'TELEMETRY' | 'POSITION_UPDATE' | 'WEATHER_ALERT' | 'WEATHER_DELIVERY' | 'OUTAGE';
   nodeId: string;
   timestamp: number;
   details: string;
@@ -6733,6 +6738,50 @@ export class MeshtasticSerialBridge extends EventEmitter {
       console.error('[MeshtasticSerial] event persist failed:', e.message);
     }
     this.emit('event', event);
+  }
+
+  /**
+   * v2.1: Wait for a final ACK outcome on a sendMessage's localId.
+   *
+   * sendMessage emits 'ackUpdate' as the packet's state progresses:
+   *   'sending' → 'sent' → 'acked' (terminal happy path)
+   *                       → 'error' (terminal sad path — routing
+   *                                  failure / timeout / firmware NAK)
+   *
+   * This helper resolves the FIRST time we see a terminal status for
+   * the matching localId, or after `timeoutMs` if nothing terminal
+   * arrives. The 'noack' outcome is our own — it means "we gave up
+   * waiting," distinct from the firmware's 'error' which is an
+   * explicit refusal/timeout.
+   *
+   * The caller is responsible for taking action on the result; this
+   * helper has no side effects beyond subscribing + cleaning up its
+   * own listener.
+   */
+  async waitForAckOutcome(
+    localId: string,
+    timeoutMs = 60_000,
+  ): Promise<{ outcome: 'acked' | 'noack' | 'error'; errorCode: number }> {
+    return new Promise(resolve => {
+      let done = false;
+      const finish = (result: { outcome: 'acked' | 'noack' | 'error'; errorCode: number }) => {
+        if (done) return;
+        done = true;
+        this.off('ackUpdate', onAck);
+        clearTimeout(timer);
+        resolve(result);
+      };
+      const onAck = (id: string, status: string, errorCode: number) => {
+        if (id !== localId) return;
+        if (status === 'acked') return finish({ outcome: 'acked', errorCode: 0 });
+        if (status === 'error') return finish({ outcome: 'error', errorCode });
+        // 'sending' / 'sent' are intermediate — keep waiting.
+      };
+      this.on('ackUpdate', onAck);
+      const timer = setTimeout(() => finish({ outcome: 'noack', errorCode: 0 }), timeoutMs);
+      // Don't keep the process alive while waiting.
+      try { (timer as any).unref?.(); } catch { /* noop */ }
+    });
   }
 
   /**

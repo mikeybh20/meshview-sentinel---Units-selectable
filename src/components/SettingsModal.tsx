@@ -2200,6 +2200,10 @@ function WeatherSubscribers() {
   const [subs, setSubs] = React.useState<WeatherSubscriber[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [removing, setRemoving] = React.useState<string | null>(null);
+  /** v2.1: BBS bridge's local node id. Used to flag self-subscribed
+   *  rows in the list so the operator understands why those alerts
+   *  show up in the inbox but not as device-level DMs. */
+  const [bbsLocalNodeId, setBbsLocalNodeId] = React.useState<string | null>(null);
 
   const refresh = React.useCallback(async () => {
     setLoading(true);
@@ -2215,12 +2219,24 @@ function WeatherSubscribers() {
 
   React.useEffect(() => {
     refresh();
+    // Fetch the BBS bridge's local node id once on mount so the
+    // self-subscribed badge can render. Pre-Beta-5 builds returned
+    // no localNodeId; we tolerate null by simply not flagging anyone.
+    meshDataService.getBbsServiceNode().then(info => {
+      setBbsLocalNodeId(info?.localNodeId ?? null);
+    });
     // Re-fetch on SSE bbsSubscriber events so the panel updates live as
     // remote nodes subscribe / unsubscribe over the air.
     const es = new EventSource(`${API_BASE}/api/mesh/stream`);
     es.addEventListener('bbsSubscriber', () => { refresh(); });
     return () => es.close();
   }, [refresh]);
+
+  // Count self-subscribed rows so we can show a banner explaining the
+  // mail-only behavior when at least one exists.
+  const selfSubscribedCount = bbsLocalNodeId
+    ? subs.filter(s => s.nodeId === bbsLocalNodeId).length
+    : 0;
 
   const handleRemove = async (nodeId: string) => {
     setRemoving(nodeId);
@@ -2247,33 +2263,59 @@ function WeatherSubscribers() {
           Refresh
         </button>
       </div>
+      {/* v2.1: when the operator is also subscribed via the same radio
+          that hosts the BBS, explain that no device-level DM arrives
+          for self-subscribed rows — Meshtastic firmware silently
+          absorbs self-DMs. The mail row still persists so dashboard
+          users see the alert; this banner tells the operator why
+          their phone never buzzed. */}
+      {selfSubscribedCount > 0 && (
+        <div className="flex items-start gap-2 rounded border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-300">
+          <AlertCircle size={12} className="mt-0.5 flex-shrink-0" />
+          <span>
+            <strong>{selfSubscribedCount === 1 ? 'One subscriber is' : `${selfSubscribedCount} subscribers are`} the BBS radio's own local node.</strong>
+            {' '}Meshtastic firmware doesn't deliver self-DMs, so alerts won't arrive on those devices. The dashboard BBS Mail inbox + Event Log still show them. To receive over-the-air DMs, subscribe from a different node.
+          </span>
+        </div>
+      )}
       {subs.length === 0 ? (
         <p className="text-[11px] text-brand-muted italic">
-          No subscribers yet. Remote nodes can opt in by DMing <code className="text-brand-accent">:weather subscribe</code> to your node.
+          No subscribers yet. Remote nodes can opt in by DMing <code className="text-brand-accent">:wx subscribe</code> (or <code className="text-brand-accent">:weather subscribe</code>) to your node.
         </p>
       ) : (
         <div className="border border-brand-line rounded overflow-hidden">
-          {subs.map(s => (
-            <div
-              key={s.nodeId}
-              className="flex items-center gap-2 px-2 py-1.5 text-xs border-b border-brand-line/40 last:border-b-0 hover:bg-brand-line/30 transition-colors"
-            >
-              <span className="mono-text text-brand-ink shrink-0 w-28">{s.nodeId}</span>
-              <span className="mono-text text-[10px] text-brand-muted shrink-0">ch{s.channelIndex}</span>
-              <span className="text-[10px] text-brand-muted flex-1 truncate">
-                subscribed {relTime(s.subscribedAt)}
-                {s.lastAlertAt && ` · last alert ${relTime(s.lastAlertAt)}`}
-              </span>
-              <button
-                onClick={() => handleRemove(s.nodeId)}
-                disabled={removing === s.nodeId}
-                className="text-[10px] mono-text uppercase tracking-widest text-brand-muted hover:text-brand-error transition-colors disabled:opacity-40"
-                title="Remove this subscriber"
+          {subs.map(s => {
+            const isSelf = !!bbsLocalNodeId && s.nodeId === bbsLocalNodeId;
+            return (
+              <div
+                key={s.nodeId}
+                className="flex items-center gap-2 px-2 py-1.5 text-xs border-b border-brand-line/40 last:border-b-0 hover:bg-brand-line/30 transition-colors"
               >
-                {removing === s.nodeId ? '…' : 'Remove'}
-              </button>
-            </div>
-          ))}
+                <span className="mono-text text-brand-ink shrink-0 w-28">{s.nodeId}</span>
+                <span className="mono-text text-[10px] text-brand-muted shrink-0">ch{s.channelIndex}</span>
+                {isSelf && (
+                  <span
+                    className="text-[9px] font-bold uppercase tracking-widest px-1.5 py-0.5 rounded border border-amber-500/40 text-amber-300 bg-amber-500/10 shrink-0"
+                    title="This subscriber is the BBS radio's own local node — alerts land in the inbox but firmware absorbs the self-DM, so no device notification."
+                  >
+                    self
+                  </span>
+                )}
+                <span className="text-[10px] text-brand-muted flex-1 truncate">
+                  subscribed {relTime(s.subscribedAt)}
+                  {s.lastAlertAt && ` · last alert ${relTime(s.lastAlertAt)}`}
+                </span>
+                <button
+                  onClick={() => handleRemove(s.nodeId)}
+                  disabled={removing === s.nodeId}
+                  className="text-[10px] mono-text uppercase tracking-widest text-brand-muted hover:text-brand-error transition-colors disabled:opacity-40"
+                  title="Remove this subscriber"
+                >
+                  {removing === s.nodeId ? '…' : 'Remove'}
+                </button>
+              </div>
+            );
+          })}
         </div>
       )}
     </div>

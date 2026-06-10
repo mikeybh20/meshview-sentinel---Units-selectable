@@ -4421,8 +4421,16 @@ app.post('/api/labeled-devices/:id/push', requireAuth, async (req, res) => {
 });
 
 app.get('/api/mesh/bbs/node', requireAuth, (_req, res) => {
+  // v2.1: also surface the BBS bridge's local node id so the
+  // WeatherSubscribers panel can flag self-subscribed rows (the
+  // operator subscribing via the same radio that hosts the BBS —
+  // mail row persists but the firmware silently absorbs the self-DM,
+  // so no notification arrives on the device).
+  const bbsCtx = bridgeManager.getBbsNode();
+  const localNodeId = bbsCtx?.bridge.getLocalNodeId() ?? null;
   return res.json({
     radioId: meshDb().getBbsNodeRadioId(),
+    localNodeId,
     candidates: meshDb().listRadios().map(r => ({
       radio_id: r.radio_id,
       long_name: r.long_name,
