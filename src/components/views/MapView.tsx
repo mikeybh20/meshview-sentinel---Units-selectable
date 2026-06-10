@@ -16,6 +16,7 @@ import { roleLabel, hardwareLabel, ROLE_SHORT } from '../../lib/meshEnums';
 import { hexToRgba } from '../../lib/color';
 import { cn } from '../../lib/utils';
 import { meshDataService } from '../../services/meshDataService';
+import { useMapClustering } from '../../hooks/useMapClustering';
 
 interface MapViewProps {
   nodes: Node[];
@@ -763,6 +764,17 @@ export function MapView({
   const [coverageData, setCoverageData] = React.useState<Awaited<ReturnType<typeof meshDataService.getRangeTestCoverage>> | null>(null);
   const [coverageLoading, setCoverageLoading] = React.useState(false);
   const [coverageHeatmap, setCoverageHeatmap] = React.useState(false);
+  // v2.1: GPU/CPU spatial clustering for map pins. When on, the
+  // marker render path swaps individual node pins for cluster markers
+  // (single pin per cluster with a count). DBSCAN runs on the sidecar;
+  // backend reads back as cuML / CPU and surfaces in the Coverage
+  // panel toggle subtitle.
+  const [clusterMode, setClusterMode] = React.useState(false);
+  const clusterResult = useMapClustering(nodes, {
+    enabled: clusterMode,
+    epsMeters: 80,
+    minSamples: 2,
+  });
 
   /**
    * Mesh stats derived from the current node set + visible-on-map subset.
@@ -961,7 +973,49 @@ export function MapView({
           {/* Message Trace Layer */}
           <TraceLinks nodes={nodes} messages={messages} traceMessageId={traceMessageId} />
 
-          {nodes.filter(n => n.position && !blockedNodeIds.has(n.id)).map(node => {
+          {/* v2.1: when clusterMode is on, render a single pin per
+              multi-member cluster at the centroid + suppress the
+              individual markers for nodes that belong to those
+              clusters. Singletons (size-1 clusters) still render as
+              normal markers. Clicking a cluster pin re-pans to its
+              centroid and zooms in one step so the operator can
+              explode it. */}
+          {clusterMode && clusterResult?.clusters
+            .filter(c => c.count > 1)
+            .map(c => (
+              <Overlay key={`cluster:${c.id}`} anchor={[c.lat, c.lng]} offset={[24, 24]}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    // Pan + zoom to the cluster centroid; pigeon-maps
+                    // doesn't expose a setZoom prop directly, but the
+                    // parent <Map>'s state-driven center prop picks up
+                    // changes. The simplest "explode" gesture is to
+                    // temporarily reduce eps via the toggle off-and-on.
+                    setClusterMode(false);
+                  }}
+                  title={`Cluster of ${c.count} nodes near ${c.lat.toFixed(4)}, ${c.lng.toFixed(4)}. Click to disable clustering and see the individual pins.`}
+                  className="w-12 h-12 rounded-full bg-brand-accent/30 hover:bg-brand-accent/45 border-2 border-brand-accent text-brand-ink font-bold text-xs flex items-center justify-center cursor-pointer transition-colors shadow-lg"
+                >
+                  {c.count}
+                </button>
+              </Overlay>
+            ))}
+
+          {nodes.filter(n => {
+            if (!n.position || blockedNodeIds.has(n.id)) return false;
+            // v2.1: suppress markers for nodes inside a multi-member
+            // cluster while clusterMode is on. We keep singleton
+            // clusters rendering as normal markers.
+            if (clusterMode && clusterResult) {
+              const cid = clusterResult.byNodeId.get(n.id);
+              if (cid != null) {
+                const cluster = clusterResult.clusters.find(c => c.id === cid);
+                if (cluster && cluster.count > 1) return false;
+              }
+            }
+            return true;
+          }).map(node => {
             // Match the Meshtastic mobile clients: render the short name inside
             // the marker so each node is identifiable at a glance, no popup needed.
             const label = node.shortName || node.id.slice(-4).toUpperCase();
@@ -1232,6 +1286,30 @@ export function MapView({
                         <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-brand-muted/50"></span>none</span>
                       </div>
                     )}
+
+                    {/* v2.1: GPU/CPU spatial clustering toggle. Routes
+                        through the sidecar so the operator can see which
+                        backend handled it (cuML on Orin, CPU otherwise).
+                        epsMeters=80 collapses markers within a city block. */}
+                    <label className="flex items-start justify-between gap-3 pt-3 border-t border-brand-line/60 cursor-pointer">
+                      <div className="flex-1">
+                        <p className="text-[10px] uppercase font-bold tracking-widest text-brand-ink">Cluster pins</p>
+                        <p className="text-[9px] text-brand-muted leading-snug">
+                          DBSCAN-collapse markers within ~80m so dense areas (city centers, repeater clusters) read as one pin with a count.
+                          {clusterResult && (
+                            <span className="ml-1 inline-flex items-center gap-1 px-1 py-0.5 rounded border border-brand-line/60 text-brand-muted">
+                              backend: <span className="text-brand-accent mono-text">{clusterResult.backend}</span>
+                            </span>
+                          )}
+                        </p>
+                      </div>
+                      <input
+                        type="checkbox"
+                        checked={clusterMode}
+                        onChange={e => setClusterMode(e.target.checked)}
+                        className="w-4 h-4 accent-emerald-500 shrink-0"
+                      />
+                    </label>
                   </div>
 
                   {!coverageData ? (

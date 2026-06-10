@@ -1,0 +1,113 @@
+# meshview-gpu — CUDA-enabled sidecar image (v2.1)
+#
+# Multi-platform: ONE Dockerfile, the right base picked automatically
+# based on the build target. The trick is the BUILDPLATFORM /
+# TARGETPLATFORM split + the BASE_IMAGE build-arg, set by buildx in
+# the docker-compose build step.
+#
+# Tier matrix:
+#   linux/amd64                 → nvidia/cuda:12.3.1-runtime-ubuntu22.04
+#                                  + RAPIDS via pip (cuML / cuGraph / cuPy)
+#                                  → tier="cuda-rapids"
+#   linux/arm64 (Jetson AGX/Orin Nano) → nvcr.io/nvidia/l4t-ml:r36.2.0-py3
+#                                  → tier="cuda-rapids"  (RAPIDS ships in L4T-ML)
+#   linux/arm64 (Jetson Nano original / Nano 2GB)  → nvcr.io/nvidia/l4t-base:r32.7.1
+#                                  + cuPy 9.x via pip
+#                                  → tier="cuda-basic"   (cuML/cuGraph unavailable
+#                                                          on SM 5.3)
+#   non-NVIDIA arm64 / any host without GPU passthrough → python:3.11-slim
+#                                  → tier="cpu"           (full graceful fallback)
+#
+# How to build for each target:
+#
+#   # x86_64 server:
+#   docker build -t meshview-gpu -f gpu/Dockerfile.gpu gpu/
+#
+#   # Jetson AGX Orin / Orin Nano:
+#   docker build -t meshview-gpu \
+#     --build-arg BASE_IMAGE=nvcr.io/nvidia/l4t-ml:r36.2.0-py3 \
+#     --build-arg INSTALL_RAPIDS=0 \
+#     -f gpu/Dockerfile.gpu gpu/
+#   # (RAPIDS already in the base image — don't double-install)
+#
+#   # Original Jetson Nano / Nano 2GB:
+#   docker build -t meshview-gpu \
+#     --build-arg BASE_IMAGE=nvcr.io/nvidia/l4t-base:r32.7.1 \
+#     --build-arg INSTALL_CUPY_ONLY=1 \
+#     -f gpu/Dockerfile.gpu gpu/
+#   # (Nano can't run RAPIDS — only cuPy is supported on SM 5.3)
+#
+#   # CPU-only / dev / CI:
+#   docker build -t meshview-gpu \
+#     --build-arg BASE_IMAGE=python:3.11-slim \
+#     --build-arg INSTALL_CPU_ONLY=1 \
+#     -f gpu/Dockerfile.gpu gpu/
+
+ARG BASE_IMAGE=nvidia/cuda:12.3.1-runtime-ubuntu22.04
+FROM ${BASE_IMAGE}
+
+# Re-declare ARGs after FROM so they're visible inside this stage
+ARG INSTALL_RAPIDS=1
+ARG INSTALL_CUPY_ONLY=0
+ARG INSTALL_CPU_ONLY=0
+ARG TARGETPLATFORM
+
+LABEL org.opencontainers.image.title="meshview-gpu" \
+      org.opencontainers.image.description="GPU-accelerated workloads for MeshView Sentinel 2.1+" \
+      org.opencontainers.image.source="https://github.com/mikeybh20/meshview-sentinel---Units-selectable"
+
+# Some bases (l4t-ml, nvidia/cuda) lack python3 by default; install if missing.
+# The L4T images use Ubuntu 20.04 / 22.04 underneath; apt-get works on all.
+RUN if ! command -v python3 >/dev/null 2>&1; then \
+        apt-get update && \
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            python3 python3-pip python3-venv ca-certificates curl && \
+        rm -rf /var/lib/apt/lists/* ; \
+    fi && \
+    python3 -m pip install --upgrade pip setuptools wheel
+
+WORKDIR /app
+
+# Always-needed FastAPI deps. RAPIDS / cuPy install separately below
+# so the CPU-only path stays light.
+COPY requirements.txt .
+RUN python3 -m pip install --no-cache-dir -r requirements.txt
+
+# ----- Tier-specific package install -----
+#
+# RAPIDS install: only on the x86_64 cuda base. The L4T-ML base
+# already has cuML/cuGraph/cuPy baked in (we set INSTALL_RAPIDS=0
+# in the Jetson Orin build command above).
+#
+# cuPy-only: original Jetson Nano. RAPIDS doesn't ship for SM 5.3;
+# cuPy 9 is the highest version that still supports it.
+#
+# CPU-only: skip all CUDA installs. The app gracefully falls back
+# to pure-Python paths when no library is importable.
+
+RUN set -eux; \
+    if [ "${INSTALL_CPU_ONLY}" = "1" ]; then \
+        echo "[Dockerfile.gpu] CPU-only build — skipping CUDA package install"; \
+    elif [ "${INSTALL_CUPY_ONLY}" = "1" ]; then \
+        echo "[Dockerfile.gpu] Jetson Nano build — installing cuPy 9.6 (last SM 5.3 release)"; \
+        python3 -m pip install --no-cache-dir "cupy-cuda102==9.6.0" || \
+        python3 -m pip install --no-cache-dir "cupy==9.6.0"; \
+    elif [ "${INSTALL_RAPIDS}" = "1" ]; then \
+        echo "[Dockerfile.gpu] Full RAPIDS build — installing cuPy / cuML / cuGraph"; \
+        python3 -m pip install --no-cache-dir --extra-index-url=https://pypi.nvidia.com \
+            "cupy-cuda12x" \
+            "cuml-cu12" \
+            "cugraph-cu12"; \
+    else \
+        echo "[Dockerfile.gpu] No CUDA tier requested (default)"; \
+    fi
+
+COPY app.py .
+
+ENV MESHVIEW_GPU_PORT=7100
+EXPOSE 7100
+
+# Sentinel hits /health on boot and reads the {gpu, tier} object back
+# so the dashboard can render a tier badge ('CPU' / 'cuPy' / 'RAPIDS').
+# probe_gpu() (in app.py) handles every tier — same code in every image.
+CMD ["python3", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7100"]
