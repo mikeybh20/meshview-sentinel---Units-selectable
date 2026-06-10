@@ -21,6 +21,7 @@ import {
   disableBrowserPush,
   sendTestPush,
 } from '../lib/webPushClient';
+import { MarkdownGuide } from './settings/MarkdownGuide';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
@@ -32,6 +33,9 @@ const API_BASE = import.meta.env.VITE_API_URL || '';
 // "Loading…" placeholder while the chunk fetches.
 const UsersSection = React.lazy(() => import('./settings/UsersSection'));
 const WorkspacesSection = React.lazy(() => import('./settings/WorkspacesSection'));
+const DataSection = React.lazy(() => import('./settings/DataSection'));
+const DiskSection = React.lazy(() => import('./settings/DiskSection'));
+const JetsonGuideSection = React.lazy(() => import('./settings/JetsonSection'));
 
 /** Standard fallback for any lazy-loaded section while its chunk fetches. */
 function SettingsSectionLoading() {
@@ -176,8 +180,16 @@ export function SettingsModal(props: SettingsModalProps) {
             {active === 'display'       && <DisplaySection {...props} />}
             {active === 'blocked'       && <BlockedSection {...props} />}
             {active === 'mode'          && <ModeSection {...props} />}
-            {active === 'data'          && <DataSection {...props} />}
-            {active === 'disk'          && <DiskSection />}
+            {active === 'data' && (
+              <React.Suspense fallback={<SettingsSectionLoading />}>
+                <DataSection onOpenExport={props.onOpenExport} onClose={props.onClose} />
+              </React.Suspense>
+            )}
+            {active === 'disk' && (
+              <React.Suspense fallback={<SettingsSectionLoading />}>
+                <DiskSection />
+              </React.Suspense>
+            )}
             {active === 'bbs'           && <BbsSection />}
             {active === 'users' && (
               <React.Suspense fallback={<SettingsSectionLoading />}>
@@ -191,7 +203,11 @@ export function SettingsModal(props: SettingsModalProps) {
             )}
             {active === 'ai'            && <AiSection />}
             {active === 'guide'         && <InstallGuideSection />}
-            {active === 'jetson'        && <JetsonGuideSection />}
+            {active === 'jetson' && (
+              <React.Suspense fallback={<SettingsSectionLoading />}>
+                <JetsonGuideSection />
+              </React.Suspense>
+            )}
           </div>
         </div>
       </motion.div>
@@ -698,344 +714,6 @@ function DisplaySection({ unitSystem, setUnitSystem, themePreference, setThemePr
 // ============================================================================
 // Data (Export / Import)
 // ============================================================================
-function DataSection({ onOpenExport, onClose }: SettingsModalProps) {
-  return (
-    <div className="space-y-5">
-      <SectionHeader title="Data" subtitle="Export mesh data as CSV. Full encrypted backup below." />
-
-      <div className="grid grid-cols-1 gap-3">
-        <button
-          onClick={() => { onOpenExport(); onClose(); }}
-          className="flex flex-col items-start gap-1.5 bg-brand-line/40 hover:bg-brand-line border border-brand-line hover:border-brand-accent/50 rounded-lg p-4 text-left transition-colors"
-        >
-          <FileDown size={16} className="text-brand-accent" />
-          <p className="text-xs font-bold text-brand-ink uppercase tracking-wide">Export</p>
-          <p className="text-[10px] text-brand-muted leading-snug">Download messages, events, or telemetry as CSV with date and node filters. BBS mail + weather subscribers have their own CSV export buttons in those tabs.</p>
-        </button>
-      </div>
-
-      {/* v2.0 Beta 4 (Item 6): CSV Import button removed — was a stub that
-          parsed the file and discarded the result. Operators got success
-          toasts for a no-op. Migration is now covered by the encrypted
-          Full Backup below (which round-trips actual DB state). If a
-          plaintext CSV import becomes needed later, add it back with a
-          real implementation. */}
-
-      {/* v2.0 Beta 2: encrypted config backup/restore. Separate from the CSV
-          export above — this captures the radios registry + channels (with
-          PSKs) + BBS config so a fresh install can be bootstrapped. */}
-      <ConfigBackupSection />
-    </div>
-  );
-}
-
-/** Sections an operator can opt out of when restoring. Each key matches the
- *  server's `sections` field; default-true means "include in restore" (no
- *  toggle change = restore everything, same as before this feature shipped). */
-const RESTORE_SECTIONS = [
-  { key: 'radios',                label: 'Radios + transports' },
-  { key: 'channels',              label: 'Channels (incl. PSKs)' },
-  { key: 'bbsConfig',             label: 'BBS config' },
-  { key: 'groups',                label: 'Node groups' },
-  { key: 'waypoints',             label: 'Waypoints' },
-  { key: 'blockedNodes',          label: 'Block list' },
-  { key: 'bbsMail',               label: 'BBS mail history' },
-  { key: 'bbsWeatherSubscribers', label: 'Weather subscribers' },
-  // v2.0 Beta 5: per-user accounts. Restore brings password hashes +
-  // roles across; you also need to copy data/auth-secret to the new
-  // host or the operator can re-bootstrap from scratch.
-  { key: 'users',                 label: 'User accounts (username + scrypt hash + role)' },
-  { key: 'tcpEndpoint',           label: 'TCP auto-reconnect endpoint' },
-  { key: 'history',               label: 'History (messages, events, telemetry, …)' },
-] as const;
-
-function ConfigBackupSection() {
-  const [exportPass, setExportPass] = React.useState('');
-  const [restorePass, setRestorePass] = React.useState('');
-  const [includeHistory, setIncludeHistory] = React.useState(false);
-  const [msg, setMsg] = React.useState<{ tone: 'ok' | 'err'; text: string } | null>(null);
-  const [busy, setBusy] = React.useState(false);
-  const fileRef = React.useRef<HTMLInputElement | null>(null);
-  const [pendingEnvelope, setPendingEnvelope] = React.useState<any>(null);
-  // Sections to RESTORE (default everything on). Used to drive the
-  // selective-restore checkboxes. Stays in sync with the keys the server
-  // recognizes in /api/mesh/restore's `sections` body field.
-  const [restoreSections, setRestoreSections] = React.useState<Record<string, boolean>>(
-    () => Object.fromEntries(RESTORE_SECTIONS.map(s => [s.key, true]))
-  );
-  const allOn = RESTORE_SECTIONS.every(s => restoreSections[s.key]);
-
-  const doExport = async () => {
-    setMsg(null);
-    if (exportPass.length < 6) { setMsg({ tone: 'err', text: 'Passphrase must be at least 6 characters.' }); return; }
-    setBusy(true);
-    try {
-      const res = await fetch(`${API_BASE}/api/mesh/backup`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ passphrase: exportPass, includeHistory }),
-      });
-      if (!res.ok) {
-        const b = await res.json().catch(() => ({}));
-        setMsg({ tone: 'err', text: b.error || `HTTP ${res.status}` });
-        return;
-      }
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `sentinel-backup-${new Date().toISOString().slice(0, 10)}${includeHistory ? '-full' : ''}.json`;
-      a.click();
-      URL.revokeObjectURL(url);
-      setMsg({ tone: 'ok', text: includeHistory ? 'Full backup downloaded (config + history).' : 'Config backup downloaded.' });
-      setExportPass('');
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const onFilePicked = async (file: File) => {
-    setMsg(null);
-    try {
-      const text = await file.text();
-      const env = JSON.parse(text);
-      if (env?.alg !== 'aes-256-gcm') { setMsg({ tone: 'err', text: 'Not a Sentinel backup file.' }); return; }
-      setPendingEnvelope(env);
-      setMsg({ tone: 'ok', text: 'Backup loaded. Enter its passphrase and click Restore.' });
-    } catch {
-      setMsg({ tone: 'err', text: 'Could not read that file as JSON.' });
-    }
-  };
-
-  const doRestore = async () => {
-    setMsg(null);
-    if (!pendingEnvelope) { setMsg({ tone: 'err', text: 'Pick a backup file first.' }); return; }
-    if (!restorePass) { setMsg({ tone: 'err', text: 'Enter the backup passphrase.' }); return; }
-    if (!confirm(
-      'Restore will overwrite your local Sentinel state from the backup:\n\n' +
-      '  • Radios registry, channels (with PSKs), BBS config\n' +
-      '  • Groups, waypoints, block list\n' +
-      '  • BBS mail + weather subscribers\n' +
-      '  • TCP endpoint config\n' +
-      '  • Message/event/telemetry history (if included in the backup)\n\n' +
-      'Radio firmware is not touched. Continue?'
-    )) return;
-    setBusy(true);
-    try {
-      // Send the `sections` body only when the operator changed at least
-      // one toggle (selective restore). All-on collapses to undefined so
-      // the server takes its default-everything path and the existing
-      // back-compat behavior is preserved exactly.
-      const sections = allOn ? undefined : restoreSections;
-      const res = await fetch(`${API_BASE}/api/mesh/restore`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ passphrase: restorePass, envelope: pendingEnvelope, sections }),
-      });
-      const b = await res.json().catch(() => ({}));
-      if (!res.ok) { setMsg({ tone: 'err', text: b.error || `HTTP ${res.status}` }); return; }
-      // Build a per-section summary line. Skip zeroes so a config-only
-      // restore doesn't carry noisy "0 history" tails.
-      const parts: string[] = [];
-      const r = b.restored ?? {};
-      if (r.radios)               parts.push(`${r.radios} radios`);
-      if (r.channels)             parts.push(`${r.channels} channels`);
-      if (r.bbsConfig)            parts.push('BBS config');
-      if (r.groups)               parts.push(`${r.groups} groups`);
-      if (r.waypoints)            parts.push(`${r.waypoints} waypoints`);
-      if (r.blockedNodes)         parts.push(`${r.blockedNodes} blocked`);
-      if (r.bbsMail)              parts.push(`${r.bbsMail} mail`);
-      if (r.bbsWeatherSubscribers) parts.push(`${r.bbsWeatherSubscribers} subs`);
-      if (r.users)                parts.push(`${r.users} users`);
-      if (r.tcpEndpoint)          parts.push('TCP endpoint');
-      if (r.history)              parts.push(`${r.history} history rows`);
-      const summary = parts.length ? parts.join(', ') : 'nothing applied';
-      setMsg({ tone: 'ok', text: `Restored (v${b.version ?? 1}): ${summary}. Reconnect radios to resync device state.` });
-      setRestorePass('');
-      setPendingEnvelope(null);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <div className="border-t border-brand-line pt-4 space-y-3">
-      <SectionHeader
-        title="Full Backup"
-        subtitle={
-          'Encrypted export of everything operator-side: radios + channels (with PSKs), BBS config, ' +
-          'groups, waypoints, block list, BBS mail, weather subscribers, and TCP endpoint. Optionally ' +
-          'includes message / event / telemetry history (much larger). Sealed with AES-256-GCM — keep ' +
-          "the passphrase safe; there's no recovery without it. Restore overwrites local state only; " +
-          'radio firmware is not touched.'
-        }
-      />
-
-      {msg && (
-        <div className={cn(
-          'flex items-center gap-2 rounded px-3 py-2 text-[11px] border',
-          msg.tone === 'ok' ? 'border-brand-accent/40 bg-brand-accent/10 text-brand-accent'
-                            : 'border-red-500/40 bg-red-500/10 text-red-300'
-        )}>
-          {msg.tone === 'ok' ? <Check size={12} /> : <AlertCircle size={12} />}
-          <span>{msg.text}</span>
-        </div>
-      )}
-
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-        <div className="space-y-2">
-          <p className="text-[10px] font-bold uppercase tracking-widest text-brand-muted">Export</p>
-          <input
-            type="password"
-            value={exportPass}
-            onChange={e => setExportPass(e.target.value)}
-            placeholder="Encryption passphrase (≥6 chars)"
-            className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs text-brand-ink"
-          />
-          <label className="flex items-start gap-2 text-[10px] text-brand-muted leading-snug cursor-pointer">
-            <input
-              type="checkbox"
-              checked={includeHistory}
-              onChange={e => setIncludeHistory(e.target.checked)}
-              className="mt-0.5 accent-brand-accent"
-            />
-            <span>
-              Include history (nodes, messages, events, telemetry, position log, traces, neighbor info).
-              Much larger — the rebuild-on-reconnect path repopulates most of these for free, so leave
-              this off unless you really want bit-exact preservation across the migration.
-            </span>
-          </label>
-          <button
-            onClick={doExport}
-            disabled={busy}
-            className="flex items-center gap-1 bg-brand-accent/10 hover:bg-brand-accent/20 disabled:opacity-40 border border-brand-accent/40 text-brand-accent text-[10px] font-bold uppercase tracking-widest rounded px-3 py-1.5"
-          >
-            <Download size={12} /> Download {includeHistory ? 'Full Backup' : 'Config Backup'}
-          </button>
-        </div>
-
-        <div className="space-y-2">
-          <p className="text-[10px] font-bold uppercase tracking-widest text-brand-muted">Restore</p>
-          <input
-            ref={fileRef}
-            type="file"
-            accept="application/json,.json"
-            onChange={e => { const f = e.target.files?.[0]; if (f) onFilePicked(f); }}
-            className="hidden"
-          />
-          <button
-            onClick={() => fileRef.current?.click()}
-            className="w-full flex items-center gap-1 border border-brand-line text-brand-muted hover:text-brand-ink hover:border-brand-accent/40 text-[10px] font-bold uppercase tracking-widest rounded px-3 py-1.5"
-          >
-            <FileUp size={12} /> {pendingEnvelope ? 'Backup loaded ✓' : 'Choose Backup File'}
-          </button>
-          <input
-            type="password"
-            value={restorePass}
-            onChange={e => setRestorePass(e.target.value)}
-            placeholder="Backup passphrase"
-            className="w-full bg-brand-bg border border-brand-line rounded px-2 py-1 text-xs text-brand-ink"
-          />
-          {/* Selective-restore section toggles. Default all-on (back-compat
-              with the original all-or-nothing restore); turn one off to
-              skip that section. */}
-          {pendingEnvelope && (
-            <details className="bg-brand-bg/40 border border-brand-line rounded">
-              <summary className="cursor-pointer px-2 py-1.5 text-[10px] font-bold uppercase tracking-widest text-brand-muted hover:text-brand-ink">
-                Sections to restore ({Object.values(restoreSections).filter(Boolean).length}/{RESTORE_SECTIONS.length})
-              </summary>
-              <div className="border-t border-brand-line px-2 py-2 space-y-1">
-                {RESTORE_SECTIONS.map(s => (
-                  <label key={s.key} className="flex items-center gap-2 text-[10px] text-brand-ink cursor-pointer hover:text-brand-accent">
-                    <input
-                      type="checkbox"
-                      checked={!!restoreSections[s.key]}
-                      onChange={e => setRestoreSections(prev => ({ ...prev, [s.key]: e.target.checked }))}
-                      className="accent-brand-accent"
-                    />
-                    <span>{s.label}</span>
-                  </label>
-                ))}
-                <div className="flex gap-2 pt-1 border-t border-brand-line/40">
-                  <button
-                    type="button"
-                    onClick={() => setRestoreSections(Object.fromEntries(RESTORE_SECTIONS.map(s => [s.key, true])))}
-                    className="text-[10px] text-brand-muted hover:text-brand-ink"
-                  >
-                    All
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setRestoreSections(Object.fromEntries(RESTORE_SECTIONS.map(s => [s.key, false])))}
-                    className="text-[10px] text-brand-muted hover:text-brand-ink"
-                  >
-                    None
-                  </button>
-                </div>
-              </div>
-            </details>
-          )}
-          <button
-            onClick={doRestore}
-            disabled={busy || !pendingEnvelope}
-            className="flex items-center gap-1 bg-amber-500/10 hover:bg-amber-500/20 disabled:opacity-40 border border-amber-500/40 text-amber-300 text-[10px] font-bold uppercase tracking-widest rounded px-3 py-1.5"
-          >
-            <Undo2 size={12} /> Restore
-          </button>
-        </div>
-      </div>
-      <p className="text-[10px] text-brand-muted/80 italic">
-        Restore rewrites Sentinel's own DB + config only — it does not push anything to radio firmware.
-        Reconnect each radio afterward to resync the device's live state.
-      </p>
-    </div>
-  );
-}
-
-// ============================================================================
-// AI (provider + API keys, inlined from former AISettingsModal)
-// ============================================================================
-type AIProvider = 'anthropic' | 'gemini' | 'ollama';
-
-interface AIConfig {
-  enabled: boolean;
-  provider: AIProvider;
-  anthropicModel: string;
-  geminiModel: string;
-  ollamaBaseUrl: string;
-  ollamaModel: string;
-  redactPii: boolean;
-  hasAnthropicKey: boolean;
-  hasGeminiKey: boolean;
-  anthropicKeyHint: string;
-  geminiKeyHint: string;
-}
-
-interface OllamaModelInfo {
-  name: string;
-  sizeBytes: number | null;
-  parameterSize: string | null;
-  quantization: string | null;
-}
-
-function formatOllamaModelLabel(m: OllamaModelInfo): string {
-  const parts: string[] = [m.name];
-  if (m.parameterSize) parts.push(m.parameterSize);
-  if (m.sizeBytes != null) {
-    const gib = m.sizeBytes / (1024 ** 3);
-    parts.push(`${gib.toFixed(1)} GB`);
-  }
-  return parts.join(' · ');
-}
-
-// ----------------------------------------------------------------------------
-// BBS section — enable/disable + triggers + caps + home ZIP for weather alerts.
-// ----------------------------------------------------------------------------
-
-// ----------------------------------------------------------------------------
-// Mode section — switch between LIVE radio and SIMULATOR (demo) data.
-// ----------------------------------------------------------------------------
-
 function ModeSection({ dataSource, setDataSource, radioConnected, transport }: SettingsModalProps) {
   const isLive = dataSource === 'live';
   return (
@@ -1139,106 +817,6 @@ function ModeSection({ dataSource, setDataSource, radioConnected, transport }: S
  * title, description, icon, lazy content loader, and the download filename;
  * everything else (Copy / Download buttons, terminal-styled viewer) is shared.
  */
-function MarkdownGuide({
-  title,
-  description,
-  icon,
-  loadContent,
-  downloadFilename,
-  displayFilename,
-}: {
-  title: string;
-  description: string;
-  icon: React.ReactNode;
-  loadContent: () => Promise<string>;
-  downloadFilename: string;
-  displayFilename: string;
-}) {
-  const [copied, setCopied] = React.useState(false);
-  const [content, setContent] = React.useState<string | null>(null);
-
-  React.useEffect(() => {
-    let cancelled = false;
-    loadContent().then(c => { if (!cancelled) setContent(c); });
-    return () => { cancelled = true; };
-  }, [loadContent]);
-
-  const handleCopy = async () => {
-    if (!content) return;
-    try {
-      await navigator.clipboard.writeText(content);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch { /* clipboard unavailable */ }
-  };
-
-  const handleDownload = () => {
-    if (!content) return;
-    const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = downloadFilename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  };
-
-  return (
-    <div className="space-y-4 max-w-3xl">
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <h3 className="text-base font-bold tracking-tight uppercase flex items-center gap-2">
-            {icon}
-            {title}
-          </h3>
-          <p className="text-xs text-brand-muted leading-snug mt-1">{description}</p>
-        </div>
-        <div className="flex items-center gap-2 shrink-0">
-          <button
-            onClick={handleCopy}
-            disabled={!content}
-            className="flex items-center gap-2 px-3 py-1.5 rounded border border-brand-line bg-brand-line/10 hover:bg-brand-line/30 text-[10px] font-bold uppercase tracking-widest disabled:opacity-40"
-            title="Copy markdown source to clipboard"
-          >
-            {copied ? <Check size={12} className="text-brand-accent" /> : <Copy size={12} />}
-            {copied ? 'Copied' : 'Copy Source'}
-          </button>
-          <button
-            onClick={handleDownload}
-            disabled={!content}
-            className="flex items-center gap-2 px-3 py-1.5 rounded bg-brand-accent text-black hover:brightness-110 text-[10px] font-bold uppercase tracking-widest disabled:opacity-40"
-            title="Download as .md file"
-          >
-            <Download size={12} />
-            Download MD
-          </button>
-        </div>
-      </div>
-
-      <div className="technical-panel overflow-hidden">
-        <div className="flex items-center gap-2 px-3 py-1.5 bg-brand-line/30 border-b border-brand-line">
-          <div className="w-2 h-2 rounded-full bg-brand-error/40" />
-          <div className="w-2 h-2 rounded-full bg-brand-warning/40" />
-          <div className="w-2 h-2 rounded-full bg-brand-accent/40" />
-          <span className="ml-2 text-[10px] mono-text text-brand-muted uppercase">{displayFilename}</span>
-        </div>
-        <div className="max-h-[60vh] overflow-y-auto p-4 bg-brand-bg/40">
-          {!content ? (
-            <div className="flex items-center gap-2 text-xs text-brand-muted">
-              <Loader2 size={14} className="animate-spin" /> Loading guide…
-            </div>
-          ) : (
-            <pre className="text-[11px] mono-text text-brand-ink whitespace-pre-wrap leading-relaxed">
-              {content}
-            </pre>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
 
 function InstallGuideSection() {
   return (
@@ -1256,547 +834,11 @@ function InstallGuideSection() {
   );
 }
 
-function JetsonGuideSection() {
-  return (
-    <div className="space-y-6">
-      <JetsonLiveStatsPanel />
-      <MarkdownGuide
-        title="Jetson Nano Deployment"
-        description="Considerations for running Sentinel on a Jetson Nano 2GB — RAM budget, microSD wear vs. SSD recommendations, pre-deployment checklist, and common gotchas specific to the Jetson platform."
-        icon={<Cpu size={16} className="text-brand-accent" />}
-        loadContent={async () => {
-          const m = await import('../constants/jetsonNanoGuide');
-          return m.JETSON_NANO_GUIDE;
-        }}
-        downloadFilename="MeshView-Sentinel-Jetson-Nano-Guide.md"
-        displayFilename="jetson-nano.md"
-      />
-    </div>
-  );
-}
-
-/**
- * v2.0 Beta 5 — Live tegrastats-equivalent panel.
- *
- * Polls /api/system/jetson-stats every POLL_MS when the panel is mounted
- * AND auto-refresh is on. Manual refresh button for one-off snapshots.
- * Server caches results for 2s so multiple tabs don't each fire their
- * own /proc/stat sample.
- *
- * Renders on any Linux host (RAM / CPU / thermal work everywhere) but
- * labels itself "Jetson stats" only when the device-tree compatible
- * string identifies as Tegra/Jetson. Non-Jetson hosts get the generic
- * "System stats" header so the panel still feels useful.
- */
-interface JetsonStatsSnapshot {
-  capturedAt: number;
-  isJetson: boolean;
-  jetsonModel: string | null;
-  uptimeSecs: number;
-  loadAvg1: number;
-  loadAvg5: number;
-  loadAvg15: number;
-  ramTotalMb: number;
-  ramUsedMb: number;
-  ramFreeMb: number;
-  ramCachedMb: number;
-  swapTotalMb: number;
-  swapUsedMb: number;
-  cpuCount: number;
-  cpuUtilPercent: number;
-  cpuPerCore: Array<{ id: number; utilPercent: number; freqKhz: number | null }>;
-  thermal: Array<{ zone: string; tempC: number }>;
-  gpuLoadPercent: number | null;
-  gpuFreqMhz: number | null;
-}
-
-function JetsonLiveStatsPanel() {
-  const [snap, setSnap] = React.useState<JetsonStatsSnapshot | null>(null);
-  const [loading, setLoading] = React.useState(false);
-  const [err, setErr] = React.useState<string | null>(null);
-  const [autoRefresh, setAutoRefresh] = React.useState(true);
-
-  // 5s polling cadence. Server caches for 2s anyway so this is gentle.
-  const POLL_MS = 5_000;
-
-  const fetchNow = React.useCallback(async () => {
-    setLoading(true);
-    setErr(null);
-    try {
-      const res = await fetch(`${API_BASE}/api/system/jetson-stats`);
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        setErr(body.error || `HTTP ${res.status}`);
-      } else {
-        setSnap(await res.json());
-      }
-    } catch (e: any) {
-      setErr(e?.message || 'Network error');
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  // Initial load
-  React.useEffect(() => { fetchNow(); }, [fetchNow]);
-
-  // Polling
-  React.useEffect(() => {
-    if (!autoRefresh) return;
-    const id = setInterval(fetchNow, POLL_MS);
-    return () => clearInterval(id);
-  }, [autoRefresh, fetchNow]);
-
-  const titleLabel = snap?.isJetson ? 'Jetson Live Stats' : 'System Live Stats';
-  const subLabel = snap?.isJetson
-    ? `${snap.jetsonModel ?? 'Jetson'} — tegrastats-equivalent, sampled via /proc + /sys (no sudo, no host shell). Refreshes every ${POLL_MS / 1000}s when auto-refresh is on.`
-    : `Reading /proc + /sys for CPU / RAM / thermal. Same panel works on non-Jetson hosts; Jetson-specific GPU stats are absent here. Refreshes every ${POLL_MS / 1000}s when auto-refresh is on.`;
-
-  return (
-    <div className="space-y-3">
-      <div className="flex items-center justify-between">
-        <div>
-          <h4 className="text-xs font-bold uppercase tracking-widest text-brand-ink">{titleLabel}</h4>
-          <p className="text-[10px] text-brand-muted mt-0.5">{subLabel}</p>
-        </div>
-        <div className="flex items-center gap-2">
-          <label className="flex items-center gap-1.5 text-[10px] text-brand-muted cursor-pointer select-none">
-            <input
-              type="checkbox"
-              checked={autoRefresh}
-              onChange={e => setAutoRefresh(e.target.checked)}
-              className="accent-brand-accent"
-            />
-            <span className="uppercase font-bold tracking-widest">Auto</span>
-          </label>
-          <button
-            onClick={fetchNow}
-            disabled={loading}
-            className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest text-brand-muted hover:text-brand-ink hover:bg-brand-line/40 px-2 py-1 rounded disabled:opacity-40"
-          >
-            <RefreshCw size={10} className={loading ? 'animate-spin' : ''} /> Refresh
-          </button>
-        </div>
-      </div>
-
-      {err && (
-        <div className="flex items-start gap-2 rounded border border-red-500/40 bg-red-500/10 text-red-300 text-[11px] px-3 py-2">
-          <AlertCircle size={12} className="mt-0.5" />
-          <span>{err}</span>
-        </div>
-      )}
-
-      {snap && (
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          {/* CPU + load */}
-          <div className="rounded border border-brand-line bg-brand-bg/40 p-3 space-y-2">
-            <h5 className="text-[10px] font-bold uppercase tracking-widest text-brand-muted">CPU</h5>
-            <StatBar label={`Overall · ${snap.cpuCount} cores`} percent={snap.cpuUtilPercent} unit="%" />
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 pt-1">
-              {snap.cpuPerCore.map(c => (
-                <div key={c.id} className="rounded border border-brand-line/60 bg-brand-bg/30 p-1.5">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[10px] mono-text text-brand-muted">cpu{c.id}</span>
-                    <span className="text-[10px] font-bold mono-text text-brand-ink">{c.utilPercent}%</span>
-                  </div>
-                  {c.freqKhz != null && (
-                    <div className="text-[9px] mono-text text-brand-muted/80 mt-0.5">
-                      {Math.round(c.freqKhz / 1000)}MHz
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-            <div className="pt-1 text-[10px] mono-text text-brand-muted/80">
-              Load: {snap.loadAvg1.toFixed(2)} · {snap.loadAvg5.toFixed(2)} · {snap.loadAvg15.toFixed(2)}
-              <span className="text-brand-muted/60"> (1m / 5m / 15m)</span>
-            </div>
-          </div>
-
-          {/* RAM + swap */}
-          <div className="rounded border border-brand-line bg-brand-bg/40 p-3 space-y-2">
-            <h5 className="text-[10px] font-bold uppercase tracking-widest text-brand-muted">Memory</h5>
-            <StatBar
-              label={`RAM ${snap.ramUsedMb} / ${snap.ramTotalMb} MB`}
-              percent={snap.ramTotalMb > 0 ? Math.round((snap.ramUsedMb / snap.ramTotalMb) * 100) : 0}
-              unit="%"
-            />
-            <div className="text-[10px] mono-text text-brand-muted/80">
-              Free: {snap.ramFreeMb} MB · Cached: {snap.ramCachedMb} MB
-            </div>
-            {snap.swapTotalMb > 0 && (
-              <>
-                <StatBar
-                  label={`Swap ${snap.swapUsedMb} / ${snap.swapTotalMb} MB`}
-                  percent={Math.round((snap.swapUsedMb / snap.swapTotalMb) * 100)}
-                  unit="%"
-                  tone="warning"
-                />
-              </>
-            )}
-            <div className="pt-1 text-[10px] mono-text text-brand-muted/80">
-              Uptime: {formatUptime(snap.uptimeSecs)}
-            </div>
-          </div>
-
-          {/* GPU — only when readable. Jetson without permissions skips
-              this card silently. */}
-          {(snap.gpuLoadPercent != null || snap.gpuFreqMhz != null) && (
-            <div className="rounded border border-brand-line bg-brand-bg/40 p-3 space-y-2">
-              <h5 className="text-[10px] font-bold uppercase tracking-widest text-brand-muted">GPU</h5>
-              {snap.gpuLoadPercent != null && (
-                <StatBar label="Load" percent={snap.gpuLoadPercent} unit="%" />
-              )}
-              {snap.gpuFreqMhz != null && (
-                <div className="text-[10px] mono-text text-brand-muted/80">
-                  Clock: {snap.gpuFreqMhz} MHz
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* Thermal */}
-          {snap.thermal.length > 0 && (
-            <div className="rounded border border-brand-line bg-brand-bg/40 p-3 space-y-2">
-              <h5 className="text-[10px] font-bold uppercase tracking-widest text-brand-muted">Thermal</h5>
-              <div className="grid grid-cols-2 gap-1">
-                {snap.thermal.map(t => {
-                  const hot = t.tempC >= 75;
-                  const warm = t.tempC >= 60;
-                  return (
-                    <div key={t.zone} className="flex items-center justify-between text-[10px] mono-text py-0.5">
-                      <span className="text-brand-muted truncate max-w-[60%]" title={t.zone}>{t.zone}</span>
-                      <span className={cn(
-                        'font-bold',
-                        hot ? 'text-brand-error' : warm ? 'text-brand-warning' : 'text-brand-ink',
-                      )}>
-                        {t.tempC.toFixed(1)}°C
-                      </span>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-      {snap && (
-        <p className="text-[10px] text-brand-muted/60 italic mt-1">
-          Captured {new Date(snap.capturedAt).toLocaleTimeString()} · sampled from /proc + /sys
-        </p>
-      )}
-    </div>
-  );
-}
-
-/** Small horizontal usage bar. Visual only — the numeric label is in
- *  the `label` prop so the bar is supplementary. */
-function StatBar({ label, percent, unit, tone }: {
-  label: string;
-  percent: number;
-  unit?: string;
-  /** Affects the fill color when the bar is high. Default = accent;
-   *  warning = swap-style yellow. Bars over 85% always go red. */
-  tone?: 'accent' | 'warning';
-}) {
-  const p = Math.max(0, Math.min(100, percent));
-  const hot = p >= 85;
-  const elevated = p >= 70;
-  const fillTone = hot
-    ? 'bg-brand-error'
-    : elevated
-      ? 'bg-brand-warning'
-      : tone === 'warning' ? 'bg-brand-warning/60' : 'bg-brand-accent';
-  return (
-    <div className="space-y-1">
-      <div className="flex items-center justify-between text-[10px] mono-text">
-        <span className="text-brand-muted">{label}</span>
-        <span className={cn('font-bold', hot ? 'text-brand-error' : 'text-brand-ink')}>
-          {p}{unit ?? ''}
-        </span>
-      </div>
-      <div className="h-1.5 rounded-full bg-brand-line/40 overflow-hidden">
-        <div className={cn('h-full transition-all duration-500', fillTone)} style={{ width: `${p}%` }} />
-      </div>
-    </div>
-  );
-}
-
-function formatUptime(secs: number): string {
-  if (secs < 60) return `${secs}s`;
-  const m = Math.floor(secs / 60);
-  if (m < 60) return `${m}m`;
-  const h = Math.floor(m / 60);
-  const rm = m % 60;
-  if (h < 24) return `${h}h ${rm}m`;
-  const d = Math.floor(h / 24);
-  const rh = h % 24;
-  return `${d}d ${rh}h`;
-}
 
 // ----------------------------------------------------------------------------
 // Disk section — per-table inventory + on-disk file size + VACUUM trigger.
 // ----------------------------------------------------------------------------
 
-interface DiskTableRow {
-  table: string;
-  rows: number;
-  oldest: number | null;
-  newest: number | null;
-  retention: string;
-}
-
-interface DiskStats {
-  dbPath: string;
-  onDisk: { main: number; wal: number; shm: number; total: number };
-  logicalBytes: number;
-  tables: DiskTableRow[];
-}
-
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)} MB`;
-  return `${(n / 1024 ** 3).toFixed(2)} GB`;
-}
-
-function formatTs(ts: number | null): string {
-  if (!ts) return '—';
-  const d = new Date(ts);
-  return d.toLocaleString([], { month: 'numeric', day: 'numeric', year: '2-digit', hour: 'numeric', minute: '2-digit' });
-}
-
-function DiskSection() {
-  const [stats, setStats] = React.useState<DiskStats | null>(null);
-  const [loading, setLoading] = React.useState(true);
-  const [error, setError] = React.useState('');
-  const [vacuuming, setVacuuming] = React.useState(false);
-  const [vacuumResult, setVacuumResult] = React.useState<string | null>(null);
-
-  const refresh = React.useCallback(async () => {
-    setLoading(true);
-    setError('');
-    try {
-      const res = await fetch(`${API_BASE}/api/mesh/db/disk`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data: DiskStats = await res.json();
-      setStats(data);
-    } catch (err: any) {
-      setError(err?.message || 'Failed to load disk stats');
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  React.useEffect(() => {
-    refresh();
-    // Auto-refresh every 30s so the panel stays current while open without
-    // hammering the endpoint.
-    const t = setInterval(refresh, 30_000);
-    return () => clearInterval(t);
-  }, [refresh]);
-
-  const handleVacuum = async () => {
-    if (!confirm(
-      'VACUUM rewrites the entire database to reclaim space from deleted rows.\n\n'
-      + 'This can take several seconds on a large DB and pauses all reads/writes '
-      + 'during execution. Continue?'
-    )) return;
-    setVacuuming(true);
-    setVacuumResult(null);
-    try {
-      const res = await fetch(`${API_BASE}/api/mesh/db/vacuum`, { method: 'POST' });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const r = await res.json() as { freedBytes: number; finalBytes: number };
-      setVacuumResult(`Reclaimed ${formatBytes(r.freedBytes)} — DB now ${formatBytes(r.finalBytes)}`);
-      await refresh();
-    } catch (err: any) {
-      setVacuumResult(`VACUUM failed: ${err?.message || 'unknown error'}`);
-    } finally {
-      setVacuuming(false);
-    }
-  };
-
-  if (loading && !stats) {
-    return (
-      <div className="flex items-center gap-2 text-sm text-brand-muted">
-        <Loader2 size={14} className="animate-spin" /> Loading disk stats…
-      </div>
-    );
-  }
-
-  if (!stats) {
-    return (
-      <div className="text-sm text-brand-error">
-        Failed to load disk stats{error ? `: ${error}` : '.'}
-        <button onClick={refresh} className="ml-2 underline text-brand-accent">Retry</button>
-      </div>
-    );
-  }
-
-  const totalRows = stats.tables.reduce((s, t) => s + t.rows, 0);
-
-  return (
-    <div className="space-y-5 max-w-3xl">
-      <div className="flex items-center justify-between gap-3">
-        <div>
-          <h3 className="text-base font-bold tracking-tight uppercase flex items-center gap-2">
-            <HardDrive size={16} className="text-brand-accent" />
-            Disk Usage
-          </h3>
-          <p className="text-xs text-brand-muted leading-snug mt-1">
-            Per-table row counts, retention policies, and on-disk footprint for{' '}
-            <code className="text-brand-accent">{stats.dbPath}</code>.
-          </p>
-        </div>
-        <button
-          onClick={refresh}
-          disabled={loading}
-          className="flex items-center gap-2 px-3 py-1.5 text-[10px] font-bold uppercase tracking-widest text-brand-muted hover:text-brand-accent border border-brand-line hover:border-brand-accent/50 rounded transition-colors"
-        >
-          <RefreshCw size={11} className={cn(loading && 'animate-spin')} />
-          Refresh
-        </button>
-      </div>
-
-      {/* On-disk summary */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-        <SummaryTile label="On-disk total" value={formatBytes(stats.onDisk.total)} hint="mesh.sqlite + WAL + shm" />
-        <SummaryTile label="Logical size"  value={formatBytes(stats.logicalBytes)} hint="After VACUUM" />
-        <SummaryTile label="Total rows"    value={totalRows.toLocaleString()} hint="Across all tables" />
-        <SummaryTile label="Tables"        value={String(stats.tables.length)} hint="Tracked persistently" />
-      </div>
-
-      {/* File-level breakdown */}
-      <div className="technical-panel p-3 space-y-1.5 text-xs">
-        <div className="flex items-baseline justify-between">
-          <span className="text-brand-muted mono-text">mesh.sqlite (main file)</span>
-          <span className="mono-text">{formatBytes(stats.onDisk.main)}</span>
-        </div>
-        <div className="flex items-baseline justify-between">
-          <span className="text-brand-muted mono-text">mesh.sqlite-wal (write-ahead log)</span>
-          <span className="mono-text">{formatBytes(stats.onDisk.wal)}</span>
-        </div>
-        <div className="flex items-baseline justify-between">
-          <span className="text-brand-muted mono-text">mesh.sqlite-shm (shared memory)</span>
-          <span className="mono-text">{formatBytes(stats.onDisk.shm)}</span>
-        </div>
-      </div>
-
-      {/* Per-table inventory */}
-      <div className="space-y-2">
-        <h4 className="text-xs font-bold uppercase tracking-widest text-brand-muted flex items-center gap-2">
-          <Database size={11} /> Tables
-        </h4>
-        <div className="technical-panel overflow-hidden">
-          {/* Header */}
-          <div className="grid grid-cols-[1.4fr_auto_1.2fr_1.4fr] gap-3 px-3 py-2 border-b border-brand-line bg-brand-line/30 text-[10px] uppercase font-bold tracking-widest text-brand-muted">
-            <span>Table</span>
-            <span className="text-right w-16">Rows</span>
-            <span>Oldest → Newest</span>
-            <span>Retention</span>
-          </div>
-          {stats.tables.map(t => (
-            <div
-              key={t.table}
-              className="grid grid-cols-[1.4fr_auto_1.2fr_1.4fr] gap-3 px-3 py-1.5 border-b border-brand-line/40 last:border-b-0 text-[11px] hover:bg-brand-line/20 transition-colors"
-            >
-              <span className="mono-text font-bold text-brand-ink truncate">{t.table}</span>
-              <span className={cn(
-                'text-right w-16 mono-text',
-                t.rows === 0 ? 'text-brand-muted' : 'text-brand-ink'
-              )}>
-                {t.rows.toLocaleString()}
-              </span>
-              <span className="text-brand-muted mono-text text-[10px] truncate">
-                {t.oldest && t.newest
-                  ? `${formatTs(t.oldest)} → ${formatTs(t.newest)}`
-                  : t.newest ? formatTs(t.newest) : '—'}
-              </span>
-              <span className="text-brand-muted text-[10px] leading-snug">
-                {t.retention}
-              </span>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      {/* Maintenance: VACUUM */}
-      <div className="technical-panel p-4 space-y-2">
-        <h4 className="text-xs font-bold uppercase tracking-widest text-brand-muted">Maintenance</h4>
-        <p className="text-[11px] text-brand-muted leading-snug">
-          SQLite reuses freed pages automatically but doesn't shrink the file. When the on-disk
-          total is much larger than the logical size, a VACUUM rewrites the database compactly to
-          reclaim the difference. Safe to run; expect a brief pause (seconds on a normal-sized DB).
-        </p>
-        <div className="flex items-center gap-3">
-          <button
-            onClick={handleVacuum}
-            disabled={vacuuming}
-            className="flex items-center gap-2 bg-brand-accent text-black px-3 py-1.5 rounded text-[10px] font-bold uppercase tracking-widest hover:brightness-110 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
-          >
-            {vacuuming ? <Loader2 size={12} className="animate-spin" /> : <Database size={12} />}
-            {vacuuming ? 'Vacuuming…' : 'VACUUM Now'}
-          </button>
-          {vacuumResult && (
-            <span className="text-[11px] text-brand-accent flex items-center gap-1.5">
-              <Check size={12} /> {vacuumResult}
-            </span>
-          )}
-        </div>
-      </div>
-
-      <p className="text-[10px] text-brand-muted leading-snug">
-        The Disk panel polls every 30 seconds while open. All listed tables are auto-pruned by the
-        5-minute retention loop (see the Recipe Guide → Disk retention section for the full policy).
-        Docker stdout logs aren't shown here — they're capped separately by the{' '}
-        <code className="text-brand-accent">logging:</code> block in <code className="text-brand-accent">docker-compose.yml</code>.
-      </p>
-    </div>
-  );
-}
-
-function SummaryTile({ label, value, hint }: { label: string; value: string; hint?: string }) {
-  return (
-    <div className="technical-panel p-3">
-      <p className="text-[9px] uppercase font-bold tracking-widest text-brand-muted">{label}</p>
-      <p className="text-base font-bold mono-text text-brand-ink mt-1">{value}</p>
-      {hint && <p className="text-[9px] text-brand-muted mt-0.5">{hint}</p>}
-    </div>
-  );
-}
-
-interface BbsConfigShape {
-  enabled: boolean;
-  mailTrigger: string;
-  weatherTrigger: string;
-  cmdTrigger: string;
-  bodyMaxChars: number;
-  retentionDays: number;
-  replyPaceMs: number;
-  homeZipCode: string;
-  /** v2.0 Beta 5: array of "HH:MM" push times. Empty disables daily
-   *  push (NWS alerts still fire). */
-  dailyForecastTimes: string[];
-}
-
-/**
- * v2.0 Beta 5 Phase 2 (Services Pattern) — BBS service node picker.
- *
- * Install-wide setting: which radio runs the BBS state machine + the
- * weather alert/forecast push. Admin picks one; flipping it
- * automatically:
- *   1. Clears is_bbs_node on every other radio (server enforces mutex).
- *   2. Re-stamps bbs_mail + bbs_weather_subscribers radio_id to the
- *      new BBS radio so the history appears in its workspace.
- *   3. Refreshes the BBS service flag on every connected bridge so
- *      the new radio starts intercepting :mail / :wx / :cmd
- *      immediately (no reconnect needed).
- *
- * Picker shows every radio in the install (not workspace-filtered),
- * since this is an install-wide service. Viewers see the read-only
- * value with the dropdown disabled.
- */
 function BbsServiceNodePicker() {
   const isAdmin = useIsAdmin();
   const [radioId, setRadioId] = React.useState<string | null>(null);
@@ -1864,6 +906,56 @@ function BbsServiceNodePicker() {
       </p>
     </div>
   );
+}
+
+// v2.1: types previously defined between sections (used by BbsSection +
+// AiSection). They were inadvertently swept along with the
+// DataSection / DiskSection extractions; live here until each owning
+// section gets its own extraction.
+interface BbsConfigShape {
+  enabled: boolean;
+  mailTrigger: string;
+  weatherTrigger: string;
+  cmdTrigger: string;
+  bodyMaxChars: number;
+  retentionDays: number;
+  replyPaceMs: number;
+  homeZipCode: string;
+  /** Array of "HH:MM" push times. Empty disables daily push (NWS alerts still fire). */
+  dailyForecastTimes: string[];
+}
+
+type AIProvider = 'anthropic' | 'gemini' | 'ollama';
+
+interface AIConfig {
+  enabled: boolean;
+  provider: AIProvider;
+  anthropicModel: string;
+  geminiModel: string;
+  ollamaBaseUrl: string;
+  ollamaModel: string;
+  redactPii: boolean;
+  hasAnthropicKey: boolean;
+  hasGeminiKey: boolean;
+  anthropicKeyHint: string;
+  geminiKeyHint: string;
+}
+
+interface OllamaModelInfo {
+  name: string;
+  sizeBytes: number | null;
+  parameterSize: string | null;
+  quantization: string | null;
+}
+
+function formatOllamaModelLabel(m: OllamaModelInfo): string {
+  const parts: string[] = [m.name];
+  if (m.parameterSize) parts.push(m.parameterSize);
+  if (m.sizeBytes != null) {
+    const gib = m.sizeBytes / (1024 ** 3);
+    parts.push(`${gib.toFixed(1)} GB`);
+  }
+  return parts.join(' · ');
 }
 
 function BbsSection() {
