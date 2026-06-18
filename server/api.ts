@@ -12,6 +12,14 @@ import { meshDb } from './database.js';
 // BbsService is no longer instantiated here in v2.0 — see [bridgeManager.ts](./bridgeManager.ts)
 // which owns one BbsService per RadioContext. api.ts just plumbs config + endpoints.
 import { loadBbsConfig, saveBbsConfig, normalizeBbsConfig, type BbsConfig } from './bbsConfig.js';
+import { consoleCapture } from './consoleCapture.js';
+
+// v2.1: install the console-capture wrapper BEFORE any other module
+// has a chance to log. The capture forwards to the original
+// console.log/warn/error so docker logs / journalctl keep working;
+// it just also pushes each line into the ring buffer for the
+// dashboard's Console view.
+consoleCapture.install();
 import { WeatherAlertPoller } from './weatherAlertPoller.js';
 // v2.0 multi-radio. Importing for side effect: BridgeManager wires its
 // auto-registration listeners onto meshBridge at module load. The exported
@@ -4113,6 +4121,65 @@ app.post('/api/mesh/log-retention', (req, res) => {
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
   }
+});
+
+/**
+ * v2.1 — raw process console stream for the dashboard's Console view.
+ *
+ * SSE endpoint that:
+ *   1. Sends the current ring buffer as a series of `event: line` /
+ *      `data: <json>` frames so the client starts already populated.
+ *   2. Subscribes to live capture and forwards each new line as it
+ *      arrives.
+ *   3. Tears down both on req close.
+ *
+ * Authenticated — the raw console can include sensitive bits (admin
+ * IPs, ack ids, hex node ids, partial config readbacks). Tracks
+ * subscribers so noisy backends can decide to throttle later.
+ */
+app.get('/api/mesh/console/tail', requireAuth, (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  const writeLine = (line: { id: number; ts: number; level: 'log' | 'warn' | 'error'; text: string }) => {
+    try {
+      res.write(`event: line\ndata: ${JSON.stringify(line)}\n\n`);
+    } catch {
+      // Client gone — silent. The close handler below cleans up.
+    }
+  };
+
+  // Backlog first so the operator opens an already-populated view.
+  for (const line of consoleCapture.getBuffer()) {
+    writeLine(line);
+  }
+
+  // Then live tail. Subscribe AFTER the backlog send so we don't miss
+  // any line that arrives between the snapshot and the subscribe.
+  const unsub = consoleCapture.subscribe(writeLine);
+
+  // Heartbeat ping every 25s. Stops the browser / proxy from
+  // closing an "idle" SSE connection on quiet meshes.
+  const heartbeat = setInterval(() => {
+    try { res.write(': hb\n\n'); } catch { /* gone */ }
+  }, 25_000);
+  heartbeat.unref?.();
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    unsub();
+  });
+});
+
+/** Clear the console ring buffer. The DELETE-style verb is overloaded
+ *  here as POST so an operator can wire it to a button click without
+ *  the browser sending a preflight. Returns how many lines we wiped. */
+app.post('/api/mesh/console/clear', requireAuth, (_req, res) => {
+  const n = consoleCapture.clear();
+  return res.json({ ok: true, cleared: n });
 });
 
 app.get('/api/mesh/message-retention', (_req, res) => {
