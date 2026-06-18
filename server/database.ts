@@ -2546,6 +2546,44 @@ export class MeshDatabase {
     return Number(r.changes ?? 0);
   }
 
+  /**
+   * v2.1 — run `fn` with FK enforcement disabled, then unconditionally
+   * re-enable in a finally. Used by the encrypted-backup restore so
+   * the dependency-blind insertion order (radios before workspaces,
+   * etc.) doesn't trip the schema-level FK from radios.workspace_id
+   * → workspaces.id.
+   *
+   * Why this is safe for restore:
+   * - The backup envelope represents a consistent snapshot, so once
+   *   ALL tables are inserted the FK graph is intact again.
+   * - FK enforcement is a CONNECTION-level pragma; flipping it OFF
+   *   doesn't drop the constraints from the schema. SQLite resumes
+   *   checking on the next write after we flip back ON.
+   * - Caller can optionally `pragma('foreign_key_check')` afterwards
+   *   to verify no dangling references survived; bad rows surface as
+   *   a list rather than as a per-INSERT exception.
+   *
+   * Returns whatever `fn` returns so callers can chain summary objects
+   * back out.
+   */
+  runWithForeignKeysDisabled<T>(fn: () => T): T {
+    this.db.pragma('foreign_keys = OFF');
+    try {
+      return fn();
+    } finally {
+      this.db.pragma('foreign_keys = ON');
+    }
+  }
+
+  /** v2.1 companion to runWithForeignKeysDisabled: surface any
+   *  dangling foreign-key references that exist in the current DB
+   *  state. Returns an array of `{table, rowid, parent, fkid}` rows
+   *  per the PRAGMA foreign_key_check schema. Empty array means the
+   *  graph is intact. */
+  foreignKeyViolations(): Array<{ table: string; rowid: number | bigint; parent: string; fkid: number }> {
+    return this.db.pragma('foreign_key_check') as any;
+  }
+
   // ---------------------------------------------------------------------
   // v2.0 Beta 5 Workspaces — Phase 1 schema + bootstrap migration
   // ---------------------------------------------------------------------

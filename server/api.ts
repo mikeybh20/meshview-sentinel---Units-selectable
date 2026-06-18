@@ -2342,78 +2342,115 @@ app.post('/api/mesh/restore', (req, res) => {
   try {
     const db = meshDb();
 
-    // ---- v1 fields ----
-    if (wants('radios') && Array.isArray(payload.radios)) {
-      for (const r of payload.radios) { db.upsertRadio(r); summary.radios = (summary.radios as number) + 1; }
-    } else if (Array.isArray(payload.radios)) {
-      skipped.push('radios');
-    }
-    if (wants('channels') && Array.isArray(payload.channels)) {
-      for (const c of payload.channels) { db.upsertChannel(c); summary.channels = (summary.channels as number) + 1; }
-    } else if (Array.isArray(payload.channels)) {
-      skipped.push('channels');
-    }
-    if (wants('bbsConfig') && payload.bbsConfig && typeof payload.bbsConfig === 'object') {
-      bbsConfig = normalizeBbsConfig(payload.bbsConfig);
-      saveBbsConfig(bbsConfig);
-      bridgeManager.setBbsConfig(bbsConfig);
-      summary.bbsConfig = true;
-    } else if (payload.bbsConfig) {
-      skipped.push('bbsConfig');
-    }
-
-    // ---- v2 core ----
-    if (version >= 2 && payload.core && typeof payload.core === 'object') {
-      // Table name → frontend section key. Pairs to one summary slot and one
-      // selective-restore opt-in flag.
-      const sectionMap: Record<string, string> = {
-        groups: 'groups',
-        waypoints: 'waypoints',
-        blocked_nodes: 'blockedNodes',
-        bbs_mail: 'bbsMail',
-        bbs_weather_subscribers: 'bbsWeatherSubscribers',
-        // v2.0 Beta 5: users round-trip. Careful — restoring users from
-        // a different install requires its auth-secret file to come over
-        // too, otherwise existing session cookies validate but resolve
-        // to no row + scrypt password hashes still validate fine.
-        users: 'users',
-      };
-      for (const t of BACKUP_TABLES_CORE) {
-        const rows = payload.core[t];
-        if (!Array.isArray(rows)) continue;
-        const key = sectionMap[t];
-        if (!wants(key)) { skipped.push(key); continue; }
-        summary[key] = db.loadTable(t, rows);
+    // v2.1 fix: disable FK enforcement for the duration of the restore.
+    //
+    // The bug this catches: radios.workspace_id has a schema-level FK
+    // to workspaces.id (CREATE TABLE radios in database.ts at the
+    // `FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE
+    // SET NULL` line). The restore inserts radios FIRST (v1 fields)
+    // and workspaces later (v2 core). On a fresh-install target the
+    // schema's FK is active and the first radio row trips
+    // "FOREIGN KEY constraint failed" before we ever get to the
+    // workspace insert.
+    //
+    // Sources / pre-existing installs didn't see this because their
+    // radios table predated the FK constraint (it was added in the
+    // v2.0 Beta 5 Workspaces wave, and ALTER TABLE on an existing
+    // SQLite table can't add an FK — only fresh CREATE TABLE picks
+    // it up).
+    //
+    // Disabling FKs during a bulk restore is the standard SQLite
+    // recipe (.dump/.restore does the same). The snapshot is
+    // consistent end-to-end, so once all tables are inserted the
+    // graph is intact again — we re-enable + foreign_key_check to
+    // surface any actual dangling refs.
+    db.runWithForeignKeysDisabled(() => {
+      // ---- v1 fields ----
+      if (wants('radios') && Array.isArray(payload.radios)) {
+        for (const r of payload.radios) { db.upsertRadio(r); summary.radios = (summary.radios as number) + 1; }
+      } else if (Array.isArray(payload.radios)) {
+        skipped.push('radios');
       }
-    }
-
-    // ---- v2 TCP endpoint ----
-    if (version >= 2 && payload.tcpEndpoint && typeof payload.tcpEndpoint === 'object') {
-      const ep = payload.tcpEndpoint;
-      if (!wants('tcpEndpoint')) {
-        skipped.push('tcpEndpoint');
-      } else if (typeof ep.host === 'string' && Number.isFinite(ep.port)) {
-        saveTcpEndpoint({ host: ep.host, port: Math.floor(ep.port) });
-        summary.tcpEndpoint = true;
+      if (wants('channels') && Array.isArray(payload.channels)) {
+        for (const c of payload.channels) { db.upsertChannel(c); summary.channels = (summary.channels as number) + 1; }
+      } else if (Array.isArray(payload.channels)) {
+        skipped.push('channels');
       }
-    }
+      if (wants('bbsConfig') && payload.bbsConfig && typeof payload.bbsConfig === 'object') {
+        bbsConfig = normalizeBbsConfig(payload.bbsConfig);
+        saveBbsConfig(bbsConfig);
+        bridgeManager.setBbsConfig(bbsConfig);
+        summary.bbsConfig = true;
+      } else if (payload.bbsConfig) {
+        skipped.push('bbsConfig');
+      }
 
-    // ---- v2 history (opt-in side; if present in envelope, restore it) ----
-    if (version >= 2 && payload.history && typeof payload.history === 'object') {
-      if (!wants('history')) {
-        skipped.push('history');
-      } else {
-        let total = 0;
-        for (const t of BACKUP_TABLES_HISTORY) {
-          const rows = payload.history[t];
+      // ---- v2 core ----
+      if (version >= 2 && payload.core && typeof payload.core === 'object') {
+        // Table name → frontend section key. Pairs to one summary slot and one
+        // selective-restore opt-in flag.
+        const sectionMap: Record<string, string> = {
+          groups: 'groups',
+          waypoints: 'waypoints',
+          blocked_nodes: 'blockedNodes',
+          bbs_mail: 'bbsMail',
+          bbs_weather_subscribers: 'bbsWeatherSubscribers',
+          // v2.0 Beta 5: users round-trip. Careful — restoring users from
+          // a different install requires its auth-secret file to come over
+          // too, otherwise existing session cookies validate but resolve
+          // to no row + scrypt password hashes still validate fine.
+          users: 'users',
+        };
+        for (const t of BACKUP_TABLES_CORE) {
+          const rows = payload.core[t];
           if (!Array.isArray(rows)) continue;
-          // Truncate first — history tables are append-only and merging with
-          // existing rows risks PK collisions / phantom dupes from different
-          // installs. The operator-confirmed restore overwrites by intent.
-          total += db.loadTable(t, rows, { truncate: true });
+          const key = sectionMap[t];
+          if (!wants(key)) { skipped.push(key); continue; }
+          summary[key] = db.loadTable(t, rows);
         }
-        summary.history = total;
       }
+
+      // ---- v2 TCP endpoint ----
+      if (version >= 2 && payload.tcpEndpoint && typeof payload.tcpEndpoint === 'object') {
+        const ep = payload.tcpEndpoint;
+        if (!wants('tcpEndpoint')) {
+          skipped.push('tcpEndpoint');
+        } else if (typeof ep.host === 'string' && Number.isFinite(ep.port)) {
+          saveTcpEndpoint({ host: ep.host, port: Math.floor(ep.port) });
+          summary.tcpEndpoint = true;
+        }
+      }
+
+      // ---- v2 history (opt-in side; if present in envelope, restore it) ----
+      if (version >= 2 && payload.history && typeof payload.history === 'object') {
+        if (!wants('history')) {
+          skipped.push('history');
+        } else {
+          let total = 0;
+          for (const t of BACKUP_TABLES_HISTORY) {
+            const rows = payload.history[t];
+            if (!Array.isArray(rows)) continue;
+            // Truncate first — history tables are append-only and merging with
+            // existing rows risks PK collisions / phantom dupes from different
+            // installs. The operator-confirmed restore overwrites by intent.
+            total += db.loadTable(t, rows, { truncate: true });
+          }
+          summary.history = total;
+        }
+      }
+    });
+
+    // v2.1: after re-enabling FK enforcement, surface any rows whose
+    // foreign-key references didn't resolve. Empty result = clean
+    // restore; populated = the backup had dangling pointers (e.g. a
+    // radio.workspace_id pointing at a workspace that was never
+    // dumped). We log the violations but don't fail the restore —
+    // the user-facing summary tells them what landed.
+    const fkViolations = db.foreignKeyViolations();
+    if (fkViolations.length > 0) {
+      const summaryStr = fkViolations.slice(0, 5).map(v => `${v.table}#${v.rowid}→${v.parent}`).join(', ');
+      console.warn(`[Backup] restore finished with ${fkViolations.length} dangling FK references: ${summaryStr}${fkViolations.length > 5 ? '…' : ''}`);
+      summary.fkViolations = fkViolations.length;
     }
 
     summary.skipped = skipped;
