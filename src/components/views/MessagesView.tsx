@@ -1065,6 +1065,35 @@ export function MessagesView({
                     <span className="text-[9px] mono-text text-brand-muted/60 ml-auto">
                       Markdown — rendered by clients that support it
                     </span>
+                    {/* v2.1: character counter. The Meshtastic LoRa
+                        payload tops out at ~228 bytes after framing;
+                        200 is the conventional safe cap that BBS Mail
+                        uses. Counter goes amber at 150 (approaching
+                        cap), red at 200 (over conventional cap), and
+                        the SEND button hard-disables at 229+ where
+                        firmware refuses TX. */}
+                    {(() => {
+                      const SOFT_CAP = 200;
+                      const len = draftMessage.length;
+                      const tone =
+                        len > SOFT_CAP ? 'text-brand-error'
+                        : len >= 150 ? 'text-brand-warning'
+                        : 'text-brand-muted/70';
+                      return (
+                        <span
+                          className={cn('text-[10px] mono-text font-bold ml-2 shrink-0 tabular-nums', tone)}
+                          title={
+                            len > SOFT_CAP
+                              ? `${len}/200 chars — past the safe single-packet cap. Some clients may refuse; consider shortening.`
+                              : len >= 150
+                              ? `${len}/200 chars — approaching the single-packet cap.`
+                              : `${len}/200 chars in this message.`
+                          }
+                        >
+                          {len}/{SOFT_CAP}
+                        </span>
+                      );
+                    })()}
                   </div>
                   <div className="flex gap-2">
                     <input
@@ -1081,7 +1110,11 @@ export function MessagesView({
                     />
                     <button
                       onClick={handleSendWithReply}
-                      className="bg-brand-accent text-black px-4 py-2 rounded-lg font-bold text-sm hover:brightness-110 transition-all"
+                      disabled={draftMessage.length > 228}
+                      title={draftMessage.length > 228
+                        ? 'Message exceeds the LoRa payload ceiling (228 bytes). Shorten and try again.'
+                        : undefined}
+                      className="bg-brand-accent text-black px-4 py-2 rounded-lg font-bold text-sm hover:brightness-110 transition-all disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:brightness-100"
                     >
                       SEND
                     </button>
