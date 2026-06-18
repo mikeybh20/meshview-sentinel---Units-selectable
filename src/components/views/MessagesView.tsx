@@ -1,5 +1,5 @@
 import React from 'react';
-import { Filter, Signal, Activity, Users, ArrowRight, Settings, Clock, Check, CheckCheck, AlertCircle, RotateCcw, Wifi, WifiOff, CornerDownRight, Smile, X, Search, Bold, Italic, Code, Link2 } from 'lucide-react';
+import { Filter, Signal, Activity, Users, ArrowRight, Settings, Clock, Check, CheckCheck, AlertCircle, RotateCcw, Wifi, WifiOff, CornerDownRight, Smile, X, Search, Bold, Italic, Code, Link2, MessageSquare } from 'lucide-react';
 // ReactionPicker is lazy-loaded so emoji-picker-react (~140 KB) only ships
 // when the operator actually opens a reaction picker.
 const ReactionPicker = React.lazy(() => import('../lazy/ReactionPicker'));
@@ -834,26 +834,49 @@ export function MessagesView({
                       })}
                     </div>
 
-                    {/* Hover actions: Reply / React (only when we have a packetId to reference) */}
-                    {canReplyOrReact && (
+                    {/* Hover actions: Reply / React / DM-sender
+                        (Reply + React only when we have a packetId to
+                        reference; DM is always available on incoming
+                        messages.) */}
+                    {(canReplyOrReact || !isOwn) && (
                       <div className={cn(
                         'absolute top-0 -translate-y-1/2 flex gap-1 opacity-0 group-hover/msg:opacity-100 transition-opacity',
                         isOwn ? 'right-full mr-1' : 'left-full ml-1'
                       )}>
-                        <button
-                          onClick={() => setReplyingTo(m)}
-                          title="Reply"
-                          className="p-1 rounded bg-brand-bg border border-brand-line hover:border-brand-accent/50 text-brand-muted hover:text-brand-accent transition-colors"
-                        >
-                          <CornerDownRight size={11} />
-                        </button>
-                        <button
-                          onClick={() => setReactPickerForId(prev => prev === m.id ? null : m.id)}
-                          title="React"
-                          className="p-1 rounded bg-brand-bg border border-brand-line hover:border-brand-accent/50 text-brand-muted hover:text-brand-accent transition-colors"
-                        >
-                          <Smile size={11} />
-                        </button>
+                        {canReplyOrReact && (
+                          <button
+                            onClick={() => setReplyingTo(m)}
+                            title="Reply"
+                            className="p-1 rounded bg-brand-bg border border-brand-line hover:border-brand-accent/50 text-brand-muted hover:text-brand-accent transition-colors"
+                          >
+                            <CornerDownRight size={11} />
+                          </button>
+                        )}
+                        {canReplyOrReact && (
+                          <button
+                            onClick={() => setReactPickerForId(prev => prev === m.id ? null : m.id)}
+                            title="React"
+                            className="p-1 rounded bg-brand-bg border border-brand-line hover:border-brand-accent/50 text-brand-muted hover:text-brand-accent transition-colors"
+                          >
+                            <Smile size={11} />
+                          </button>
+                        )}
+                        {/* v2.1: DM the sender. Only meaningful on
+                            incoming messages (you can't DM yourself)
+                            and only when the active chat ISN'T already
+                            that node's DM thread. Switches activeChatId
+                            to the sender's node id, which creates the
+                            DM thread on first click if one doesn't
+                            exist yet. */}
+                        {!isOwn && activeChatId !== m.from && (
+                          <button
+                            onClick={() => setActiveChatId(m.from)}
+                            title={`Direct message ${senderName}`}
+                            className="p-1 rounded bg-brand-bg border border-brand-line hover:border-brand-accent/50 text-brand-muted hover:text-brand-accent transition-colors"
+                          >
+                            <MessageSquare size={11} />
+                          </button>
+                        )}
                       </div>
                     )}
 
