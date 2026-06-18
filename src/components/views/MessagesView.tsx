@@ -580,7 +580,25 @@ export function MessagesView({
 
           <div className="p-2">
             <p className="text-[10px] text-brand-muted px-2 py-1 uppercase font-bold tracking-widest">Direct Messages</p>
-            {[...nodes, ...orphanUnreadNodes]
+            {(() => {
+              // v2.1 fix: precompute the set of nodes we've ever
+              // exchanged DMs with (sent OR received). Used by the
+              // filter below to keep historical DM partners in the
+              // sidebar list even after they go offline — otherwise a
+              // DM you just sent to a now-offline node disappears
+              // from the list the moment that node's online flag
+              // flips, with no way to navigate back to the thread.
+              const dmHistoryIds = new Set<string>();
+              for (const m of messages) {
+                if (m.isOwn || m.from === localNodeId) {
+                  // Outbound DM (skip broadcasts)
+                  if (m.to && m.to !== '!ffffffff') dmHistoryIds.add(m.to);
+                } else if (m.to === localNodeId) {
+                  // Inbound DM
+                  if (m.from) dmHistoryIds.add(m.from);
+                }
+              }
+              return [...nodes, ...orphanUnreadNodes]
               // Filter out: the placeholder demo node, blocked nodes, and
               // the local node itself. The local node can't be DMed —
               // self-DMs don't actually transmit, they just consume rate-
@@ -595,16 +613,18 @@ export function MessagesView({
               // useful when it can't actually reach the peer through the
               // selected radio's mesh.
               //
-              // Hard exception: nodes with UNREAD messages always show,
-              // even if they're now offline or `heardByRadios` lags the
-              // actual receive. Otherwise the sidebar/radio-pill "1"
-              // badge points to a chat that's invisible in the list, and
-              // the operator can't get to it without searching.
+              // Hard exceptions (always show, even when offline):
+              //   - nodes with UNREAD messages — otherwise the sidebar /
+              //     radio-pill "1" badge points to an invisible row
+              //   - v2.1: nodes we have any DM history with — so a fresh
+              //     outbound DM stays reachable from the sidebar even if
+              //     the peer is currently offline
               .filter(n => {
                 if (n.id === '!abcdef01' || n.id === localNodeId) return false;
                 if (blockedNodeIds.has(n.id)) return false;
                 const hasUnread = (unreadCounts[n.id] ?? 0) > 0;
                 if (hasUnread) return true;
+                if (dmHistoryIds.has(n.id)) return true;
                 if (!n.online) return false;
                 if (selectedRadioId && !(n.heardByRadios ?? []).includes(selectedRadioId)) return false;
                 return true;
@@ -623,23 +643,39 @@ export function MessagesView({
                 if (ua !== ub) return ub - ua;
                 return (b.lastSeen ?? 0) - (a.lastSeen ?? 0);
               })
-              .map(n => (
-              <ChannelItem
-                key={n.id}
-                name={n.name}
-                isDM={true}
-                isPkc={!!n.publicKey}
-                active={activeChatId === n.id}
-                count={unreadCounts[n.id]}
-                onClick={() => setActiveChatId(n.id)}
-                // lastMsg preview also follows the selected radio so it
-                // matches what the operator would see in the thread.
-                lastMsg={messages.find(m =>
-                  (m.from === n.id || m.to === n.id) &&
-                  (!selectedRadioId || m.radioId === selectedRadioId)
-                )?.text || 'No messages'}
-              />
-            ))}
+              .map(n => {
+                // v2.1: match the official Meshtastic app's "<short>
+                // <long>" naming so the DM list isn't just a wall of
+                // !hex ids when NodeInfo hasn't arrived yet. Synthesize
+                // a short from the last-4 of the node id when the
+                // firmware-broadcast shortName isn't known, and keep
+                // the long name when it's something other than a hex
+                // echo. Falls all the way back to the bare hex when
+                // we have nothing better to say.
+                const idHex = n.id;
+                const last4 = idHex.replace(/^!/, '').slice(-4).toUpperCase();
+                const short = (n.shortName && n.shortName.trim()) ? n.shortName : last4;
+                const longIsHex = !n.name || n.name === idHex || n.name.toLowerCase() === idHex.toLowerCase();
+                const displayName = longIsHex ? short : `${short} ${n.name}`;
+                return (
+                <ChannelItem
+                  key={n.id}
+                  name={displayName}
+                  isDM={true}
+                  isPkc={!!n.publicKey}
+                  active={activeChatId === n.id}
+                  count={unreadCounts[n.id]}
+                  onClick={() => setActiveChatId(n.id)}
+                  // lastMsg preview also follows the selected radio so it
+                  // matches what the operator would see in the thread.
+                  lastMsg={messages.find(m =>
+                    (m.from === n.id || m.to === n.id) &&
+                    (!selectedRadioId || m.radioId === selectedRadioId)
+                  )?.text || 'No messages'}
+                />
+                );
+              });
+            })()}
           </div>
         </div>
       </div>
