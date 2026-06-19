@@ -83,7 +83,17 @@ type SessionState =
   | { kind: 'awaiting-recipient'; enteredAt: number; channelIndex: number; pendingBody?: string }
   | { kind: 'awaiting-recipient-pick'; enteredAt: number; channelIndex: number; candidates: MeshNode[]; pendingBody?: string }
   | { kind: 'awaiting-body'; enteredAt: number; channelIndex: number; recipientNodeId: string; recipientShortName: string }
-  | { kind: 'reading'; enteredAt: number; channelIndex: number; currentMailId: number };
+  | {
+      kind: 'reading';
+      enteredAt: number;
+      channelIndex: number;
+      currentMailId: number;
+      /** v2.1: which category the subscriber asked to read. Null/
+       *  undefined = "all unread" (legacy `:mail r`). 'WX' | 'FX' |
+       *  'OTHER' = filtered. Sticky across N taps so the second
+       *  unread in this session pulls from the same bucket. */
+      category?: 'WX' | 'FX' | 'OTHER' | null;
+    };
 
 export class BbsService {
   private sessions = new Map<string, SessionState>(); // senderNodeId → state
@@ -284,7 +294,30 @@ export class BbsService {
       return this.startSend(fromId, channelIndex);
     }
     if (lower === `${mailTrigger} read` || lower === `${mailTrigger} r`) {
-      return this.startRead(fromId, channelIndex);
+      return this.startRead(fromId, channelIndex, null);
+    }
+    // v2.1: category-filtered read. `:mail r wx` / `:mail r fx` /
+    // `:mail r other` lets a subscriber drown out the weather noise
+    // (or surf JUST the weather) without paging through every item.
+    if (lower === `${mailTrigger} r wx` || lower === `${mailTrigger} read wx`) {
+      return this.startRead(fromId, channelIndex, 'WX');
+    }
+    if (lower === `${mailTrigger} r fx` || lower === `${mailTrigger} read fx`) {
+      return this.startRead(fromId, channelIndex, 'FX');
+    }
+    if (lower === `${mailTrigger} r other` || lower === `${mailTrigger} read other`) {
+      return this.startRead(fromId, channelIndex, 'OTHER');
+    }
+    // v2.1: bulk delete by category. `:mail d wx` wipes every WX
+    // alert in the subscriber's inbox (read OR unread); `:mail d fx`
+    // wipes daily forecasts; `:mail d other` is intentionally NOT
+    // supported — that would risk a misfire wiping real messages
+    // the subscriber actually wanted.
+    if (lower === `${mailTrigger} d wx` || lower === `${mailTrigger} delete wx`) {
+      return this.bulkDelete(fromId, channelIndex, 'WX');
+    }
+    if (lower === `${mailTrigger} d fx` || lower === `${mailTrigger} delete fx`) {
+      return this.bulkDelete(fromId, channelIndex, 'FX');
     }
 
     // Weather trigger (no args) — return the command menu. v2.0 Beta 4:
@@ -351,13 +384,23 @@ export class BbsService {
   }
 
   private async openMenu(fromId: string, channelIndex: number): Promise<boolean> {
-    const unread = meshDb.countUnread(fromId, this.radioId);
-    if (unread > 0) {
-      await this.reply(
-        fromId,
-        `MAIL: ${unread} new. Reply R=read, S=send, X=exit.`,
-        channelIndex,
-      );
+    // v2.1: categorised breakdown so a subscriber buried in weather
+    // pushes can see at a glance whether anything REAL is waiting.
+    // WX = NWS alerts, FX = scheduled daily forecast pushes,
+    // Other = everything else (real mail from real nodes).
+    const counts = meshDb.countUnreadByCategory(fromId, this.radioId);
+    if (counts.total > 0) {
+      // Tight one-packet response. Trigger names get re-used in the
+      // hints so the subscriber doesn't have to remember the configured
+      // mail trigger when copy-pasting.
+      const t = this.config.mailTrigger;
+      // Single-packet ceiling is 200; this fits under 130 chars with
+      // realistic counts (≤ ~999 per bucket).
+      const breakdown = `${counts.total} new (WX:${counts.wx} FX:${counts.fx} Other:${counts.other})`;
+      const hints = counts.other > 0
+        ? `${t} r other = real mail. R=all, S=send, X=exit.`
+        : `R=read all, S=send, X=exit.`;
+      await this.reply(fromId, `MAIL: ${breakdown}. ${hints}`, channelIndex);
     } else {
       await this.reply(fromId, 'MAIL: no new. Reply S=send, X=exit.', channelIndex);
     }
@@ -365,6 +408,29 @@ export class BbsService {
     // input picks an action. We piggyback on awaiting-recipient with a sentinel
     // candidates list to keep state shape simple — see dispatchInFlow.
     this.sessions.set(fromId, { kind: 'awaiting-recipient-pick', enteredAt: Date.now(), channelIndex, candidates: [] });
+    return true;
+  }
+
+  /**
+   * v2.1 — bulk delete unread + read mail in a single category for
+   * one subscriber. Used by `:mail d wx` / `:mail d fx` to wipe
+   * stale weather noise. Always scoped to the requesting node id so
+   * a subscriber can only wipe their OWN mail.
+   */
+  private async bulkDelete(
+    fromId: string,
+    channelIndex: number,
+    category: 'WX' | 'FX',
+  ): Promise<boolean> {
+    const n = meshDb.deleteMailByCategory(fromId, category, this.radioId);
+    this.sessions.delete(fromId);
+    this.bridge.emit('bbsMail', { recipientNodeId: fromId, bulkDelete: true, category, count: n });
+    const label = category === 'WX' ? 'weather alerts' : 'daily forecasts';
+    await this.reply(fromId, n > 0
+      ? `Deleted ${n} ${label}.`
+      : `No ${label} in inbox.`,
+      channelIndex,
+    );
     return true;
   }
 
@@ -380,14 +446,32 @@ export class BbsService {
     return true;
   }
 
-  private async startRead(fromId: string, channelIndex: number): Promise<boolean> {
-    const next = meshDb.nextUnreadFor(fromId, this.radioId);
+  private async startRead(
+    fromId: string,
+    channelIndex: number,
+    // v2.1: category filter sticks across the read session — N
+    // tap fetches the NEXT unread in the same bucket.
+    category: 'WX' | 'FX' | 'OTHER' | null = null,
+  ): Promise<boolean> {
+    const next = category
+      ? meshDb.nextUnreadByCategory(fromId, category, this.radioId)
+      : meshDb.nextUnreadFor(fromId, this.radioId);
     if (!next) {
       this.sessions.delete(fromId);
-      await this.reply(fromId, 'No unread mail.', channelIndex);
+      const noneLabel = category === 'WX' ? 'No unread weather alerts.'
+        : category === 'FX' ? 'No unread daily forecasts.'
+        : category === 'OTHER' ? 'No unread real mail.'
+        : 'No unread mail.';
+      await this.reply(fromId, noneLabel, channelIndex);
       return true;
     }
-    this.sessions.set(fromId, { kind: 'reading', enteredAt: Date.now(), channelIndex, currentMailId: next.id });
+    this.sessions.set(fromId, {
+      kind: 'reading',
+      enteredAt: Date.now(),
+      channelIndex,
+      currentMailId: next.id,
+      category,
+    });
     const when = relTime(next.postedAt);
     const body = next.body.length > 160 ? next.body.slice(0, 160) + '…' : next.body;
     await this.reply(fromId, `From ${next.senderShortName} ${when}: ${body}\nN=next D=delete X=exit`, channelIndex);
@@ -418,7 +502,7 @@ export class BbsService {
       // an attempt to send-by-short-name (skip the explicit S step) so people
       // can type `:mail` then `BH20` then a body without the menu friction.
       if (/^r$/i.test(trimmed)) {
-        return this.startRead(fromId, channelIndex);
+        return this.startRead(fromId, channelIndex, null);
       }
       if (/^s$/i.test(trimmed)) {
         return this.startSend(fromId, channelIndex);
@@ -654,13 +738,17 @@ export class BbsService {
     if (/^d$/i.test(text)) {
       meshDb.deleteMail(session.currentMailId);
       this.bridge.emit('bbsMail', { recipientNodeId: fromId, mailId: session.currentMailId, deleted: true });
-      return this.startRead(fromId, channelIndex);
+      // v2.1: stay within the original category filter when advancing
+      // — if the operator started with `:mail r other`, D and N keep
+      // serving only Other mail until they're empty.
+      return this.startRead(fromId, channelIndex, session.category ?? null);
     }
 
     if (/^n$/i.test(text)) {
       // Read mark already happened in startRead when this mail was served;
-      // just advance to the next unread.
-      return this.startRead(fromId, channelIndex);
+      // just advance to the next unread. v2.1: same category-stickiness
+      // as the D branch above.
+      return this.startRead(fromId, channelIndex, session.category ?? null);
     }
 
     // Anything else → treat as reply body (compose mail back to the sender).

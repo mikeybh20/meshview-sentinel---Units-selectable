@@ -244,11 +244,23 @@ The recipient gets a push DM notification (\`✉ Mail from <SENDER>. DM :mail R 
 **Reader flow:**
 
 \`\`\`text
-DM ":mail"  →  "MAIL: 1 new. Reply R=read, S=send, X=exit."
-DM "R"      →  "From BH20 2m ago: Hey can you grab milk?  N=next D=delete X=exit"
-DM "D"      →  deletes; serves next unread (or "No unread mail.")
-DM "X"      →  exits the session.
+DM ":mail"        →  "MAIL: 45 new (WX:5 FX:35 Other:5). :mail r other = real mail. R=all, S=send, X=exit."
+DM "R"            →  "From BH20 2m ago: Hey can you grab milk?  N=next D=delete X=exit"
+DM "D"            →  deletes; serves next unread (or "No unread mail.")
+DM "X"            →  exits the session.
 \`\`\`
+
+v2.1 — **category filters**, useful when weather pushes pile up alongside real mail:
+
+\`\`\`text
+DM ":mail r other"  →  next unread real mail; N/D stay scoped to Other
+DM ":mail r wx"     →  next unread NWS alert (urgent)
+DM ":mail r fx"     →  next unread daily forecast (routine)
+DM ":mail d wx"     →  bulk-deletes EVERY weather alert in your inbox; reports count
+DM ":mail d fx"     →  bulk-deletes EVERY daily forecast in your inbox; reports count
+\`\`\`
+
+\`d other\` is intentionally not provided — wiping real mail in bulk is too easy to misfire. Delete those one at a time via the per-message D in the read session.
 
 Shortcuts: \`:mail send\`, \`:mail read\`, \`:mail BH20\` (skip the menu and prompt for body), \`!02eb3bec\` instead of a short name (hex form bypasses short-name lookup), reply-by-typing during a read session.
 

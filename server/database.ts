@@ -1957,6 +1957,103 @@ export class MeshDatabase {
     return Number((r as any).changes ?? 0) > 0;
   }
 
+  /**
+   * v2.1 — categorised unread counts for the BBS `:mail` menu summary.
+   *
+   * The weather alert poller stamps two synthetic sender shorts:
+   *   'WX' — issued NWS alerts (urgent)
+   *   'FX' — scheduled daily forecast pushes (routine)
+   * Everything else is treated as 'OTHER' — real mail from real nodes.
+   *
+   * Lets a subscriber DM `:mail` and get a `WX: 5  FX: 35  Other: 45`
+   * line back instead of just a total. Pairs with countByCategory(),
+   * nextUnreadByCategory(), and deleteByCategory() to support the
+   * filter/delete flows.
+   */
+  countUnreadByCategory(recipientNodeId: string, radioId?: string | null): { wx: number; fx: number; other: number; total: number } {
+    const sql = radioId
+      ? `SELECT sender_short_name, COUNT(*) AS c FROM bbs_mail
+         WHERE recipient_node_id = ? AND read_at IS NULL AND (radio_id = ? OR radio_id IS NULL)
+         GROUP BY sender_short_name`
+      : `SELECT sender_short_name, COUNT(*) AS c FROM bbs_mail
+         WHERE recipient_node_id = ? AND read_at IS NULL
+         GROUP BY sender_short_name`;
+    const rows = this.db.prepare(sql).all(...(radioId ? [recipientNodeId, radioId] : [recipientNodeId])) as Array<{ sender_short_name: string; c: number }>;
+    let wx = 0, fx = 0, other = 0;
+    for (const r of rows) {
+      const short = (r.sender_short_name || '').toUpperCase();
+      if (short === 'WX') wx += r.c;
+      else if (short === 'FX') fx += r.c;
+      else other += r.c;
+    }
+    return { wx, fx, other, total: wx + fx + other };
+  }
+
+  /**
+   * v2.1 — fetch the next unread mail for a recipient, filtered to a
+   * single category. category='WX' / 'FX' returns only those synthetic
+   * senders; category='OTHER' returns anything that ISN'T WX or FX;
+   * category=null (default) keeps the legacy behavior (any unread).
+   */
+  nextUnreadByCategory(
+    recipientNodeId: string,
+    category: 'WX' | 'FX' | 'OTHER' | null,
+    radioId?: string | null,
+  ): { id: number; senderNodeId: string; senderShortName: string; postedAt: number; body: string } | null {
+    const params: any[] = [recipientNodeId];
+    let where = 'recipient_node_id = ? AND read_at IS NULL';
+    if (radioId) { where += ' AND (radio_id = ? OR radio_id IS NULL)'; params.push(radioId); }
+    if (category === 'WX' || category === 'FX') {
+      where += ' AND UPPER(sender_short_name) = ?';
+      params.push(category);
+    } else if (category === 'OTHER') {
+      where += ` AND UPPER(sender_short_name) NOT IN ('WX', 'FX')`;
+    }
+    const sql = `SELECT id, sender_node_id, sender_short_name, posted_at, body
+                 FROM bbs_mail WHERE ${where} ORDER BY posted_at ASC LIMIT 1`;
+    const row = this.db.prepare(sql).get(...params) as {
+      id: number; sender_node_id: string; sender_short_name: string;
+      posted_at: number; body: string;
+    } | undefined;
+    if (!row) return null;
+    return {
+      id: row.id,
+      senderNodeId: row.sender_node_id,
+      senderShortName: row.sender_short_name,
+      postedAt: row.posted_at,
+      body: row.body,
+    };
+  }
+
+  /**
+   * v2.1 — bulk delete mail for a recipient by category. Returns
+   * count deleted. Used by `:mail D WX` / `:mail D FX` so the
+   * subscriber can wipe stale weather noise in one command instead
+   * of pressing D on each item.
+   *
+   * SECURITY NOTE: scoped to a single recipient — a subscriber can
+   * only ever delete their own mail this way, never anyone else's.
+   * The BBS service is the only caller; it always passes the fromId
+   * of the in-flight session as the recipient.
+   */
+  deleteMailByCategory(
+    recipientNodeId: string,
+    category: 'WX' | 'FX' | 'OTHER',
+    radioId?: string | null,
+  ): number {
+    const params: any[] = [recipientNodeId];
+    let where = 'recipient_node_id = ?';
+    if (radioId) { where += ' AND (radio_id = ? OR radio_id IS NULL)'; params.push(radioId); }
+    if (category === 'WX' || category === 'FX') {
+      where += ' AND UPPER(sender_short_name) = ?';
+      params.push(category);
+    } else {
+      where += ` AND UPPER(sender_short_name) NOT IN ('WX', 'FX')`;
+    }
+    const r = this.db.prepare(`DELETE FROM bbs_mail WHERE ${where}`).run(...params);
+    return Number((r as any).changes ?? 0);
+  }
+
   /** Delete mail older than the given epoch-ms cutoff (regardless of read state).
    *  Returns rows removed. Called by the periodic retention pruner. */
   pruneMailOlderThan(cutoffMs: number): number {
