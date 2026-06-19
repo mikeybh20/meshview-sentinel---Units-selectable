@@ -319,6 +319,13 @@ export class BbsService {
     if (lower === `${mailTrigger} d fx` || lower === `${mailTrigger} delete fx`) {
       return this.bulkDelete(fromId, channelIndex, 'FX');
     }
+    // v2.1: command catalog. With the category filters + bulk
+    // deletes the surface grew enough that a subscriber should be
+    // able to discover the commands from the air. Mirrors how
+    // `:weather help` and `:weather ?` already work.
+    if (lower === `${mailTrigger} help` || lower === `${mailTrigger} ?`) {
+      return this.sendMailHelp(fromId, channelIndex);
+    }
 
     // Weather trigger (no args) — return the command menu. v2.0 Beta 4:
     // replaces the old "send a ZIP" prompt flow with a help message so
@@ -389,20 +396,24 @@ export class BbsService {
     // WX = NWS alerts, FX = scheduled daily forecast pushes,
     // Other = everything else (real mail from real nodes).
     const counts = meshDb.countUnreadByCategory(fromId, this.radioId);
+    // Trigger name reused in the hints so the subscriber doesn't have
+    // to remember the configured mail trigger when copy-pasting.
+    const t = this.config.mailTrigger;
     if (counts.total > 0) {
-      // Tight one-packet response. Trigger names get re-used in the
-      // hints so the subscriber doesn't have to remember the configured
-      // mail trigger when copy-pasting.
-      const t = this.config.mailTrigger;
       // Single-packet ceiling is 200; this fits under 130 chars with
       // realistic counts (≤ ~999 per bucket).
       const breakdown = `${counts.total} new (WX:${counts.wx} FX:${counts.fx} Other:${counts.other})`;
+      // v2.1: always include `?=help` so the new command surface
+      // (`r wx|fx|other`, `d wx|fx`) is discoverable without us
+      // having to bloat this prompt. The conditional `r other` hint
+      // stays — it's the highest-value tip when an inbox is
+      // weather-flooded but has real mail behind it.
       const hints = counts.other > 0
-        ? `${t} r other = real mail. R=all, S=send, X=exit.`
-        : `R=read all, S=send, X=exit.`;
+        ? `${t} r other = real mail. R=all S=send X=exit ?=help.`
+        : `R=read all S=send X=exit ?=help.`;
       await this.reply(fromId, `MAIL: ${breakdown}. ${hints}`, channelIndex);
     } else {
-      await this.reply(fromId, 'MAIL: no new. Reply S=send, X=exit.', channelIndex);
+      await this.reply(fromId, `MAIL: no new. Reply S=send, X=exit, ${t} ? = help.`, channelIndex);
     }
     // Park them in a synthetic awaiting state where their next single-letter
     // input picks an action. We piggyback on awaiting-recipient with a sentinel
@@ -431,6 +442,26 @@ export class BbsService {
       : `No ${label} in inbox.`,
       channelIndex,
     );
+    return true;
+  }
+
+  /**
+   * v2.1 — single-packet help reply for `:mail help` / `:mail ?`.
+   * Matches the format of handleWeatherHelp(): one line, pipe-
+   * separated, templated on the configured mailTrigger so a
+   * subscriber who's renamed the trigger sees the same trigger
+   * back. ~125 chars when trigger is the default `:mail` — fits
+   * the 200-char single-packet ceiling with margin.
+   */
+  private async sendMailHelp(fromId: string, channelIndex: number): Promise<boolean> {
+    const t = this.config.mailTrigger;
+    const msg =
+      `${t} = inbox | ` +
+      `${t} r [wx|fx|other] = read | ` +
+      `${t} s = send | ` +
+      `${t} d wx|fx = bulk del | ` +
+      `${t} SHORT = quick-to-node`;
+    await this.reply(fromId, msg, channelIndex);
     return true;
   }
 

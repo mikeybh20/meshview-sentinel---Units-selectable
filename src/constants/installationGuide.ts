@@ -258,9 +258,12 @@ DM ":mail r wx"     →  next unread NWS alert (urgent)
 DM ":mail r fx"     →  next unread daily forecast (routine)
 DM ":mail d wx"     →  bulk-deletes EVERY weather alert in your inbox; reports count
 DM ":mail d fx"     →  bulk-deletes EVERY daily forecast in your inbox; reports count
+DM ":mail ?"        →  one-line command catalog (also ":mail help")
 \`\`\`
 
 \`d other\` is intentionally not provided — wiping real mail in bulk is too easy to misfire. Delete those one at a time via the per-message D in the read session.
+
+The \`:mail\` entry response also includes \`?=help\` as a tail hint, so a subscriber meeting the BBS for the first time can discover the catalog without it being documented anywhere they can see.
 
 Shortcuts: \`:mail send\`, \`:mail read\`, \`:mail BH20\` (skip the menu and prompt for body), \`!02eb3bec\` instead of a short name (hex form bypasses short-name lookup), reply-by-typing during a read session.
 
