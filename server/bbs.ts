@@ -255,10 +255,43 @@ export class BbsService {
       return hadMail || hadWeather;
     }
 
-    // Help command at any time during a session.
+    // v2.1: context-aware in-session help. Pre-2.1 this always replied
+    // with `X=cancel. Body cap N chars.` — wrong for every state EXCEPT
+    // body-compose. A subscriber typing `?` right after `:mail` hits
+    // the just-opened menu (awaiting-recipient-pick) and expects the
+    // command catalog, NOT a stray body-compose fragment. Route the
+    // reply off the active session kind:
+    //  - menu / before-recipient → full :mail command catalog
+    //  - awaiting body            → keep the legacy "X=cancel. Body cap"
+    //  - reading                  → restate N/D/X choices
+    //  - weather (awaiting ZIP)   → restate the ZIP prompt
     if (/^(\?|help|h)$/i.test(trimmed) && (this.sessions.has(fromId) || this.weatherSessions.has(fromId))) {
-      await this.reply(fromId, `X=cancel. Body cap ${this.config.bodyMaxChars} chars.`, channelIndex);
-      return true;
+      const mailSession = this.sessions.get(fromId);
+      if (mailSession) {
+        if (mailSession.kind === 'awaiting-recipient-pick') {
+          return this.sendMailHelp(fromId, channelIndex);
+        }
+        if (mailSession.kind === 'awaiting-recipient') {
+          await this.reply(fromId, `TO whom? 4-char shortname (e.g. BH20), !02eb3bec hex form, or X=cancel.`, channelIndex);
+          return true;
+        }
+        if (mailSession.kind === 'awaiting-body') {
+          await this.reply(fromId, `Type message body. X=cancel. Body cap ${this.config.bodyMaxChars} chars.`, channelIndex);
+          return true;
+        }
+        if (mailSession.kind === 'reading') {
+          await this.reply(fromId, `Replying anything composes a reply. N=next D=delete X=exit.`, channelIndex);
+          return true;
+        }
+      }
+      if (this.weatherSessions.has(fromId)) {
+        await this.reply(fromId, `Send 5-digit US ZIP, or X=cancel.`, channelIndex);
+        return true;
+      }
+      // Belt-and-suspenders default — every session.kind is handled
+      // above, but if a future kind lands without an update here the
+      // catalog is the safest fallback.
+      return this.sendMailHelp(fromId, channelIndex);
     }
 
     // Weather flow — single-message exchange. If they're waiting for a ZIP,
