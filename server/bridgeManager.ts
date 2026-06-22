@@ -630,6 +630,81 @@ class BridgeManager extends EventEmitter {
     return { ok: true, previousSingleton: previousSingleton ?? undefined };
   }
 
+  /**
+   * v2.1 — rebind a radio's live connection after its DB row's
+   * `target` or `transport` changed (e.g. the operator edited the
+   * IP address from .117 to .116 in Settings → Radios).
+   *
+   * Without this, the PUT /api/mesh/radios endpoint would only
+   * update the stored row — the in-process bridge worker keeps
+   * looping reconnect attempts at the OLD target indefinitely
+   * (`Will retry 192.168.1.117:4403 in 60s (failure #473)`), and
+   * the dashboard reports the radio offline despite the operator
+   * having "saved" a working address.
+   *
+   * Handles both topologies:
+   *   - Singleton/default: tear down + re-connect the singleton
+   *     bridge (same recipe as promoteToSingleton).
+   *   - Secondary: disconnectRadio() then spawnSecondary() — the
+   *     spawn re-reads the (now-updated) DB row to pick up the
+   *     new target.
+   *
+   * Returns `rebound: false` when the radio wasn't actively
+   * connected (e.g. user edited a disconnected radio's IP) —
+   * caller logs "DB only" in that case; the next manual Connect
+   * picks up the new target automatically.
+   */
+  async rebindAfterTargetChange(
+    radioId: string,
+  ): Promise<{ ok: true; rebound: boolean } | { ok: false; error: string }> {
+    const row = meshDb().getRadio(radioId);
+    if (!row) return { ok: false, error: `radio "${radioId}" not found` };
+    if (row.transport === 'ble') {
+      return { ok: false, error: 'BLE transport not yet implemented' };
+    }
+
+    // Singleton path: same disconnect → clear registration → reconnect
+    // sequence promoteToSingleton uses. We gate on EITHER `defaultRadioId`
+    // (DB-default heuristic) OR `meshBridge.getRadioId()` (the post-
+    // identity confirmed singleton) so we catch the case where the two
+    // diverge at boot before identity exchange completes.
+    const singletonRadio = meshBridge.getRadioId();
+    const isSingleton = radioId === this.defaultRadioId || singletonRadio === radioId;
+    if (isSingleton) {
+      try { await meshBridge.disconnect(); } catch { /* best-effort */ }
+      this.contexts.delete(radioId);
+      this.defaultRadioId = null;
+      this.defaultRegistered = false;
+      try {
+        if (row.transport === 'tcp') {
+          const { host, port } = parseTcpTarget(row.target);
+          await meshBridge.connectTcp(host, port);
+        } else {
+          await meshBridge.connect(row.target);
+        }
+      } catch (err: any) {
+        return { ok: false, error: err?.message ?? 'singleton rebind failed' };
+      }
+      console.log(`[BridgeManager] singleton rebound to "${row.target}" (${row.transport}) for radio ${radioId}`);
+      return { ok: true, rebound: true };
+    }
+
+    // Secondary path: only rebind if currently connected. If the radio
+    // sits disconnected in the DB, the next manual Connect picks up the
+    // new target with no further work.
+    const ctx = this.contexts.get(radioId);
+    if (!ctx) {
+      return { ok: true, rebound: false };
+    }
+    try { await ctx.bridge.disconnect(); } catch { /* best-effort */ }
+    this.detachForwarders(radioId);
+    this.contexts.delete(radioId);
+    const spawn = await this.spawnSecondary(radioId);
+    if (spawn.ok !== true) return { ok: false, error: spawn.error };
+    console.log(`[BridgeManager] secondary ${radioId} rebound to "${row.target}" (${row.transport})`);
+    return { ok: true, rebound: true };
+  }
+
   async disconnectRadio(radioId: string): Promise<{ ok: true } | { ok: false; error: string }> {
     if (radioId === this.defaultRadioId) {
       return { ok: false, error: 'cannot disconnect the default radio from here — use the Connection panel' };

@@ -1604,7 +1604,7 @@ app.post('/api/mesh/radios', (req, res) => {
   return res.status(201).json(db.getRadio(radio_id));
 });
 
-app.put('/api/mesh/radios/:radioId', (req, res) => {
+app.put('/api/mesh/radios/:radioId', async (req, res) => {
   const { radioId } = req.params;
   const db = meshDb();
   const existing = db.getRadio(radioId);
@@ -1624,6 +1624,11 @@ app.put('/api/mesh/radios/:radioId', (req, res) => {
     if (body[f] !== undefined && body[f] !== (existing as any)[f]) changed.push(`${f}="${body[f]}"`);
   }
 
+  // v2.1 — capture connection-path mutations BEFORE we upsert so we know
+  // whether to kick the live bridge worker (see rebind block below).
+  const targetChanged = body.target !== undefined && body.target !== existing.target;
+  const transportChanged = body.transport !== undefined && body.transport !== existing.transport;
+
   db.upsertRadio({
     ...existing,
     long_name:       body.long_name       ?? existing.long_name,
@@ -1642,8 +1647,30 @@ app.put('/api/mesh/radios/:radioId', (req, res) => {
   if (body.bbs_only !== undefined) {
     bridgeManager.updateRadioBbsOnly(radioId, !!body.bbs_only);
   }
+
+  // v2.1 — if the operator changed the radio's target IP or transport,
+  // the in-process bridge worker is still looping at the OLD address.
+  // Tear it down and reconnect to the new one. Without this the
+  // dashboard happily reports "saved!" while the console keeps logging
+  // `Will retry 192.168.1.117:4403 in 60s (failure #473)` against the
+  // stale IP and every BBS / weather DM silently fails with
+  // "Radio not connected — mail row left in inbox".
+  let rebindError: string | null = null;
+  if (targetChanged || transportChanged) {
+    const result = await bridgeManager.rebindAfterTargetChange(radioId);
+    if (result.ok === true) {
+      console.log(`[Radios] EDIT radio_id="${radioId}" rebind=${result.rebound ? 'YES' : 'NO_LIVE_CTX'} new_target="${body.target ?? existing.target}"`);
+    } else {
+      rebindError = result.error;
+      console.log(`[Radios] EDIT radio_id="${radioId}" rebind=FAILED err="${result.error}"`);
+    }
+  }
+
   console.log(`[Radios] EDIT radio_id="${radioId}" by user=${actor} result=OK changed=[${changed.join(',') || 'none'}]`);
-  return res.json(db.getRadio(radioId));
+  // Return the updated row + a rebind hint the UI can surface as a toast
+  // when the worker couldn't reconnect to the new address. Keeps the
+  // operator from having to chase docker logs to see what went wrong.
+  return res.json({ ...db.getRadio(radioId), rebindError });
 });
 
 app.delete('/api/mesh/radios/:radioId', (req, res) => {
