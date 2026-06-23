@@ -14,3 +14,6 @@ data/
 __pycache__/
 *.py[cod]
 
+# Private legal/agreement drafts (never commit — see legal/README if added)
+legal/
+
