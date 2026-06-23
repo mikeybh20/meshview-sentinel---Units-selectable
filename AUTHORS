@@ -1,0 +1,37 @@
+MeshView Sentinel — Authors
+
+This file lists the co-authors of the MeshView Sentinel codebase.
+Copyright in the Software is jointly held by the authors listed
+below, subject to the dual-license terms in LICENSE (AGPL-3.0) and
+COMMERCIAL-LICENSE.md.
+
+Co-Authors
+----------
+
+Kit Kim
+    Founding co-author. Original v1.0 contributor.
+
+Michael Broadwater <michael.broadwater@gmail.com>
+    Primary maintainer. Founding co-author. Maryland, USA.
+
+
+Community Contributors
+----------------------
+
+Contributors who submit code, documentation, bug reports, and other
+improvements under the AGPL-3.0 license are listed in the
+contributors graph of the public repository and in commit history.
+Their contributions are gratefully acknowledged; they retain
+copyright in their own contributions, licensed in under AGPL-3.0.
+
+For the canonical contributor list, see the project's GitHub
+contributors page.
+
+
+Attribution Required
+--------------------
+
+Any redistribution of MeshView Sentinel — whether under AGPL-3.0 or
+under a Commercial License — must retain attribution to the
+co-authors listed above. See LICENSE Section 5 (AGPL-3.0) and
+COMMERCIAL-LICENSE.md for specific attribution obligations.

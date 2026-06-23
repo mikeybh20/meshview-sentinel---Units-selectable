@@ -2,7 +2,7 @@
 
 A self-hosted, web-based operator console for [Meshtastic](https://meshtastic.org/) LoRa mesh networks. Connect to a real radio over USB serial or TCP, run against the built-in simulator, or use both. Eight firmware modules can be configured end-to-end without leaving the browser.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-emerald.svg)](LICENSE)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-emerald.svg)](LICENSE) [![Commercial License Available](https://img.shields.io/badge/Commercial%20License-Available-blue.svg)](COMMERCIAL-LICENSE.md)
 
 ---
 
@@ -173,7 +173,27 @@ A few other security notes:
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE) — free for personal and commercial use, modification, and redistribution.
+MeshView Sentinel is **dual-licensed**:
+
+1. **[GNU Affero General Public License v3.0](LICENSE)** — the default
+   license. Free for personal use, amateur radio operators, mesh-network
+   community groups, SKYWARN spotters, ARES/RACES, volunteer first
+   responders, registered 501(c)(3) EmComm organizations, and academic
+   use. Strong copyleft including AGPL §13 (the "network use" clause)
+   — if you modify and host the Software for users, you must offer
+   them the corresponding source.
+
+2. **[Commercial License](COMMERCIAL-LICENSE.md)** — available for
+   commercial entities that need exemption from AGPL-3.0 copyleft
+   (proprietary integration, closed-source redistribution, hosted
+   commercial services without source disclosure). Categories
+   enumerated in the [Free Commercial License Policy](FREE-USE-POLICY.md)
+   receive the Commercial License at $0 on request — the dual-license
+   model exists to ensure for-profit deployments contribute back, not
+   to charge volunteers and community groups.
+
+Copyright (c) 2024-2026 Kit Kim and Michael Broadwater. See
+[AUTHORS](AUTHORS) for attribution details.
 
 ---
 

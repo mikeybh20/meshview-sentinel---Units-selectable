@@ -166,18 +166,23 @@ These are valuable but explicitly out of v3.0 scope:
 
 - [x] **Corporate IP release / clearance** — confirmed clear per
       Broadwater. Sentinel is personal IP, not work-for-hire.
-- [ ] **Co-author agreement signed** by Broadwater and Kit.
-      Draft prepared at `legal/co-author-agreement-draft.md`
-      (private, gitignored). Pending attorney review by each
-      party + signatures.
-- [ ] **LICENSE file** added (AGPL-3.0).
-- [ ] **COMMERCIAL-LICENSE.md** added (commercial license terms +
+      (README Disclaimer section also memorializes this publicly.)
+- [x] **Co-author agreement** — treated as resolved per Broadwater
+      direction. Draft remains at `legal/co-author-agreement-draft.md`
+      (private, gitignored) for attorney review + signature whenever
+      formalisation is convenient.
+- [x] **LICENSE file** added (canonical AGPL-3.0 text from FSF).
+- [x] **COMMERCIAL-LICENSE.md** added (commercial license terms +
       contact for commercial license inquiries).
-- [ ] **FREE-USE-POLICY.md** added (categories eligible for free
-      commercial license waiver).
-- [ ] **AUTHORS file** added (Broadwater + Kit attribution).
+- [x] **FREE-USE-POLICY.md** added (categories eligible for free
+      commercial license waiver, with edge-case examples).
+- [x] **AUTHORS file** added (Kit Kim + Broadwater attribution).
+- [x] **README updated** to show dual-license badges + replace MIT
+      License section with AGPL-3.0 + Commercial dual-license
+      explanation pointing at the three license files.
 - [ ] **Source-code copyright headers** updated across all source
-      files to reflect joint authorship.
+      files to reflect joint authorship. Done incrementally as files
+      are touched in normal work; no big-bang sweep planned.
 - [ ] **Public repository** spun up (or existing repo made public)
       with documentation, README, contributing guide.
 
