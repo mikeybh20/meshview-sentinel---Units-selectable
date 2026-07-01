@@ -5040,6 +5040,137 @@ app.delete('/api/mesh/bbs/weather/subscribers/:nodeId', (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------
+// v3.0 SKYWARN: Storm Reports (Local Storm Report intake — NWS LSR shape)
+// ---------------------------------------------------------------------
+
+/** GET /api/mesh/bbs/storm-reports — list storm reports.
+ *  Query params (all optional):
+ *    radio_id       — scope to a single receiving radio
+ *    workspace_id   — scope to a workspace (independent of radio)
+ *    since          — epoch-ms lower bound on received_at
+ *    until          — epoch-ms upper bound on received_at
+ *    event_type     — exact match NWS LSR code (HAIL / TSTM WND / etc.)
+ *    reporter_id    — reports from one spotter node
+ *    limit          — default 200, cap 1000
+ *    count=true     — return {count:N} instead of the full list */
+app.get('/api/mesh/bbs/storm-reports', (req, res) => {
+  const q = req.query;
+  const opts = {
+    radioId: typeof q.radio_id === 'string' && q.radio_id ? q.radio_id : undefined,
+    workspaceId: typeof q.workspace_id === 'string' && q.workspace_id ? q.workspace_id : undefined,
+    since: typeof q.since === 'string' ? parseInt(q.since, 10) || undefined : undefined,
+    until: typeof q.until === 'string' ? parseInt(q.until, 10) || undefined : undefined,
+    eventType: typeof q.event_type === 'string' && q.event_type ? q.event_type.toUpperCase() : undefined,
+    reporterNodeId: typeof q.reporter_id === 'string' && q.reporter_id ? q.reporter_id.toLowerCase() : undefined,
+    limit: typeof q.limit === 'string' ? parseInt(q.limit, 10) || undefined : undefined,
+  };
+  try {
+    if (q.count === 'true') {
+      return res.json({ count: meshDb().countStormReports(opts) });
+    }
+    return res.json({
+      reports: meshDb().listStormReports(opts),
+      total: meshDb().countStormReports(opts),
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/** GET /api/mesh/bbs/storm-reports/export.csv — NWS LSR-shaped CSV export.
+ *  Fields ordered to match the NWS eSpotter submission form so the
+ *  operator can paste rows straight in (until v3.1's direct-submit
+ *  path is enabled). */
+app.get('/api/mesh/bbs/storm-reports/export.csv', (req, res) => {
+  const q = req.query;
+  const opts = {
+    radioId: typeof q.radio_id === 'string' && q.radio_id ? q.radio_id : undefined,
+    workspaceId: typeof q.workspace_id === 'string' && q.workspace_id ? q.workspace_id : undefined,
+    since: typeof q.since === 'string' ? parseInt(q.since, 10) || undefined : undefined,
+    until: typeof q.until === 'string' ? parseInt(q.until, 10) || undefined : undefined,
+    eventType: typeof q.event_type === 'string' && q.event_type ? q.event_type.toUpperCase() : undefined,
+    limit: 1000,
+  };
+  try {
+    const rows = meshDb().listStormReports(opts);
+    // Escape a field for CSV: wrap in quotes only if it contains a
+    // comma, quote, or newline; escape embedded quotes by doubling.
+    const csvField = (v: string | number | null | undefined): string => {
+      if (v === null || v === undefined) return '';
+      const s = String(v);
+      if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+      return s;
+    };
+    const header = [
+      'id', 'reported_at_iso', 'received_at_iso', 'event_type',
+      'magnitude_value', 'magnitude_unit',
+      'lat', 'lng', 'location_source', 'location_description',
+      'county', 'state',
+      'spotter_source', 'reporter_short_name', 'reporter_node_id',
+      'remarks', 'submitted_to_nws',
+    ].join(',');
+    const body = rows.map(r => [
+      r.id,
+      new Date(r.reportedAt).toISOString(),
+      new Date(r.receivedAt).toISOString(),
+      r.eventType,
+      r.magnitudeValue ?? '',
+      r.magnitudeUnit ?? '',
+      r.lat ?? '',
+      r.lng ?? '',
+      r.locationSource,
+      csvField(r.locationDescription),
+      csvField(r.county),
+      csvField(r.state),
+      r.spotterSource,
+      csvField(r.reporterShortName),
+      r.reporterNodeId,
+      csvField(r.remarks),
+      r.submittedToNws ? 'true' : 'false',
+    ].join(',')).join('\n');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="storm-reports-${Date.now()}.csv"`);
+    return res.send(header + '\n' + body + (body ? '\n' : ''));
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/** GET /api/mesh/bbs/storm-reports/:id — single storm report by id.
+ *  Registered AFTER /export.csv so Express routes the static path
+ *  first; parseInt("export.csv") would otherwise 400. */
+app.get('/api/mesh/bbs/storm-reports/:id', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isFinite(id) || id <= 0) {
+    return res.status(400).json({ error: 'id must be a positive integer' });
+  }
+  try {
+    const row = meshDb().getStormReport(id);
+    if (!row) return res.status(404).json({ error: 'storm report not found' });
+    return res.json(row);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/** DELETE /api/mesh/bbs/storm-reports/:id — operator correction path. */
+app.delete('/api/mesh/bbs/storm-reports/:id', requireAuth, (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isFinite(id) || id <= 0) {
+    return res.status(400).json({ error: 'id must be a positive integer' });
+  }
+  const actor = req.user ? `${req.user.username}#${req.user.id}` : '<unauthenticated>';
+  try {
+    const ok = meshDb().deleteStormReport(id);
+    console.log(`[StormReports] DELETE id=${id} by user=${actor} result=${ok ? 'OK' : 'NOT_FOUND'}`);
+    if (ok) meshBridge.emit('stormReport', { id, action: 'deleted' });
+    return res.json({ ok });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // Send a text message through the radio (also handles replies and reactions).
 // v2.0 Phase 4: optional `radio_id` in the body picks the originating radio;
 // when omitted, falls back to the default radio so 1.x clients keep working.

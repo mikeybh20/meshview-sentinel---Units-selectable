@@ -269,6 +269,82 @@ export class MeshDatabase {
         zip            TEXT
       );
 
+      -- v3.0 SKYWARN: Local Storm Report intake. Each row is one report
+      -- submitted by a subscriber via the BBS ":spot" command. Column
+      -- shape mirrors the NWS LSR (Local Storm Report) format so v3.1
+      -- can flip the SKYWARN_DIRECT_SUBMIT feature flag and submit
+      -- rows straight to the NWS eSpotter API without ETL. Field
+      -- meanings:
+      --   reported_at         — event time (spotter can override if
+      --                         reporting a delayed sighting)
+      --   received_at         — bridge-stamped when the DM arrived,
+      --                         canonical clock; drives ordering
+      --   event_type          — NWS LSR code — HAIL / TSTM WND /
+      --                         TORNADO / FUNNEL / FLOOD / WALL CLOUD
+      --                         / WATERSPOUT / etc. TEXT (no enum
+      --                         constraint) so new codes can be added
+      --                         without a migration.
+      --   magnitude_value +   — hail size (in inches), wind speed
+      --   magnitude_unit        (mph), water depth (feet), etc.
+      --                         Nullable — some events (WALL CLOUD,
+      --                         FUNNEL CLOUD) have no natural scalar.
+      --   lat/lng             — event location. Auto-populated from
+      --                         reporter's last known position by
+      --                         default; overridable during :spot.
+      --   location_source     — AUTO_LAST_POSITION | SPOTTER_TYPED |
+      --                         LANDMARK — audit trail of how the
+      --                         coordinates were chosen (matters for
+      --                         NWS submission credibility).
+      --   spotter_source      — NWS taxonomy: SPOTTER (untrained
+      --                         reporter), TRAINED_SPOTTER (SKYWARN-
+      --                         certified), PUBLIC (bystander), LEO
+      --                         (law enforcement), EM (emergency
+      --                         manager). Defaults to SPOTTER; the
+      --                         :spot flow lets the reporter pick.
+      --   submitted_to_nws    — 0 until SKYWARN_DIRECT_SUBMIT is on
+      --                         AND the report was successfully
+      --                         posted to eSpotter. Column exists in
+      --                         v3.0 to reserve the shape; column
+      --                         stays 0 for every row until v3.1.
+      --   workspace_id        — resolved from radio_id at insert time
+      --                         so subsequent workspace/radio moves
+      --                         don't scramble historical reports.
+      CREATE TABLE IF NOT EXISTS storm_reports (
+        id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+        reporter_node_id      TEXT NOT NULL,
+        reporter_short_name   TEXT NOT NULL,
+        radio_id              TEXT,
+        workspace_id          TEXT,
+        reported_at           INTEGER NOT NULL,
+        received_at           INTEGER NOT NULL,
+        event_type            TEXT NOT NULL,
+        magnitude_value       REAL,
+        magnitude_unit        TEXT,
+        lat                   REAL,
+        lng                   REAL,
+        location_source       TEXT NOT NULL DEFAULT 'AUTO_LAST_POSITION',
+        location_description  TEXT,
+        county                TEXT,
+        state                 TEXT,
+        spotter_source        TEXT NOT NULL DEFAULT 'SPOTTER',
+        remarks               TEXT,
+        submitted_to_nws      INTEGER NOT NULL DEFAULT 0,
+        nws_submission_id     TEXT,
+        nws_submission_at     INTEGER,
+        created_at            INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_storm_reports_received
+        ON storm_reports(received_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_storm_reports_radio
+        ON storm_reports(radio_id, received_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_storm_reports_workspace
+        ON storm_reports(workspace_id, received_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_storm_reports_reporter
+        ON storm_reports(reporter_node_id, received_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_storm_reports_unsubmitted
+        ON storm_reports(received_at DESC) WHERE submitted_to_nws = 0;
+
       -- Per-node position history. Backs the iOS-style "Position Log" view in
       -- the node detail panel. We write a row every time a Position arrives
       -- (POSITION_APP packet OR NodeInfo-embedded position). Tracks lat/lng/
@@ -2206,6 +2282,169 @@ export class MeshDatabase {
   }
 
   // ---------------------------------------------------------------------
+  // v3.0 SKYWARN: Storm Reports (Local Storm Report — NWS LSR shape)
+  // ---------------------------------------------------------------------
+
+  /**
+   * Insert one storm report. Returns the new row's id.
+   *
+   * The BBS ":spot" command is the primary caller (submits via DM,
+   * multi-step form). The dashboard "Storm Reports" tab may add a
+   * manual-entry path in a later slice.
+   *
+   * NWS LSR column parity is intentional — v3.1 will flip the
+   * SKYWARN_DIRECT_SUBMIT feature flag and this row shape maps 1:1
+   * onto the eSpotter submission payload with zero ETL.
+   */
+  addStormReport(row: {
+    reporterNodeId: string;
+    reporterShortName: string;
+    radioId?: string | null;
+    workspaceId?: string | null;
+    reportedAt: number;
+    receivedAt: number;
+    eventType: string;
+    magnitudeValue?: number | null;
+    magnitudeUnit?: string | null;
+    lat?: number | null;
+    lng?: number | null;
+    locationSource?: 'AUTO_LAST_POSITION' | 'SPOTTER_TYPED' | 'LANDMARK';
+    locationDescription?: string | null;
+    county?: string | null;
+    state?: string | null;
+    spotterSource?: 'SPOTTER' | 'TRAINED_SPOTTER' | 'PUBLIC' | 'LEO' | 'EM';
+    remarks?: string | null;
+    now?: number;
+  }): number {
+    const now = row.now ?? Date.now();
+    const r = this.db.prepare(`
+      INSERT INTO storm_reports (
+        reporter_node_id, reporter_short_name, radio_id, workspace_id,
+        reported_at, received_at, event_type,
+        magnitude_value, magnitude_unit,
+        lat, lng, location_source, location_description, county, state,
+        spotter_source, remarks, submitted_to_nws, created_at
+      ) VALUES (
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?
+      )
+    `).run(
+      row.reporterNodeId,
+      row.reporterShortName,
+      row.radioId ?? null,
+      row.workspaceId ?? null,
+      row.reportedAt,
+      row.receivedAt,
+      row.eventType,
+      row.magnitudeValue ?? null,
+      row.magnitudeUnit ?? null,
+      row.lat ?? null,
+      row.lng ?? null,
+      row.locationSource ?? 'AUTO_LAST_POSITION',
+      row.locationDescription ?? null,
+      row.county ?? null,
+      row.state ?? null,
+      row.spotterSource ?? 'SPOTTER',
+      row.remarks ?? null,
+      now,
+    );
+    return Number((r as any).lastInsertRowid);
+  }
+
+  /** Fetch a single storm report by id. Returns null if it doesn't exist. */
+  getStormReport(id: number): StormReportRow | null {
+    const row = this.db.prepare(
+      `SELECT * FROM storm_reports WHERE id = ?`
+    ).get(id) as StormReportRaw | undefined;
+    return row ? mapStormReportRow(row) : null;
+  }
+
+  /**
+   * List storm reports with flexible filtering. All filters are optional;
+   * with no filters, returns the most recent `limit` reports.
+   *
+   *   radioId       — scope to reports received by this radio
+   *   workspaceId   — scope to reports in this workspace (independent of
+   *                   which radio); pass one OR the other, not both
+   *   since / until — epoch-ms bounds on received_at (inclusive)
+   *   eventType     — exact match on the LSR event code
+   *   reporterNodeId — reports from one spotter
+   *   limit         — default 200, cap 1000
+   */
+  listStormReports(opts: {
+    radioId?: string | null;
+    workspaceId?: string | null;
+    since?: number;
+    until?: number;
+    eventType?: string;
+    reporterNodeId?: string;
+    limit?: number;
+  } = {}): StormReportRow[] {
+    const clauses: string[] = [];
+    const params: any[] = [];
+    if (opts.radioId) { clauses.push('radio_id = ?'); params.push(opts.radioId); }
+    if (opts.workspaceId) { clauses.push('workspace_id = ?'); params.push(opts.workspaceId); }
+    if (typeof opts.since === 'number') { clauses.push('received_at >= ?'); params.push(opts.since); }
+    if (typeof opts.until === 'number') { clauses.push('received_at <= ?'); params.push(opts.until); }
+    if (opts.eventType) { clauses.push('event_type = ?'); params.push(opts.eventType); }
+    if (opts.reporterNodeId) { clauses.push('reporter_node_id = ?'); params.push(opts.reporterNodeId); }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const limit = Math.min(Math.max(1, opts.limit ?? 200), 1000);
+    const rows = this.db.prepare(
+      `SELECT * FROM storm_reports ${where} ORDER BY received_at DESC LIMIT ?`
+    ).all(...params, limit) as StormReportRaw[];
+    return rows.map(mapStormReportRow);
+  }
+
+  /** Count storm reports matching the same filters as listStormReports.
+   *  Used by the dashboard summary tile and API `?count=true` mode. */
+  countStormReports(opts: {
+    radioId?: string | null;
+    workspaceId?: string | null;
+    since?: number;
+    until?: number;
+    eventType?: string;
+    reporterNodeId?: string;
+  } = {}): number {
+    const clauses: string[] = [];
+    const params: any[] = [];
+    if (opts.radioId) { clauses.push('radio_id = ?'); params.push(opts.radioId); }
+    if (opts.workspaceId) { clauses.push('workspace_id = ?'); params.push(opts.workspaceId); }
+    if (typeof opts.since === 'number') { clauses.push('received_at >= ?'); params.push(opts.since); }
+    if (typeof opts.until === 'number') { clauses.push('received_at <= ?'); params.push(opts.until); }
+    if (opts.eventType) { clauses.push('event_type = ?'); params.push(opts.eventType); }
+    if (opts.reporterNodeId) { clauses.push('reporter_node_id = ?'); params.push(opts.reporterNodeId); }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const row = this.db.prepare(
+      `SELECT COUNT(*) AS c FROM storm_reports ${where}`
+    ).get(...params) as { c: number } | undefined;
+    return row?.c ?? 0;
+  }
+
+  /** Delete one storm report by id. Used for operator corrections.
+   *  Only the operator (dashboard) can delete — the BBS command flow
+   *  intentionally has no "delete my last report" verb; spotters ask
+   *  the operator instead. */
+  deleteStormReport(id: number): boolean {
+    const r = this.db.prepare(`DELETE FROM storm_reports WHERE id = ?`).run(id);
+    return Number((r as any).changes ?? 0) > 0;
+  }
+
+  /** Mark a report as successfully submitted to NWS. v3.1 wiring —
+   *  the SKYWARN direct-submit worker calls this after eSpotter
+   *  returns a submission id. In v3.0 this is exercised only by tests
+   *  since the direct-submit flag is off. */
+  markStormReportSubmitted(id: number, nwsSubmissionId: string, now: number = Date.now()): boolean {
+    const r = this.db.prepare(`
+      UPDATE storm_reports
+         SET submitted_to_nws = 1,
+             nws_submission_id = ?,
+             nws_submission_at = ?
+       WHERE id = ? AND submitted_to_nws = 0
+    `).run(nwsSubmissionId, now, id);
+    return Number((r as any).changes ?? 0) > 0;
+  }
+
+  // ---------------------------------------------------------------------
   // Position history
   // ---------------------------------------------------------------------
 
@@ -3286,6 +3525,100 @@ export interface RadioRow {
   workspace_id: number | null;
   created_at: number;
   updated_at: number;
+}
+
+// ---------------------------------------------------------------------
+// v3.0 SKYWARN Storm Report shapes.
+//
+// StormReportRaw = the DB row exactly as SELECT returns it (snake_case,
+// nullable columns typed as nullable). StormReportRow = the caller-
+// facing shape (camelCase, nullable fields kept explicit).
+// mapStormReportRow() bridges the two so callers never see the raw
+// snake_case columns.
+// ---------------------------------------------------------------------
+export type StormReportEventType = string; // NWS LSR code — HAIL, TSTM WND, TORNADO, FUNNEL, etc.
+export type StormReportLocationSource = 'AUTO_LAST_POSITION' | 'SPOTTER_TYPED' | 'LANDMARK';
+export type StormReportSpotterSource = 'SPOTTER' | 'TRAINED_SPOTTER' | 'PUBLIC' | 'LEO' | 'EM';
+
+export interface StormReportRow {
+  id: number;
+  reporterNodeId: string;
+  reporterShortName: string;
+  radioId: string | null;
+  workspaceId: string | null;
+  reportedAt: number;
+  receivedAt: number;
+  eventType: StormReportEventType;
+  magnitudeValue: number | null;
+  magnitudeUnit: string | null;
+  lat: number | null;
+  lng: number | null;
+  locationSource: StormReportLocationSource;
+  locationDescription: string | null;
+  county: string | null;
+  state: string | null;
+  spotterSource: StormReportSpotterSource;
+  remarks: string | null;
+  submittedToNws: boolean;
+  nwsSubmissionId: string | null;
+  nwsSubmissionAt: number | null;
+  createdAt: number;
+}
+
+interface StormReportRaw {
+  id: number;
+  reporter_node_id: string;
+  reporter_short_name: string;
+  radio_id: string | null;
+  workspace_id: string | null;
+  reported_at: number;
+  received_at: number;
+  event_type: string;
+  magnitude_value: number | null;
+  magnitude_unit: string | null;
+  lat: number | null;
+  lng: number | null;
+  location_source: string;
+  location_description: string | null;
+  county: string | null;
+  state: string | null;
+  spotter_source: string;
+  remarks: string | null;
+  submitted_to_nws: number;
+  nws_submission_id: string | null;
+  nws_submission_at: number | null;
+  created_at: number;
+}
+
+function mapStormReportRow(raw: StormReportRaw): StormReportRow {
+  return {
+    id: raw.id,
+    reporterNodeId: raw.reporter_node_id,
+    reporterShortName: raw.reporter_short_name,
+    radioId: raw.radio_id,
+    workspaceId: raw.workspace_id,
+    reportedAt: raw.reported_at,
+    receivedAt: raw.received_at,
+    eventType: raw.event_type,
+    magnitudeValue: raw.magnitude_value,
+    magnitudeUnit: raw.magnitude_unit,
+    lat: raw.lat,
+    lng: raw.lng,
+    // Defensive cast — DB accepts any TEXT into these columns; the
+    // BBS command validates on ingest, but a hand-edited row could
+    // slip through. Type-assert to the enum and rely on the writer
+    // side for correctness.
+    locationSource: (raw.location_source as StormReportLocationSource),
+    locationDescription: raw.location_description,
+    county: raw.county,
+    state: raw.state,
+    spotterSource: (raw.spotter_source as StormReportSpotterSource),
+    remarks: raw.remarks,
+    submittedToNws: raw.submitted_to_nws === 1,
+    nwsSubmissionId: raw.nws_submission_id,
+    nwsSubmissionAt: raw.nws_submission_at,
+    createdAt: raw.created_at,
+  };
 }
 
 // ---------------------------------------------------------------------
