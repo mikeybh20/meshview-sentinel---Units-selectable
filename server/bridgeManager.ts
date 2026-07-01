@@ -39,6 +39,9 @@ const FORWARDED_EVENTS = [
   // without re-parsing the underlying packet.
   'message',
   'ackUpdate', 'bbsMail', 'bbsSubscriber',
+  // v3.0 SKYWARN — storm report intake / correction / deletion, so
+  // the Storm Reports tab re-fetches without polling.
+  'stormReport',
 ] as const;
 
 class BridgeManager extends EventEmitter {

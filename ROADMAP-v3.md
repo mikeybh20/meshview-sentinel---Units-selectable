@@ -45,24 +45,36 @@ unaffected.
 Pi sitting in a drawer; they don't have a Jetson. A Jetson-only
 target is an adoption ceiling on day one of open-source release.
 
-### 2. SKYWARN spotter workflow
+### 2. SKYWARN spotter workflow — **shipped**
 A new BBS command `:spot` for submitting Local Storm Reports via DM
 from a subscriber node. Captures the NWS LSR shape:
 
-- Time (auto-stamped, override-able if reporting a delayed sighting)
-- Location (auto from sender's last position, override-able with
-  county/landmark or explicit lat/lon)
-- Event type (HAIL / TSTM WND / TORNADO / FUNNEL / FLOOD / FLOOD WARN /
-  MARINE TSTM WND / WALL CLOUD / FUNNEL CLOUD / etc.)
-- Magnitude (hail size in inches, wind in mph, water depth, etc.)
-- Spotter source (TRAINED SPOTTER / PUBLIC / etc.)
+- Time (auto-stamped)
+- Location (auto from sender's last MeshNode.position at confirm time)
+- Event type (HAIL / TSTM WND / TORNADO / FUNNEL / FLOOD / WALL CLOUD /
+  OTHER — TEXT column, expandable without migration)
+- Magnitude (hail size in inches, wind in mph, water depth in feet;
+  sanity-clamped per unit)
+- Spotter source (defaults to SPOTTER; TRAINED_SPOTTER promotion is a
+  follow-up)
 - Remarks (free text, length-capped)
 
-New "Storm Reports" tab on the dashboard:
-- Map markers with severity-tinted icons
-- Filter/sort table view
+Storm Reports tab on the dashboard:
+- pigeon-maps view with severity-tinted markers (red=Tornado/Funnel,
+  orange=Hail/Wind, blue=Flood, purple=Wall Cloud/Waterspout)
+- Marker size scaled by magnitude when present
+- Filter by event type + date range
+- Table view with delete-per-row (operator correction path)
 - NWS LSR-format CSV export
-- Multi-tenant aware (per-workspace storm event tracking)
+- SSE-live: new intake, edits, deletes fan out via stormReport event
+
+**Slices shipped:** DB schema + API endpoints (dfd0054), BBS `:spot`
+command (d8c43a6), dashboard tab (this).
+
+**Deferred to v3.0.x follow-ups:** workspace_id backfill on intake
+(currently null), `:spot source trained` shortcut for SKYWARN-cert
+reporters, PATCH endpoint for corrections without full delete-and-
+resubmit.
 
 ### 3. SKYWARN direct submission (built but gated)
 Build the eSpotter/eSpotterChat API client + authentication scaffolding

@@ -21,6 +21,7 @@ import {
   Mail,
   CloudRain,
   Tag,
+  AlertTriangle,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -63,6 +64,7 @@ import { LogsView } from './components/views/LogsView';
 import { MatrixView } from './components/views/MatrixView';
 import { MailView } from './components/views/MailView';
 import { WeatherView } from './components/views/WeatherView';
+import { StormReportsView } from './components/views/StormReportsView';
 import { LabeledDevicesView } from './components/views/LabeledDevicesView';
 
 export default function App() {
@@ -70,7 +72,7 @@ export default function App() {
   const [nodes, setNodes] = React.useState<Node[]>([]);
   const [messages, setMessages] = React.useState<Message[]>([]);
   const [events, setEvents] = React.useState<RadioEvent[]>([]);
-  const [activeTab, setActiveTab] = React.useState<'dashboard' | 'map' | 'messages' | 'logs' | 'matrix' | 'topology' | 'mail' | 'weather' | 'radios' | 'labels'>('dashboard');
+  const [activeTab, setActiveTab] = React.useState<'dashboard' | 'map' | 'messages' | 'logs' | 'matrix' | 'topology' | 'mail' | 'weather' | 'storms' | 'radios' | 'labels'>('dashboard');
   const [selectedNodeId, setSelectedNodeId] = React.useState<string | null>(null);
   const [configuringNodeId, setConfiguringNodeId] = React.useState<string | null>(null);
   const [showExportModal, setShowExportModal] = React.useState(false);
@@ -714,6 +716,14 @@ export default function App() {
             icon={<CloudRain size={20} />}
             label="BBS Weather"
           />
+          {/* v3.0 SKYWARN: Local Storm Reports intake via `:spot` BBS
+              command. Empty state until the first spotter submits. */}
+          <NavItem
+            active={activeTab === 'storms'}
+            onClick={() => setActiveTab('storms')}
+            icon={<AlertTriangle size={20} />}
+            label="Storm Reports"
+          />
           <NavItem
             active={activeTab === 'labels'}
             onClick={() => setActiveTab('labels')}
@@ -1281,6 +1291,18 @@ export default function App() {
                 className="h-full overflow-hidden"
               >
                 <WeatherView nodes={nodes} />
+              </motion.div>
+            )}
+
+            {activeTab === 'storms' && (
+              <motion.div
+                key="storms"
+                initial={{ opacity: 0, scale: 0.98 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.98 }}
+                className="h-full overflow-hidden"
+              >
+                <StormReportsView />
               </motion.div>
             )}
 

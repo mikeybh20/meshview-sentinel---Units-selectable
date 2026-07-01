@@ -5,7 +5,7 @@
  * interface identical to the simulator, so the app can switch between
  * real hardware and simulated data seamlessly.
  */
-import { Node, Message, RadioEvent, Channel, Waypoint, TraceResult, NeighborInfoSnapshot, StoreForwardRouter, LocalModuleConfigSnapshot, Group } from '../types';
+import { Node, Message, RadioEvent, Channel, Waypoint, TraceResult, NeighborInfoSnapshot, StoreForwardRouter, LocalModuleConfigSnapshot, Group, StormReport } from '../types';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
@@ -235,6 +235,12 @@ export class MeshDataService {
       this.eventSource.addEventListener('bbsSubscriber', () => {
         this.bbsSubscriberListeners.forEach(l => { try { l(); } catch { /* keep firing */ } });
       });
+      // v3.0 SKYWARN — Storm Reports tab re-fetches on each intake /
+      // correction / deletion.
+      this.eventSource.addEventListener('stormReport', () => {
+        this.emitActivity('rx');
+        this.stormReportListeners.forEach(l => { try { l(); } catch { /* keep firing */ } });
+      });
 
       this.eventSource.onerror = () => {
         // Browser will auto-reconnect; no action needed
@@ -301,6 +307,7 @@ export class MeshDataService {
   // (declared inline to avoid creating a separate type file for one feature)
   private bbsMailListeners: Array<() => void> = [];
   private bbsSubscriberListeners: Array<() => void> = [];
+  private stormReportListeners: Array<() => void> = [];
 
   /** Subscribe to "something about BBS mail changed" notifications. The callback
    *  fires after any mail insert / read / delete and is the cue to re-fetch
@@ -431,6 +438,64 @@ export class MeshDataService {
   onBbsSubscriber(cb: () => void): () => void {
     this.bbsSubscriberListeners.push(cb);
     return () => { this.bbsSubscriberListeners = this.bbsSubscriberListeners.filter(l => l !== cb); };
+  }
+
+  // -------- v3.0 SKYWARN Storm Reports --------
+
+  /**
+   * List Local Storm Reports produced by the `:spot` BBS command.
+   * All filters optional.
+   */
+  async listStormReports(opts: {
+    radioId?: string | null;
+    workspaceId?: string | null;
+    since?: number;
+    until?: number;
+    eventType?: string;
+    reporterNodeId?: string;
+    limit?: number;
+  } = {}): Promise<{
+    reports: StormReport[];
+    total: number;
+  } | null> {
+    const p = new URLSearchParams();
+    if (opts.radioId) p.set('radio_id', opts.radioId);
+    if (opts.workspaceId) p.set('workspace_id', opts.workspaceId);
+    if (typeof opts.since === 'number') p.set('since', String(opts.since));
+    if (typeof opts.until === 'number') p.set('until', String(opts.until));
+    if (opts.eventType) p.set('event_type', opts.eventType);
+    if (opts.reporterNodeId) p.set('reporter_id', opts.reporterNodeId);
+    if (opts.limit) p.set('limit', String(opts.limit));
+    try {
+      const qs = p.toString();
+      const res = await fetch(`${API_BASE}/api/mesh/bbs/storm-reports${qs ? '?' + qs : ''}`);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  }
+
+  /** Operator correction path — delete one storm report by id. */
+  async deleteStormReport(id: number): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/bbs/storm-reports/${id}`, {
+        method: 'DELETE',
+      });
+      if (!res.ok) {
+        const b = await res.json().catch(() => ({}));
+        return { ok: false, error: b.error || `HTTP ${res.status}` };
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'request failed' };
+    }
+  }
+
+  /** Subscribe to stormReport SSE events (fires on each :spot intake,
+   *  operator delete, or future correction). Lets StormReportsView
+   *  stay live without polling. */
+  onStormReport(cb: () => void): () => void {
+    this.stormReportListeners.push(cb);
+    return () => { this.stormReportListeners = this.stormReportListeners.filter(l => l !== cb); };
   }
 
   async markBbsRead(id: number): Promise<boolean> {

@@ -171,6 +171,39 @@ export interface RadioEvent {
   details: string;
 }
 
+/**
+ * v3.0 SKYWARN — Local Storm Report row (client shape).
+ *
+ * Mirrors the server's StormReportRow (see server/database.ts). Every
+ * field the eSpotter submission payload will need is captured; some
+ * are v3.0-inert (submittedToNws stays false, nwsSubmissionId stays
+ * null) until v3.1 flips the SKYWARN_DIRECT_SUBMIT feature flag.
+ */
+export interface StormReport {
+  id: number;
+  reporterNodeId: string;
+  reporterShortName: string;
+  radioId: string | null;
+  workspaceId: string | null;
+  reportedAt: number;
+  receivedAt: number;
+  eventType: string;
+  magnitudeValue: number | null;
+  magnitudeUnit: string | null;
+  lat: number | null;
+  lng: number | null;
+  locationSource: 'AUTO_LAST_POSITION' | 'SPOTTER_TYPED' | 'LANDMARK';
+  locationDescription: string | null;
+  county: string | null;
+  state: string | null;
+  spotterSource: 'SPOTTER' | 'TRAINED_SPOTTER' | 'PUBLIC' | 'LEO' | 'EM';
+  remarks: string | null;
+  submittedToNws: boolean;
+  nwsSubmissionId: string | null;
+  nwsSubmissionAt: number | null;
+  createdAt: number;
+}
+
 export interface Waypoint {
   id: number;
   lat: number;

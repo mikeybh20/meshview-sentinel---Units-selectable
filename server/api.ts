@@ -5315,6 +5315,8 @@ bridgeManager.on('neighborInfoUpdate',      fanOut('neighborInfo'));
 bridgeManager.on('localModuleConfigUpdate', fanOut('moduleConfig'));
 bridgeManager.on('bbsMail',                 fanOut('bbsMail'));
 bridgeManager.on('bbsSubscriber',           fanOut('bbsSubscriber'));
+// v3.0 SKYWARN — Storm Reports tab subscribes to this.
+bridgeManager.on('stormReport',             fanOut('stormReport'));
 // v2.0: LoRa config readback completed — Settings → Radios re-fetches.
 bridgeManager.on('loraConfigUpdate',        fanOut('loraConfig'));
 
