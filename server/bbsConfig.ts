@@ -37,6 +37,11 @@ export interface BbsConfig {
    *  can discover what's available without remembering each subcommand.
    *  Must start with `:`. Default ":cmd". */
   cmdTrigger: string;
+  /** v3.0 SKYWARN: trigger keyword for the storm-spotter :spot flow.
+   *  DMing this to the BBS starts a multi-step form that produces a
+   *  Local Storm Report row (see storm_reports table). Must start with
+   *  `:`. Default ":spot". */
+  spotTrigger: string;
   /** Hard cap on mail body length, in chars. Meshtastic packet payload tops
    *  out at ~228 bytes after framing; 200 leaves headroom for protocol overhead. */
   bodyMaxChars: number;
@@ -75,6 +80,7 @@ const DEFAULTS: BbsConfig = {
   mailTrigger: ':mail',
   weatherTrigger: ':wx',
   cmdTrigger: ':cmd',
+  spotTrigger: ':spot',
   bodyMaxChars: 200,
   retentionDays: 30,
   replyPaceMs: 2_000,
@@ -101,6 +107,7 @@ export function normalizeBbsConfig(partial: Partial<BbsConfig>): BbsConfig {
   merged.mailTrigger = sanitizeTrigger(merged.mailTrigger, DEFAULTS.mailTrigger);
   merged.weatherTrigger = sanitizeTrigger(merged.weatherTrigger, DEFAULTS.weatherTrigger);
   merged.cmdTrigger = sanitizeTrigger(merged.cmdTrigger, DEFAULTS.cmdTrigger);
+  merged.spotTrigger = sanitizeTrigger(merged.spotTrigger, DEFAULTS.spotTrigger);
 
   // Prevent identical triggers (would route everything to whichever check
   // runs first). Collisions snap the colliding trigger back to its default.
@@ -109,6 +116,13 @@ export function normalizeBbsConfig(partial: Partial<BbsConfig>): BbsConfig {
   }
   if (merged.cmdTrigger === merged.mailTrigger || merged.cmdTrigger === merged.weatherTrigger) {
     merged.cmdTrigger = DEFAULTS.cmdTrigger;
+  }
+  if (
+    merged.spotTrigger === merged.mailTrigger ||
+    merged.spotTrigger === merged.weatherTrigger ||
+    merged.spotTrigger === merged.cmdTrigger
+  ) {
+    merged.spotTrigger = DEFAULTS.spotTrigger;
   }
 
   merged.enabled = !!merged.enabled;

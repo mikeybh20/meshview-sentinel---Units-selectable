@@ -125,7 +125,7 @@ export interface MeshEvent {
    *  and the fallback mail-notice attempt. Lets the operator grep
    *  the Event Log for "did the alert actually reach 7fba?" instead
    *  of having to dig in docker logs. */
-  type: 'NODE_JOINED' | 'NODE_LOST' | 'MESSAGE' | 'TELEMETRY' | 'POSITION_UPDATE' | 'WEATHER_ALERT' | 'WEATHER_DELIVERY' | 'OUTAGE';
+  type: 'NODE_JOINED' | 'NODE_LOST' | 'MESSAGE' | 'TELEMETRY' | 'POSITION_UPDATE' | 'WEATHER_ALERT' | 'WEATHER_DELIVERY' | 'STORM_REPORT' | 'OUTAGE';
   nodeId: string;
   timestamp: number;
   details: string;

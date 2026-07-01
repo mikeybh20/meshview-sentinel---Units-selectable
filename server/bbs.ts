@@ -54,6 +54,50 @@ const PUSH_CHANNEL_FALLBACK = 0;
 const WEATHER_ALIASES: readonly string[] = [':wx', ':weather'];
 
 /**
+ * v3.0 SKYWARN — Local Storm Report event type table.
+ *
+ * The one-letter (or two-letter) `code` is what the reporter types
+ * in the :spot event-selection step; it maps to the NWS LSR
+ * `eventType` string that gets stored (and, in v3.1, submitted to
+ * eSpotter). `magnitudeUnit` drives the follow-up magnitude prompt
+ * — null skips straight to remarks (WALL CLOUD has no natural
+ * scalar; TORNADO uses EF-rating which spotters rarely know in the
+ * moment, so also skipped).
+ *
+ * Keeping this in one table means the prompt string, the parser,
+ * and the submitter all agree on the code set — no drift.
+ */
+interface SpotEventDef {
+  code: string;
+  eventType: string;
+  magnitudeUnit: string | null;
+  /** Optional label for the confirm summary — defaults to eventType. */
+  label?: string;
+}
+const SPOT_EVENTS: readonly SpotEventDef[] = [
+  { code: 'H',  eventType: 'HAIL',        magnitudeUnit: 'INCHES' },
+  { code: 'T',  eventType: 'TSTM WND',    magnitudeUnit: 'MPH' },
+  { code: 'TR', eventType: 'TORNADO',     magnitudeUnit: null },
+  { code: 'F',  eventType: 'FUNNEL',      magnitudeUnit: null },
+  { code: 'FL', eventType: 'FLOOD',       magnitudeUnit: 'FEET' },
+  { code: 'W',  eventType: 'WALL CLOUD',  magnitudeUnit: null },
+  { code: 'O',  eventType: 'OTHER',       magnitudeUnit: null },
+];
+
+/** One-line event-selection menu — packet-cap tight. Sample when all
+ *  defaults are present:
+ *    "H=HAIL T=TSTM_WND TR=TORNADO F=FUNNEL FL=FLOOD W=WALL_CLOUD O=OTHER"
+ *  ~72 chars. Fits under 200 with the wrapper prompt around it. */
+const SPOT_EVENT_MENU: string = SPOT_EVENTS
+  .map(e => `${e.code}=${e.eventType.replace(/\s+/g, '_')}`)
+  .join(' ');
+
+function findSpotEventByCode(code: string): SpotEventDef | null {
+  const up = code.toUpperCase();
+  return SPOT_EVENTS.find(e => e.code === up) ?? null;
+}
+
+/**
  * Rewrite a leading weather-alias prefix to the configured weatherTrigger
  * so every downstream `lower.startsWith(weatherTrigger …)` check in
  * handleInboundDm hits without us having to duplicate every comparison
@@ -72,7 +116,7 @@ function canonicalizeWeatherAlias(text: string, cfg: BbsConfig): string {
   const lower = text.toLowerCase();
   for (const alias of WEATHER_ALIASES) {
     if (alias === cfg.weatherTrigger) continue;
-    if (alias === cfg.mailTrigger || alias === cfg.cmdTrigger) continue;
+    if (alias === cfg.mailTrigger || alias === cfg.cmdTrigger || alias === cfg.spotTrigger) continue;
     if (lower === alias) return cfg.weatherTrigger;
     if (lower.startsWith(alias + ' ')) return cfg.weatherTrigger + text.slice(alias.length);
   }
@@ -93,6 +137,48 @@ type SessionState =
        *  'OTHER' = filtered. Sticky across N taps so the second
        *  unread in this session pulls from the same bucket. */
       category?: 'WX' | 'FX' | 'OTHER' | null;
+    }
+  // v3.0 SKYWARN — :spot multi-step form. Reporter types :spot,
+  // picks an event type, provides a magnitude if the event has one,
+  // adds optional remarks, confirms. Each step gets its own kind
+  // so the state machine stays flat and the reaper can time out
+  // stuck mid-report sessions the same way it does :mail flows.
+  | {
+      kind: 'spot-event';
+      enteredAt: number;
+      channelIndex: number;
+    }
+  | {
+      kind: 'spot-magnitude';
+      enteredAt: number;
+      channelIndex: number;
+      /** NWS LSR event code chosen in the previous step (HAIL, TSTM WND, etc). */
+      eventType: string;
+      /** Prompt-side hint of what units we're asking for (INCHES, MPH, FEET). */
+      magnitudeUnit: string;
+    }
+  | {
+      kind: 'spot-remarks';
+      enteredAt: number;
+      channelIndex: number;
+      eventType: string;
+      magnitudeValue: number | null;
+      magnitudeUnit: string | null;
+    }
+  | {
+      kind: 'spot-confirm';
+      enteredAt: number;
+      channelIndex: number;
+      eventType: string;
+      magnitudeValue: number | null;
+      magnitudeUnit: string | null;
+      remarks: string | null;
+      /** Location resolved at :spot entry (from reporter's last known
+       *  MeshNode.position). Null if the reporter has no position;
+       *  the operator can still submit but with lat/lng null. */
+      lat: number | null;
+      lng: number | null;
+      locationSource: 'AUTO_LAST_POSITION' | 'SPOTTER_TYPED' | 'LANDMARK';
     };
 
 export class BbsService {
@@ -183,7 +269,7 @@ export class BbsService {
     const localNodeId = (this.bridge as any).localNodeId as string | null;
     if (localNodeId && fromId === localNodeId) return false;
     if (this.sessions.has(fromId) || this.weatherSessions.has(fromId)) return false;
-    const triggers = [this.config.mailTrigger, this.config.weatherTrigger, this.config.cmdTrigger];
+    const triggers = [this.config.mailTrigger, this.config.weatherTrigger, this.config.spotTrigger, this.config.cmdTrigger];
     await this.reply(fromId, `BBS node. Cmds: ${triggers.join(' ')}`, channelIndex);
     return true;
   }
@@ -203,13 +289,14 @@ export class BbsService {
     const t = text.trim().toLowerCase();
     if (t.startsWith(this.config.mailTrigger)) return true;
     if (t.startsWith(this.config.weatherTrigger)) return true;
+    if (t.startsWith(this.config.spotTrigger)) return true;
     // v2.0 Beta 5 BBS (alias): :wx and :weather are interchangeable —
     // both prefixes hit the weather flow regardless of which one the
     // operator has saved as the configured trigger. See
     // WEATHER_ALIASES + canonicalizeWeatherAlias().
     for (const alias of WEATHER_ALIASES) {
       if (alias === this.config.weatherTrigger) continue;
-      if (alias === this.config.mailTrigger || alias === this.config.cmdTrigger) continue;
+      if (alias === this.config.mailTrigger || alias === this.config.cmdTrigger || alias === this.config.spotTrigger) continue;
       if (t === alias || t.startsWith(alias + ' ')) return true;
     }
     if (t === this.config.cmdTrigger) return true;
@@ -246,6 +333,7 @@ export class BbsService {
     const mailTrigger = this.config.mailTrigger;
     const weatherTrigger = this.config.weatherTrigger;
     const cmdTrigger = this.config.cmdTrigger;
+    const spotTrigger = this.config.spotTrigger;
 
     // Cancellation always wins, regardless of current state.
     if (/^(x|cancel|exit|quit)$/i.test(trimmed)) {
@@ -281,6 +369,26 @@ export class BbsService {
         }
         if (mailSession.kind === 'reading') {
           await this.reply(fromId, `Replying anything composes a reply. N=next D=delete X=exit.`, channelIndex);
+          return true;
+        }
+        // v3.0 SKYWARN spot-flow help — each step gets a state-
+        // specific hint restating the choices, since a reporter
+        // pinging `?` mid-flow is typically confused about what
+        // the current prompt wants.
+        if (mailSession.kind === 'spot-event') {
+          await this.reply(fromId, `SPOT event? ${SPOT_EVENT_MENU} X=cancel.`, channelIndex);
+          return true;
+        }
+        if (mailSession.kind === 'spot-magnitude') {
+          await this.reply(fromId, `${mailSession.eventType} ${mailSession.magnitudeUnit.toLowerCase()}? Type a number, .=skip, X=cancel.`, channelIndex);
+          return true;
+        }
+        if (mailSession.kind === 'spot-remarks') {
+          await this.reply(fromId, `Remarks (optional). Type text, .=skip, X=cancel.`, channelIndex);
+          return true;
+        }
+        if (mailSession.kind === 'spot-confirm') {
+          await this.reply(fromId, `Y=send N=cancel. Retype anything to edit remarks.`, channelIndex);
           return true;
         }
       }
@@ -360,6 +468,17 @@ export class BbsService {
       return this.sendMailHelp(fromId, channelIndex);
     }
 
+    // v3.0 SKYWARN: :spot — start a Local Storm Report intake. Multi-
+    // step form (event type → magnitude if applicable → remarks →
+    // confirm). See sessionState kinds 'spot-event' / 'spot-magnitude'
+    // / 'spot-remarks' / 'spot-confirm' + dispatchInFlow branches.
+    if (lower === spotTrigger) {
+      return this.startSpot(fromId, senderShortName, channelIndex);
+    }
+    if (lower === `${spotTrigger} help` || lower === `${spotTrigger} ?`) {
+      return this.sendSpotHelp(fromId, channelIndex);
+    }
+
     // Weather trigger (no args) — return the command menu. v2.0 Beta 4:
     // replaces the old "send a ZIP" prompt flow with a help message so
     // subscribers can discover what's actually available. The prompt path
@@ -418,7 +537,7 @@ export class BbsService {
    *  tiny regardless of how many subsystems we add. Subscribers chase the
    *  subsystem's own `help` for usage (e.g., `:wx help`). */
   private async handleCmdIndex(fromId: string, channelIndex: number): Promise<boolean> {
-    const triggers = [this.config.mailTrigger, this.config.weatherTrigger, this.config.cmdTrigger];
+    const triggers = [this.config.mailTrigger, this.config.weatherTrigger, this.config.spotTrigger, this.config.cmdTrigger];
     await this.reply(fromId, `Cmds: ${triggers.join(' ')}`, channelIndex);
     return true;
   }
@@ -495,6 +614,311 @@ export class BbsService {
       `${t} d wx|fx = bulk del | ` +
       `${t} SHORT = quick-to-node`;
     await this.reply(fromId, msg, channelIndex);
+    return true;
+  }
+
+  // -------------------------------------------------------------------
+  // v3.0 SKYWARN — :spot Local Storm Report flow
+  // -------------------------------------------------------------------
+
+  /**
+   * Entry point for :spot. Puts the reporter into the event-type
+   * selection step and prompts with the one-line event menu. Location
+   * is captured lazily at confirm time from the reporter's last known
+   * MeshNode.position; if no position exists at confirm, the report
+   * goes in with lat/lng null and location_source='SPOTTER_TYPED'
+   * (the remarks field becomes the geographic description).
+   */
+  private async startSpot(
+    fromId: string,
+    _senderShortName: string,
+    channelIndex: number,
+  ): Promise<boolean> {
+    this.sessions.set(fromId, {
+      kind: 'spot-event',
+      enteredAt: Date.now(),
+      channelIndex,
+    });
+    // Prompt fits in one packet — SPOT_EVENT_MENU is ~72 chars, plus
+    // wrapper ~40 chars = ~112 total.
+    await this.reply(
+      fromId,
+      `SPOT: what happened? ${SPOT_EVENT_MENU} X=cancel.`,
+      channelIndex,
+    );
+    return true;
+  }
+
+  /** One-line command catalog for :spot. Mirrors sendMailHelp shape. */
+  private async sendSpotHelp(fromId: string, channelIndex: number): Promise<boolean> {
+    const t = this.config.spotTrigger;
+    const msg =
+      `${t} = start LSR (Local Storm Report) | ` +
+      `${t} ? = help | ` +
+      `flow: pick event -> magnitude if applicable -> optional remarks -> Y to send`;
+    await this.reply(fromId, msg, channelIndex);
+    return true;
+  }
+
+  /**
+   * Handle the event-type selection step. Reporter typed a single or
+   * two-letter code — resolve to a SpotEventDef and transition to the
+   * next appropriate state:
+   *
+   *   - Events with a magnitudeUnit  → spot-magnitude
+   *   - Events without (WALL CLOUD,
+   *     FUNNEL, TORNADO, OTHER)      → spot-remarks
+   *
+   * Unrecognized input → re-prompt with the menu.
+   */
+  private async handleSpotEvent(
+    fromId: string,
+    channelIndex: number,
+    trimmed: string,
+  ): Promise<boolean> {
+    const def = findSpotEventByCode(trimmed);
+    if (!def) {
+      await this.reply(fromId, `Unknown code. ${SPOT_EVENT_MENU} X=cancel.`, channelIndex);
+      return true;
+    }
+    if (def.magnitudeUnit) {
+      this.sessions.set(fromId, {
+        kind: 'spot-magnitude',
+        enteredAt: Date.now(),
+        channelIndex,
+        eventType: def.eventType,
+        magnitudeUnit: def.magnitudeUnit,
+      });
+      // Unit-specific prompt so a reporter typing "3" for hail knows
+      // that means 3 inches, not 3 mph.
+      const unitWord = def.magnitudeUnit === 'INCHES' ? 'inches'
+        : def.magnitudeUnit === 'MPH' ? 'mph'
+        : def.magnitudeUnit === 'FEET' ? 'feet'
+        : def.magnitudeUnit.toLowerCase();
+      await this.reply(
+        fromId,
+        `${def.eventType} — ${unitWord}? Type a number (e.g. 1.5), .=skip, X=cancel.`,
+        channelIndex,
+      );
+      return true;
+    }
+    // No magnitude to collect — jump straight to remarks.
+    this.sessions.set(fromId, {
+      kind: 'spot-remarks',
+      enteredAt: Date.now(),
+      channelIndex,
+      eventType: def.eventType,
+      magnitudeValue: null,
+      magnitudeUnit: null,
+    });
+    await this.reply(fromId, `Remarks? Describe what you saw, or .=skip, X=cancel.`, channelIndex);
+    return true;
+  }
+
+  /**
+   * Handle the magnitude step. `.` skips; otherwise parse a positive
+   * finite number and clamp to sane bounds (hail ≤ 6 inches — Aurora
+   * NE 2003 record was 7"; wind ≤ 300 mph; flood depth ≤ 100 ft).
+   * Out-of-range or non-numeric → re-prompt.
+   */
+  private async handleSpotMagnitude(
+    fromId: string,
+    channelIndex: number,
+    trimmed: string,
+    session: Extract<SessionState, { kind: 'spot-magnitude' }>,
+  ): Promise<boolean> {
+    let value: number | null = null;
+    if (trimmed !== '.') {
+      const parsed = parseFloat(trimmed);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        await this.reply(fromId, `Not a number. Type e.g. 1.5, or .=skip, X=cancel.`, channelIndex);
+        return true;
+      }
+      // Sanity clamp — a report of "500 mph wind" is a typo, not a
+      // real observation.
+      const upper = session.magnitudeUnit === 'INCHES' ? 6
+        : session.magnitudeUnit === 'MPH' ? 300
+        : session.magnitudeUnit === 'FEET' ? 100
+        : 10000;
+      if (parsed > upper) {
+        await this.reply(fromId, `Value ${parsed} exceeds ${upper} ${session.magnitudeUnit.toLowerCase()} — retype, .=skip, X=cancel.`, channelIndex);
+        return true;
+      }
+      value = parsed;
+    }
+    this.sessions.set(fromId, {
+      kind: 'spot-remarks',
+      enteredAt: Date.now(),
+      channelIndex,
+      eventType: session.eventType,
+      magnitudeValue: value,
+      magnitudeUnit: session.magnitudeUnit,
+    });
+    await this.reply(fromId, `Remarks? Describe what you saw, or .=skip, X=cancel.`, channelIndex);
+    return true;
+  }
+
+  /**
+   * Handle the remarks step. `.` skips (null remarks). Anything else
+   * is captured verbatim up to bodyMaxChars (same 200-char cap the
+   * mail body uses). Then resolves location from the reporter's last
+   * known MeshNode.position and transitions to the confirm step.
+   */
+  private async handleSpotRemarks(
+    fromId: string,
+    channelIndex: number,
+    trimmed: string,
+    session: Extract<SessionState, { kind: 'spot-remarks' }>,
+  ): Promise<boolean> {
+    const remarks = trimmed === '.' ? null : trimmed.slice(0, this.config.bodyMaxChars);
+    // Location resolution — snapshot at confirm-time, not entry-time,
+    // so if the reporter's position updates while they're typing we
+    // pick up the fresher fix.
+    const senderNode = this.bridge.getNodes().find(n => n.id === fromId);
+    const pos = senderNode?.position;
+    const lat = pos?.lat ?? null;
+    const lng = pos?.lng ?? null;
+    const locationSource: 'AUTO_LAST_POSITION' | 'SPOTTER_TYPED' =
+      lat !== null && lng !== null ? 'AUTO_LAST_POSITION' : 'SPOTTER_TYPED';
+
+    this.sessions.set(fromId, {
+      kind: 'spot-confirm',
+      enteredAt: Date.now(),
+      channelIndex,
+      eventType: session.eventType,
+      magnitudeValue: session.magnitudeValue,
+      magnitudeUnit: session.magnitudeUnit,
+      remarks,
+      lat, lng, locationSource,
+    });
+
+    // Confirm summary. Fits under 200 chars in realistic cases:
+    //   "SPOT: HAIL 1.5in at 39.4213,-77.4103. Rmks: golf-ball. Y=send N=cancel."
+    const mag = session.magnitudeValue !== null && session.magnitudeUnit
+      ? ` ${session.magnitudeValue}${this.abbrevUnit(session.magnitudeUnit)}`
+      : '';
+    const loc = lat !== null && lng !== null
+      ? `${lat.toFixed(4)},${lng.toFixed(4)}`
+      : '<no fix — will submit without coords>';
+    const rmks = remarks ? ` Rmks: ${remarks.slice(0, 60)}${remarks.length > 60 ? '…' : ''}.` : '';
+    await this.reply(
+      fromId,
+      `SPOT: ${session.eventType}${mag} at ${loc}.${rmks} Y=send N=cancel.`,
+      channelIndex,
+    );
+    return true;
+  }
+
+  /** Abbreviate a NWS unit code for the tight confirm summary. */
+  private abbrevUnit(unit: string): string {
+    switch (unit) {
+      case 'INCHES': return 'in';
+      case 'MPH':    return 'mph';
+      case 'FEET':   return 'ft';
+      default:       return unit.toLowerCase();
+    }
+  }
+
+  /**
+   * Handle the confirm step. Y writes the row + acks; N cancels; any
+   * other input is treated as "edit remarks" (drops back to
+   * spot-remarks with the same event/magnitude and lets the reporter
+   * re-type the remarks field). This lets a reporter fix a typo
+   * without abandoning the whole form.
+   */
+  private async handleSpotConfirm(
+    fromId: string,
+    senderShortName: string,
+    channelIndex: number,
+    trimmed: string,
+    session: Extract<SessionState, { kind: 'spot-confirm' }>,
+  ): Promise<boolean> {
+    if (/^n(o)?$/i.test(trimmed)) {
+      this.sessions.delete(fromId);
+      await this.reply(fromId, `SPOT cancelled. Nothing saved.`, channelIndex);
+      return true;
+    }
+    if (/^y(es)?$/i.test(trimmed)) {
+      return this.finalizeSpot(fromId, senderShortName, channelIndex, session);
+    }
+    // Anything else = edit remarks. Preserve everything else, re-prompt.
+    this.sessions.set(fromId, {
+      kind: 'spot-remarks',
+      enteredAt: Date.now(),
+      channelIndex,
+      eventType: session.eventType,
+      magnitudeValue: session.magnitudeValue,
+      magnitudeUnit: session.magnitudeUnit,
+    });
+    await this.reply(fromId, `Edit remarks. Type new text, .=skip (clear), X=cancel.`, channelIndex);
+    return true;
+  }
+
+  /**
+   * Write the storm report to the DB, emit the STORM_REPORT event so
+   * the operator's Event Log lights up, and reply with the confirmed
+   * report id so the reporter can reference it later.
+   *
+   * spotter_source defaults to 'SPOTTER' in v3.0. A future slice could
+   * add a `:spot source trained` shortcut to let a SKYWARN-certified
+   * reporter self-identify, but for the first cut everyone lands as
+   * SPOTTER — the operator can promote the row via a dashboard edit
+   * or a PATCH endpoint we'll add later.
+   */
+  private async finalizeSpot(
+    fromId: string,
+    senderShortName: string,
+    channelIndex: number,
+    session: Extract<SessionState, { kind: 'spot-confirm' }>,
+  ): Promise<boolean> {
+    const now = Date.now();
+    const id = meshDb.addStormReport({
+      reporterNodeId: fromId,
+      reporterShortName: senderShortName,
+      radioId: this.radioId,
+      // workspace_id resolution is a v3.0-next-slice concern — for
+      // now we leave it null; the storm_reports index by radio_id
+      // covers the operator's dashboard queries either way, and a
+      // v3.0.x follow-up can backfill workspace_id from the radio's
+      // workspace association at insert-time.
+      workspaceId: null,
+      reportedAt: now,
+      receivedAt: now,
+      eventType: session.eventType,
+      magnitudeValue: session.magnitudeValue,
+      magnitudeUnit: session.magnitudeUnit,
+      lat: session.lat,
+      lng: session.lng,
+      locationSource: session.locationSource,
+      locationDescription: null,
+      county: null,
+      state: null,
+      spotterSource: 'SPOTTER',
+      remarks: session.remarks,
+      now,
+    });
+    this.sessions.delete(fromId);
+
+    // Emit the operator-visible event so the Event Log surfaces it in
+    // real time. STORM_REPORT event type is v3.0-new — see
+    // meshtastic/types.ts MeshEvent union.
+    const magStr = session.magnitudeValue !== null && session.magnitudeUnit
+      ? ` ${session.magnitudeValue}${this.abbrevUnit(session.magnitudeUnit)}`
+      : '';
+    this.bridge.emit('event', {
+      id: `storm-${id}`,
+      type: 'STORM_REPORT',
+      timestamp: now,
+      nodeId: fromId,
+      details: `${senderShortName}: ${session.eventType}${magStr}${session.remarks ? ' — ' + session.remarks.slice(0, 80) : ''}`,
+    });
+    // Also emit the fine-grained storm-report event for the future
+    // SSE-driven Storm Reports tab to pick up (parallels bbsMail /
+    // bbsSubscriber events).
+    this.bridge.emit('stormReport', { id, action: 'created', reporterNodeId: fromId });
+
+    console.log(`[BBS] SPOT logged id=${id} reporter=${senderShortName} (${fromId}) event="${session.eventType}"${magStr} loc=${session.lat ?? 'null'},${session.lng ?? 'null'} remarks="${session.remarks ?? ''}"`);
+    await this.reply(fromId, `SPOT logged #${id}. Thanks — stay safe.`, channelIndex);
     return true;
   }
 
@@ -585,6 +1009,22 @@ export class BbsService {
 
     if (session.kind === 'reading') {
       return this.handleReadingInput(fromId, session, trimmed, channelIndex);
+    }
+
+    // v3.0 SKYWARN spot-flow branches. Each session kind maps to the
+    // matching handler that reads the current step's input, updates
+    // the DB or session, and transitions to the next state.
+    if (session.kind === 'spot-event') {
+      return this.handleSpotEvent(fromId, channelIndex, trimmed);
+    }
+    if (session.kind === 'spot-magnitude') {
+      return this.handleSpotMagnitude(fromId, channelIndex, trimmed, session);
+    }
+    if (session.kind === 'spot-remarks') {
+      return this.handleSpotRemarks(fromId, channelIndex, trimmed, session);
+    }
+    if (session.kind === 'spot-confirm') {
+      return this.handleSpotConfirm(fromId, senderShortName, channelIndex, trimmed, session);
     }
 
     return false;

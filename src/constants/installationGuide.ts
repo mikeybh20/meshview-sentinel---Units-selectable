@@ -267,6 +267,26 @@ The \`:mail\` entry response also includes \`?=help\` as a tail hint, so a subsc
 
 Shortcuts: \`:mail send\`, \`:mail read\`, \`:mail BH20\` (skip the menu and prompt for body), \`!02eb3bec\` instead of a short name (hex form bypasses short-name lookup), reply-by-typing during a read session.
 
+### Storm Reports — SKYWARN (\`:spot\`) — **v3.0**
+
+Multi-step form for submitting a Local Storm Report (NWS LSR shape) via DM. Designed for SKYWARN volunteers reporting to a Sentinel operator during a storm; the operator sees each report land in the "Storm Reports" tab and (in v3.1) can flip a flag to auto-submit them to the NWS eSpotter API.
+
+\`\`\`text
+DM ":spot"                → "SPOT: what happened? H=HAIL T=TSTM_WND TR=TORNADO F=FUNNEL FL=FLOOD W=WALL_CLOUD O=OTHER X=cancel."
+DM "H"                    → "HAIL — inches? Type a number (e.g. 1.5), .=skip, X=cancel."
+DM "1.5"                  → "Remarks? Describe what you saw, or .=skip, X=cancel."
+DM "golf-ball, still falling"
+                          → "SPOT: HAIL 1.5in at 39.4213,-77.4103. Rmks: golf-ball, still falling. Y=send N=cancel."
+DM "Y"                    → "SPOT logged #17. Thanks — stay safe."
+\`\`\`
+
+- Location is auto-populated from the reporter's most recent Meshtastic Position packet (\`location_source = AUTO_LAST_POSITION\`). If the reporter has no position (fresh node, GPS unavailable), the report goes in with lat/lng null — the remarks field becomes the geographic description.
+- Events without a natural magnitude (\`TORNADO\`, \`FUNNEL\`, \`WALL CLOUD\`, \`OTHER\`) skip the magnitude step and go straight to remarks.
+- \`:spot ?\` returns the flow catalog. In-session \`?\` restates the current step's prompt so a confused reporter can recover without cancelling.
+- The confirm step accepts \`Y\` (send), \`N\` (cancel), or anything else (interpreted as an edit of the remarks field — keeps event and magnitude, re-prompts for remarks).
+
+Operator side: the Storm Reports tab (v3.0 slice 3, upcoming) shows all reports on a map with severity-tinted markers, a filterable table view, and an NWS LSR-format CSV export for the operator to copy/paste into eSpotter until v3.1 wires direct submission. Reports API is live now at \`GET /api/mesh/bbs/storm-reports\`.
+
 ### Weather (\`:weather\` or \`:wx\`)
 
 On-demand US weather lookup against the National Weather Service + zippopotam.us. Both \`:weather\` and \`:wx\` are accepted everywhere — built-in aliases for each other regardless of which one the operator has saved as the configured Weather trigger in Settings → BBS. Returns ≤200-char compact summary:
