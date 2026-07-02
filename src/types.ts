@@ -204,6 +204,36 @@ export interface StormReport {
   createdAt: number;
 }
 
+/**
+ * v3.0 Mesh Ops Intelligence — per-channel traffic rollup row.
+ * One row per (radio, channel, hour). Every observed packet
+ * increments packet_count + adds to byte_count; per-port breakouts
+ * split TEXT_MESSAGE_APP (chat), POSITION_APP, TELEMETRY_APP for
+ * "what kind of traffic is this?" analysis.
+ */
+export interface ChannelTrafficRow {
+  radioId: string;
+  channelIndex: number;
+  /** Epoch-ms rounded DOWN to the hour. */
+  hourBucket: number;
+  packetCount: number;
+  byteCount: number;
+  fromMqtt: number;
+  portMsg: number;
+  portPos: number;
+  portTele: number;
+}
+
+/** Cross-time totals grouped by channel (for summary tiles). */
+export interface ChannelTrafficTotal {
+  channelIndex: number;
+  packetCount: number;
+  byteCount: number;
+  portMsg: number;
+  portPos: number;
+  portTele: number;
+}
+
 export interface Waypoint {
   id: number;
   lat: number;

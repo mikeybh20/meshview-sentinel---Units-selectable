@@ -5,7 +5,7 @@
  * interface identical to the simulator, so the app can switch between
  * real hardware and simulated data seamlessly.
  */
-import { Node, Message, RadioEvent, Channel, Waypoint, TraceResult, NeighborInfoSnapshot, StoreForwardRouter, LocalModuleConfigSnapshot, Group, StormReport } from '../types';
+import { Node, Message, RadioEvent, Channel, Waypoint, TraceResult, NeighborInfoSnapshot, StoreForwardRouter, LocalModuleConfigSnapshot, Group, StormReport, ChannelTrafficRow, ChannelTrafficTotal } from '../types';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
@@ -496,6 +496,54 @@ export class MeshDataService {
   onStormReport(cb: () => void): () => void {
     this.stormReportListeners.push(cb);
     return () => { this.stormReportListeners = this.stormReportListeners.filter(l => l !== cb); };
+  }
+
+  // -------- v3.0 Mesh Ops Intelligence --------
+
+  /**
+   * Fetch per-channel traffic rollup rows for the given filters.
+   * Rows come back in ascending hour_bucket order so a chart can
+   * render straight through without sorting.
+   */
+  async listChannelTraffic(opts: {
+    radioId?: string | null;
+    channelIndex?: number;
+    since?: number;
+    until?: number;
+    limit?: number;
+  } = {}): Promise<ChannelTrafficRow[] | null> {
+    const p = new URLSearchParams();
+    if (opts.radioId) p.set('radio_id', opts.radioId);
+    if (typeof opts.channelIndex === 'number') p.set('channel_index', String(opts.channelIndex));
+    if (typeof opts.since === 'number') p.set('since', String(opts.since));
+    if (typeof opts.until === 'number') p.set('until', String(opts.until));
+    if (opts.limit) p.set('limit', String(opts.limit));
+    try {
+      const qs = p.toString();
+      const res = await fetch(`${API_BASE}/api/mesh/ops/channel-traffic${qs ? '?' + qs : ''}`);
+      if (!res.ok) return null;
+      const body = await res.json();
+      return Array.isArray(body?.rows) ? body.rows as ChannelTrafficRow[] : null;
+    } catch { return null; }
+  }
+
+  /** Fetch cross-time totals grouped by channel. */
+  async channelTrafficTotals(opts: {
+    radioId?: string | null;
+    since?: number;
+    until?: number;
+  } = {}): Promise<ChannelTrafficTotal[] | null> {
+    const p = new URLSearchParams();
+    if (opts.radioId) p.set('radio_id', opts.radioId);
+    if (typeof opts.since === 'number') p.set('since', String(opts.since));
+    if (typeof opts.until === 'number') p.set('until', String(opts.until));
+    try {
+      const qs = p.toString();
+      const res = await fetch(`${API_BASE}/api/mesh/ops/channel-traffic/totals${qs ? '?' + qs : ''}`);
+      if (!res.ok) return null;
+      const body = await res.json();
+      return Array.isArray(body?.totals) ? body.totals as ChannelTrafficTotal[] : null;
+    } catch { return null; }
   }
 
   async markBbsRead(id: number): Promise<boolean> {

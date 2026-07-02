@@ -65,6 +65,7 @@ import { MatrixView } from './components/views/MatrixView';
 import { MailView } from './components/views/MailView';
 import { WeatherView } from './components/views/WeatherView';
 import { StormReportsView } from './components/views/StormReportsView';
+import { MeshOpsView } from './components/views/MeshOpsView';
 import { LabeledDevicesView } from './components/views/LabeledDevicesView';
 
 export default function App() {
@@ -72,7 +73,7 @@ export default function App() {
   const [nodes, setNodes] = React.useState<Node[]>([]);
   const [messages, setMessages] = React.useState<Message[]>([]);
   const [events, setEvents] = React.useState<RadioEvent[]>([]);
-  const [activeTab, setActiveTab] = React.useState<'dashboard' | 'map' | 'messages' | 'logs' | 'matrix' | 'topology' | 'mail' | 'weather' | 'storms' | 'radios' | 'labels'>('dashboard');
+  const [activeTab, setActiveTab] = React.useState<'dashboard' | 'map' | 'messages' | 'logs' | 'matrix' | 'topology' | 'mail' | 'weather' | 'storms' | 'ops' | 'radios' | 'labels'>('dashboard');
   const [selectedNodeId, setSelectedNodeId] = React.useState<string | null>(null);
   const [configuringNodeId, setConfiguringNodeId] = React.useState<string | null>(null);
   const [showExportModal, setShowExportModal] = React.useState(false);
@@ -736,11 +737,22 @@ export default function App() {
             icon={<History size={20} />}
             label="Event Logs"
           />
-          <NavItem 
-            active={activeTab === 'matrix'} 
+          <NavItem
+            active={activeTab === 'matrix'}
             onClick={() => setActiveTab('matrix')}
             icon={<Signal size={20} />}
             label="Comm Matrix"
+          />
+          {/* v3.0 Mesh Ops Intelligence: per-channel traffic
+              analytics, connectivity matrix (future slice),
+              firmware/health (future slice). Distinct from Comm
+              Matrix (which is message-flow) — this is RF/protocol
+              telemetry the official apps don't surface. */}
+          <NavItem
+            active={activeTab === 'ops'}
+            onClick={() => setActiveTab('ops')}
+            icon={<Activity size={20} />}
+            label="Mesh Ops"
           />
           <NavItem
             active={activeTab === 'topology'}
@@ -1303,6 +1315,18 @@ export default function App() {
                 className="h-full overflow-hidden"
               >
                 <StormReportsView />
+              </motion.div>
+            )}
+
+            {activeTab === 'ops' && (
+              <motion.div
+                key="ops"
+                initial={{ opacity: 0, scale: 0.98 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.98 }}
+                className="h-full overflow-hidden"
+              >
+                <MeshOpsView />
               </motion.div>
             )}
 
