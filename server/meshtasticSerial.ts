@@ -1753,6 +1753,26 @@ export class MeshtasticSerialBridge extends EventEmitter {
 
     if (!payloadBuf) return;
 
+    // v3.0 Mesh Ops — record this packet in the per-channel hourly
+    // rollup. Called BEFORE the port switch so every parsed packet
+    // is counted, including ones on ports we don't currently
+    // dispatch. Try/catch keeps a DB hiccup from silently killing
+    // packet handling — the counter is best-effort telemetry, not
+    // a correctness requirement.
+    if (this.radioId) {
+      try {
+        this.db.recordChannelTraffic({
+          radioId: this.radioId,
+          channelIndex,
+          payloadBytes: payloadBuf.length,
+          viaMqtt,
+          portNum,
+        });
+      } catch (e: any) {
+        console.error('[MeshtasticSerial] channel-traffic record failed:', e.message);
+      }
+    }
+
     // Dispatch based on port number
     switch (portNum) {
       case PORT_TEXT_MESSAGE:

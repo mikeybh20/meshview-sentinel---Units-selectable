@@ -5191,6 +5191,58 @@ app.delete('/api/mesh/bbs/storm-reports/:id', requireAuth, (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------
+// v3.0 Mesh Ops Intelligence — per-channel traffic analytics
+// ---------------------------------------------------------------------
+
+/** GET /api/mesh/ops/channel-traffic — hourly rollup rows.
+ *
+ * Query params (all optional):
+ *   radio_id       — scope to a single radio
+ *   channel_index  — scope to one channel (0-7)
+ *   since          — epoch-ms lower bound on hour_bucket
+ *   until          — epoch-ms upper bound on hour_bucket
+ *   limit          — default 5000, cap 10000
+ *
+ * Returns rows in ASCENDING hour_bucket order (oldest first) so
+ * charts can render a straight time series without sorting. */
+app.get('/api/mesh/ops/channel-traffic', (req, res) => {
+  const q = req.query;
+  const chanRaw = typeof q.channel_index === 'string' ? parseInt(q.channel_index, 10) : NaN;
+  const opts = {
+    radioId:      typeof q.radio_id === 'string' && q.radio_id ? q.radio_id : undefined,
+    channelIndex: Number.isFinite(chanRaw) ? chanRaw : undefined,
+    since:        typeof q.since === 'string' ? parseInt(q.since, 10) || undefined : undefined,
+    until:        typeof q.until === 'string' ? parseInt(q.until, 10) || undefined : undefined,
+    limit:        typeof q.limit === 'string' ? parseInt(q.limit, 10) || undefined : undefined,
+  };
+  try {
+    return res.json({
+      rows: meshDb().listChannelTraffic(opts),
+      queryEchoed: opts,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/** GET /api/mesh/ops/channel-traffic/totals — cross-time totals grouped
+ *  by channel. Backs the "top channels in the last 24h" summary tile.
+ *  Same filters as the row endpoint minus channel_index. */
+app.get('/api/mesh/ops/channel-traffic/totals', (req, res) => {
+  const q = req.query;
+  const opts = {
+    radioId: typeof q.radio_id === 'string' && q.radio_id ? q.radio_id : undefined,
+    since:   typeof q.since === 'string' ? parseInt(q.since, 10) || undefined : undefined,
+    until:   typeof q.until === 'string' ? parseInt(q.until, 10) || undefined : undefined,
+  };
+  try {
+    return res.json({ totals: meshDb().channelTrafficTotals(opts) });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // Send a text message through the radio (also handles replies and reactions).
 // v2.0 Phase 4: optional `radio_id` in the body picks the originating radio;
 // when omitted, falls back to the default radio so 1.x clients keep working.

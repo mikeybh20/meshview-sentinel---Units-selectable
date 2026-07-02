@@ -345,6 +345,58 @@ export class MeshDatabase {
       CREATE INDEX IF NOT EXISTS idx_storm_reports_unsubmitted
         ON storm_reports(received_at DESC) WHERE submitted_to_nws = 0;
 
+      -- v3.0 Mesh Ops Intelligence: per-channel traffic rollup.
+      -- One row per (radio, channel, hour) — every observed packet
+      -- increments the row's counters via UPSERT so the table stays
+      -- compact regardless of packet volume. Bytes counted from the
+      -- decrypted Data submessage payload — the operator-visible
+      -- "how much are subscribers talking on this channel" signal.
+      --
+      -- Column meanings:
+      --   radio_id       — 4-char short_name of the receiving radio
+      --                    (same key used by radios / bbs_mail tables)
+      --   channel_index  — Meshtastic channel index (0 = PRIMARY,
+      --                    1-7 = secondary). NULL is impossible
+      --                    (every MeshPacket carries a channel index).
+      --   hour_bucket    — epoch ms rounded DOWN to the hour. Lets
+      --                    us GROUP BY / range-scan efficiently.
+      --   packet_count   — total packets observed in this bucket
+      --   byte_count     — sum of Data.payload byte lengths (the
+      --                    signal for airtime pressure, since
+      --                    payload len dominates PHY-level airtime).
+      --   from_mqtt      — subset of packet_count that arrived via
+      --                    the MQTT bridge rather than direct RF.
+      --                    Separating them lets the analytics UI
+      --                    show "actual local RF" vs "MQTT firehose".
+      --   port_msg       — subset from port TEXT_MESSAGE_APP (1).
+      --                    Coarse "how much of this is actual human
+      --                    chat" signal — most other traffic is
+      --                    telemetry/position/etc noise.
+      --   port_pos       — subset from port POSITION_APP (3).
+      --   port_tele      — subset from port TELEMETRY_APP (67).
+      -- (Other port breakouts can be added without migration by
+      -- extending the schema additively; existing rows keep 0 for
+      -- new columns thanks to NOT NULL DEFAULT 0.)
+      CREATE TABLE IF NOT EXISTS channel_traffic_hourly (
+        radio_id      TEXT    NOT NULL,
+        channel_index INTEGER NOT NULL,
+        hour_bucket   INTEGER NOT NULL,
+        packet_count  INTEGER NOT NULL DEFAULT 0,
+        byte_count    INTEGER NOT NULL DEFAULT 0,
+        from_mqtt     INTEGER NOT NULL DEFAULT 0,
+        port_msg      INTEGER NOT NULL DEFAULT 0,
+        port_pos      INTEGER NOT NULL DEFAULT 0,
+        port_tele     INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (radio_id, channel_index, hour_bucket)
+      );
+
+      -- Range-scan by time is the primary access pattern for the
+      -- analytics UI ("last 24h", "last 7 days"). Composite key
+      -- already covers by-radio-then-by-time scans; this index
+      -- covers cross-radio time scans (statewide/all-radios view).
+      CREATE INDEX IF NOT EXISTS idx_channel_traffic_time
+        ON channel_traffic_hourly(hour_bucket DESC);
+
       -- Per-node position history. Backs the iOS-style "Position Log" view in
       -- the node detail panel. We write a row every time a Position arrives
       -- (POSITION_APP packet OR NodeInfo-embedded position). Tracks lat/lng/
@@ -2442,6 +2494,187 @@ export class MeshDatabase {
        WHERE id = ? AND submitted_to_nws = 0
     `).run(nwsSubmissionId, now, id);
     return Number((r as any).changes ?? 0) > 0;
+  }
+
+  // ---------------------------------------------------------------------
+  // v3.0 Mesh Ops Intelligence — per-channel traffic rollup
+  // ---------------------------------------------------------------------
+
+  /**
+   * Record one observed packet's counters into the hourly bucket for
+   * (radio, channel). Called from meshtasticSerial handleMeshPacket
+   * on every parsed packet. Upserts on the composite PK so the table
+   * grows at O(radios × channels × hours) — not O(packets).
+   *
+   * Bytes = the Data submessage payload length. That's the closest
+   * signal we have to airtime pressure without cracking the PHY
+   * frame — payload dominates airtime for anything longer than a
+   * bare position ping.
+   *
+   * portNum drives the optional per-port breakouts (msg/pos/tele)
+   * so the analytics UI can distinguish "actual chat" from
+   * "telemetry noise" at a glance.
+   */
+  recordChannelTraffic(row: {
+    radioId: string;
+    channelIndex: number;
+    payloadBytes: number;
+    viaMqtt: boolean;
+    portNum: number;
+    now?: number;
+  }): void {
+    const now = row.now ?? Date.now();
+    // Round DOWN to the hour — 3600_000 ms per hour.
+    const hourBucket = Math.floor(now / 3600_000) * 3600_000;
+    // Port constants from Meshtastic protobuf PortNum enum. Left
+    // inline (not exported) since these three are the only ones the
+    // rollup breaks out.
+    const isMsg  = row.portNum === 1;   // TEXT_MESSAGE_APP
+    const isPos  = row.portNum === 3;   // POSITION_APP
+    const isTele = row.portNum === 67;  // TELEMETRY_APP
+    this.db.prepare(`
+      INSERT INTO channel_traffic_hourly (
+        radio_id, channel_index, hour_bucket,
+        packet_count, byte_count, from_mqtt, port_msg, port_pos, port_tele
+      ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)
+      ON CONFLICT(radio_id, channel_index, hour_bucket) DO UPDATE SET
+        packet_count = packet_count + 1,
+        byte_count   = byte_count + excluded.byte_count,
+        from_mqtt    = from_mqtt + excluded.from_mqtt,
+        port_msg     = port_msg + excluded.port_msg,
+        port_pos     = port_pos + excluded.port_pos,
+        port_tele    = port_tele + excluded.port_tele
+    `).run(
+      row.radioId,
+      row.channelIndex,
+      hourBucket,
+      Math.max(0, row.payloadBytes | 0),
+      row.viaMqtt ? 1 : 0,
+      isMsg ? 1 : 0,
+      isPos ? 1 : 0,
+      isTele ? 1 : 0,
+    );
+  }
+
+  /**
+   * List channel-traffic rollup rows with flexible filters.
+   * Time bounds are epoch ms (inclusive on lower, inclusive on upper).
+   *
+   * Returns rows in ascending hour_bucket order (oldest first) so
+   * chart libraries can render a straight time series without
+   * sorting.
+   */
+  listChannelTraffic(opts: {
+    radioId?: string | null;
+    channelIndex?: number | null;
+    since?: number;
+    until?: number;
+    limit?: number;
+  } = {}): Array<{
+    radioId: string;
+    channelIndex: number;
+    hourBucket: number;
+    packetCount: number;
+    byteCount: number;
+    fromMqtt: number;
+    portMsg: number;
+    portPos: number;
+    portTele: number;
+  }> {
+    const clauses: string[] = [];
+    const params: any[] = [];
+    if (opts.radioId) { clauses.push('radio_id = ?'); params.push(opts.radioId); }
+    if (typeof opts.channelIndex === 'number') { clauses.push('channel_index = ?'); params.push(opts.channelIndex); }
+    if (typeof opts.since === 'number') { clauses.push('hour_bucket >= ?'); params.push(opts.since); }
+    if (typeof opts.until === 'number') { clauses.push('hour_bucket <= ?'); params.push(opts.until); }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    // Cap at 10000 rows so an unbounded query can't blow the process.
+    // At most 8 channels × 24 hours = 192 rows/day per radio, so 10000
+    // covers ~50 days per radio which is well past any dashboard need.
+    const limit = Math.min(Math.max(1, opts.limit ?? 5000), 10000);
+    const rows = this.db.prepare(
+      `SELECT radio_id, channel_index, hour_bucket,
+              packet_count, byte_count, from_mqtt,
+              port_msg, port_pos, port_tele
+       FROM channel_traffic_hourly ${where}
+       ORDER BY hour_bucket ASC LIMIT ?`
+    ).all(...params, limit) as Array<{
+      radio_id: string; channel_index: number; hour_bucket: number;
+      packet_count: number; byte_count: number; from_mqtt: number;
+      port_msg: number; port_pos: number; port_tele: number;
+    }>;
+    return rows.map(r => ({
+      radioId: r.radio_id,
+      channelIndex: r.channel_index,
+      hourBucket: r.hour_bucket,
+      packetCount: r.packet_count,
+      byteCount: r.byte_count,
+      fromMqtt: r.from_mqtt,
+      portMsg: r.port_msg,
+      portPos: r.port_pos,
+      portTele: r.port_tele,
+    }));
+  }
+
+  /**
+   * Roll up totals across the queried range grouped by channel.
+   * For the "top channels by traffic in the last 24h" summary tile.
+   */
+  channelTrafficTotals(opts: {
+    radioId?: string | null;
+    since?: number;
+    until?: number;
+  } = {}): Array<{
+    channelIndex: number;
+    packetCount: number;
+    byteCount: number;
+    portMsg: number;
+    portPos: number;
+    portTele: number;
+  }> {
+    const clauses: string[] = [];
+    const params: any[] = [];
+    if (opts.radioId) { clauses.push('radio_id = ?'); params.push(opts.radioId); }
+    if (typeof opts.since === 'number') { clauses.push('hour_bucket >= ?'); params.push(opts.since); }
+    if (typeof opts.until === 'number') { clauses.push('hour_bucket <= ?'); params.push(opts.until); }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const rows = this.db.prepare(
+      `SELECT channel_index,
+              SUM(packet_count) AS packet_count,
+              SUM(byte_count)   AS byte_count,
+              SUM(port_msg)     AS port_msg,
+              SUM(port_pos)     AS port_pos,
+              SUM(port_tele)    AS port_tele
+       FROM channel_traffic_hourly ${where}
+       GROUP BY channel_index
+       ORDER BY packet_count DESC`
+    ).all(...params) as Array<{
+      channel_index: number; packet_count: number; byte_count: number;
+      port_msg: number; port_pos: number; port_tele: number;
+    }>;
+    return rows.map(r => ({
+      channelIndex: r.channel_index,
+      packetCount: r.packet_count,
+      byteCount: r.byte_count,
+      portMsg: r.port_msg,
+      portPos: r.port_pos,
+      portTele: r.port_tele,
+    }));
+  }
+
+  /**
+   * Prune hourly buckets older than `cutoffMs`. Called by the
+   * retention pruner alongside the existing message/event retention
+   * pass. Analytics rollups are cheap to keep long-term (a year of
+   * data for 2 radios × 8 channels is ~140k rows, < 10 MB) but the
+   * operator can cap it via the same retentionDays setting that
+   * governs mail if they want.
+   */
+  pruneChannelTrafficBefore(cutoffMs: number): number {
+    const r = this.db.prepare(
+      `DELETE FROM channel_traffic_hourly WHERE hour_bucket < ?`
+    ).run(cutoffMs);
+    return Number((r as any).changes ?? 0);
   }
 
   // ---------------------------------------------------------------------
