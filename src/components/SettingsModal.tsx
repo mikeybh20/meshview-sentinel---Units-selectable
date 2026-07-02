@@ -837,7 +837,7 @@ function ModeSection({ dataSource, setDataSource, radioConnected, transport }: S
           <div className="flex items-start justify-between gap-2 mb-2">
             <div className="flex items-center gap-2">
               <Activity size={16} className={!isLive ? "text-brand-warning" : "text-brand-muted"} />
-              <span className="text-sm font-bold uppercase tracking-tight">Simulator</span>
+              <span className="text-sm font-bold uppercase tracking-tight">Playground</span>
             </div>
             {!isLive && (
               <span className="text-[9px] mono-text uppercase tracking-widest px-1.5 py-0.5 rounded-full bg-brand-warning/20 text-brand-warning">
@@ -854,10 +854,30 @@ function ModeSection({ dataSource, setDataSource, radioConnected, transport }: S
         </button>
       </div>
 
-      <div className="text-[10px] text-brand-muted leading-snug px-1">
-        The mode you choose persists across reloads. The sidebar radio badge remains visible in
-        either mode and shows the current state at a glance — green for connected Live, amber
-        for Simulator, red for Live without a connected radio.
+      {/* v3.0 note: Playground is now session-only. */}
+      <div className="text-[10px] text-brand-muted leading-snug px-1 pb-2 border-b border-brand-line/40">
+        <strong className="text-brand-warning">v3.0 change:</strong> Playground (formerly "Simulator") is now <strong>session-only</strong> — it doesn't persist across reloads. Refresh the page and you're back in Live mode. This was a deliberate change from v2.x where the toggle persisted and occasionally trapped operators who forgot they'd enabled it and wondered why their real radio's traffic wasn't showing up.
+      </div>
+
+      {/* Re-open First-Run Wizard — useful for demoing Sentinel to a
+          colleague, or for anyone who dismissed the wizard early. */}
+      <div className="flex items-center justify-between gap-3 pt-1">
+        <div className="text-[10px] text-brand-muted leading-snug">
+          Want the fresh-install experience again? Clears the "wizard dismissed" flag and re-shows the welcome flow.
+        </div>
+        <button
+          onClick={() => {
+            try { localStorage.removeItem('mesh.wizardDismissed'); } catch {}
+            // Force a reload — App.tsx reads wizardDismissed once at
+            // mount, so simply clearing it here doesn't re-show the
+            // wizard until next reload. The reload also picks up any
+            // fresh-install detection changes.
+            window.location.reload();
+          }}
+          className="text-[10px] uppercase font-bold tracking-widest px-3 py-1.5 rounded border border-brand-accent/40 text-brand-accent hover:bg-brand-accent/10 shrink-0"
+        >
+          Show First-Run Wizard
+        </button>
       </div>
     </div>
   );

@@ -138,12 +138,23 @@ rework.
 - Bug-list discipline — every reported bug filed, triaged, and
   either fixed or documented as out-of-scope before v3.0 ships.
 
-### 9. Demo mode sunset
-The v1.0 demo-mode flag (`MESHTASTIC_DEMO_MODE` / equivalent) is
-removed in v3.0. Replacement is the session-only playground in the
-first-run wizard (Inclusion #5). Migration path: existing demo-mode
-deployments see a one-time notice on update directing them to pair a
-real radio or use the playground.
+### 9. Demo mode sunset — **shipped**
+The v2.x "Simulator" persistent-toggle demo mode is retired in v3.0.
+Replacement is the **session-only Playground** in the first-run
+wizard (Inclusion #5, also shipped).
+
+- v3.0 First-Run Wizard modal appears on fresh installs (0 radios
+  + not dismissed). Two paths: "Pair a Radio" (opens Radios tab) or
+  "Playground" (activates the simulator for the session only).
+- Playground never persists — reload = back to Live. This kills the
+  v2.x foot-gun where operators forgot they'd enabled Simulator and
+  wondered why their real radio's traffic wasn't appearing.
+- Migration for existing v2.x installs with `mesh.dataSource='simulator'`
+  in localStorage: honored on the first boot after upgrade so the
+  operator isn't ejected mid-session, but then cleared on the next
+  state save so subsequent reloads land in Live.
+- Settings → Mode gains a "Show First-Run Wizard" button so operators
+  can re-show the flow when onboarding a colleague.
 
 ### 10. Co-author / dual-license release
 - **License:** AGPL-3.0 for open-source / amateur / community use,

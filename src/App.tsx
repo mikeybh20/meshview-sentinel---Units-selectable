@@ -67,6 +67,7 @@ import { WeatherView } from './components/views/WeatherView';
 import { StormReportsView } from './components/views/StormReportsView';
 import { MeshOpsView } from './components/views/MeshOpsView';
 import { LabeledDevicesView } from './components/views/LabeledDevicesView';
+import { FirstRunWizard } from './components/FirstRunWizard';
 
 export default function App() {
   const theme = useTheme();
@@ -169,7 +170,20 @@ export default function App() {
   const [ackStatuses, setAckStatuses] = React.useState<Record<string, { status: string; errorCode: number }>>({});
   
   // v2.0 multi-radio: the active per-radio filter from the RadioBar (null = "all").
-  const { selectedRadioId, defaultRadioId } = useRadios();
+  const { selectedRadioId, defaultRadioId, radios } = useRadios();
+
+  // v3.0 First-Run Wizard state. Shown when:
+  //   - The install has 0 configured radios AND
+  //   - The user hasn't dismissed it via localStorage
+  //   - Also opened manually from Settings → Mode ("Show wizard" btn)
+  // Explicit override via forceShowWizard so Settings can re-open it
+  // for an operator demoing Sentinel to a colleague.
+  const [forceShowWizard, setForceShowWizard] = React.useState(false);
+  const wizardDismissed = React.useMemo(() => {
+    try { return localStorage.getItem('mesh.wizardDismissed') === 'true'; }
+    catch { return true; } // private mode → don't re-nag on every reload
+  }, []);
+  const showWizard = forceShowWizard || (radios.length === 0 && !wizardDismissed);
   // v2.0 Beta 2: orthogonal transport filter (RF vs MQTT-bridged). Persisted
   // to localStorage so the operator's preference survives reloads.
   const [selectedVia, setSelectedVia] = React.useState<ViaFilterValue>(() => {
@@ -209,6 +223,13 @@ export default function App() {
   // want to flip the toggle every load. If no radio is connected the UI shows
   // a red "Radio Offline" indicator; the operator can switch to simulator
   // mode from Settings → Mode if they want demo data instead.
+  // v3.0 demo-mode sunset: 'simulator' is now the internal name for
+  // the session-only Playground. Loading logic is intentionally
+  // asymmetric — we HONOR a persisted 'simulator' on THIS boot so
+  // upgrading v2.x operators aren't ejected mid-session, but we
+  // never SAVE 'simulator' again. On next reload, that persisted
+  // value is gone and Playground is cleared until the operator opts
+  // in again via the First-Run Wizard or Settings → Mode.
   const [dataSource, setDataSource] = React.useState<DataSource>(() => {
     try {
       const persisted = localStorage.getItem('mesh.dataSource');
@@ -216,9 +237,19 @@ export default function App() {
     } catch { /* private mode */ }
     return 'live';
   });
-  // Persist on change so a deliberate switch survives reloads.
+  // Persist ONLY 'live' — 'simulator' (Playground) is session-only in
+  // v3.0 by design. Also proactively clear any persisted 'simulator'
+  // from a v2.x install so it doesn't linger.
   React.useEffect(() => {
-    try { localStorage.setItem('mesh.dataSource', dataSource); } catch { /* */ }
+    try {
+      if (dataSource === 'live') {
+        localStorage.setItem('mesh.dataSource', 'live');
+      } else {
+        // 'simulator' → don't persist. Actively clear any legacy
+        // v2.x value so a reload starts fresh in Live mode.
+        localStorage.removeItem('mesh.dataSource');
+      }
+    } catch { /* */ }
   }, [dataSource]);
   const [radioConnected, setRadioConnected] = React.useState(false);
   const [transport, setTransport] = React.useState<TransportInfo | null>(null);
@@ -675,6 +706,20 @@ export default function App() {
 
   return (
     <div className="flex h-screen bg-brand-bg font-sans overflow-hidden">
+      {/* v3.0 First-Run Wizard — modal overlay on fresh installs. */}
+      {showWizard && (
+        <FirstRunWizard
+          onPairRadio={() => {
+            setForceShowWizard(false);
+            setActiveTab('radios');
+          }}
+          onStartPlayground={() => {
+            setForceShowWizard(false);
+            setDataSource('simulator');
+          }}
+          onDismiss={() => setForceShowWizard(false)}
+        />
+      )}
       {/* Sidebar */}
       <aside className="w-16 md:w-64 border-r border-brand-line flex flex-col items-center md:items-stretch bg-brand-bg/50 backdrop-blur-md z-50">
         <div className="p-4 flex items-center gap-3 border-b border-brand-line h-16">
