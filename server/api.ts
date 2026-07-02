@@ -745,6 +745,39 @@ function slugifyWorkspaceName(name: string): string | null {
 /** POST /api/workspaces — admin creates a new workspace. The creating
  *  admin auto-joins as both member and owner. Slug is derived from the
  *  name; on collision, a numeric suffix is appended (-2, -3, …). */
+/**
+ * v3.0 multi-tenant cleanup — best-effort audit-log helper. Never
+ * throws; a DB hiccup writing the row must not roll back the mutation
+ * that already committed. Used by every /api/workspaces* mutation
+ * endpoint below.
+ */
+function logWorkspace(
+  req: import('express').Request,
+  workspaceId: number,
+  action: string,
+  opts?: {
+    targetType?: string;
+    targetId?: string;
+    details?: unknown;
+  },
+): void {
+  try {
+    const actorUserId = req.user?.id ?? null;
+    const actorUsername = req.user ? `${req.user.username}#${req.user.id}` : '<unauthenticated>';
+    meshDb().logWorkspaceAction({
+      workspaceId,
+      actorUserId,
+      actorUsername,
+      action,
+      targetType: opts?.targetType ?? null,
+      targetId: opts?.targetId ?? null,
+      details: opts?.details,
+    });
+  } catch (err: any) {
+    console.warn(`[WorkspaceAudit] log failed for action=${action} ws=${workspaceId}:`, err?.message);
+  }
+}
+
 app.post('/api/workspaces', requireAdmin, (req, res) => {
   const name = String(req.body?.name ?? '').trim();
   if (name.length < 1 || name.length > 64) {
@@ -768,6 +801,7 @@ app.post('/api/workspaces', requireAdmin, (req, res) => {
       ownerUserId: req.user!.id,
     });
     meshDb().addWorkspaceMember(id, req.user!.id);
+    logWorkspace(req, id, 'workspace.create', { details: { name, slug, ownerUserId: req.user!.id } });
     return res.status(201).json({ workspace: meshDb().getWorkspace(id) });
   } catch (err: any) {
     return res.status(500).json({ error: err.message ?? 'create failed' });
@@ -789,6 +823,7 @@ app.patch('/api/workspaces/:id', requireAdmin, (req, res) => {
       return res.status(400).json({ error: 'name must be 1..64 chars' });
     }
     meshDb().updateWorkspaceName(id, name);
+    logWorkspace(req, id, 'workspace.rename', { details: { fromName: ws.name, toName: name } });
   }
   if (req.body?.ownerUserId !== undefined) {
     const newOwner = req.body.ownerUserId === null ? null : Number(req.body.ownerUserId);
@@ -799,6 +834,11 @@ app.patch('/api/workspaces/:id', requireAdmin, (req, res) => {
       return res.status(409).json({ error: 'new owner must already be a member of this workspace' });
     }
     meshDb().setWorkspaceOwner(id, newOwner);
+    logWorkspace(req, id, 'workspace.owner.change', {
+      targetType: 'user',
+      targetId: newOwner !== null ? String(newOwner) : null,
+      details: { fromOwnerUserId: ws.ownerUserId, toOwnerUserId: newOwner },
+    });
   }
   return res.json({ workspace: meshDb().getWorkspace(id) });
 });
@@ -828,6 +868,26 @@ app.delete('/api/workspaces/:id', requireAdmin, (req, res) => {
       meshDb().setRadioWorkspace(r.radio_id, fallback.id);
     }
   }
+  // NOTE: audit log CASCADEs with the workspace_id FK, so we log
+  // BEFORE the delete or the row goes away with the workspace. The
+  // pre-delete row is preserved for cross-workspace forensics via a
+  // sister log on the fallback workspace below.
+  logWorkspace(req, id, 'workspace.delete', {
+    details: {
+      name: ws.name,
+      slug: ws.slug,
+      migratedRadioCount: fallback ? meshDb().listRadios().filter(r => r.workspace_id === id).length : 0,
+      migratedRadiosTo: fallback?.id ?? null,
+    },
+  });
+  // Also log to the destination workspace so an operator viewing
+  // that workspace's audit trail can see "these radios arrived
+  // because workspace X was deleted."
+  if (fallback) {
+    logWorkspace(req, fallback.id, 'workspace.radio.migrated_in', {
+      details: { fromDeletedWorkspaceId: id, fromDeletedWorkspaceName: ws.name },
+    });
+  }
   meshDb().deleteWorkspace(id);
   return res.json({ ok: true, migratedRadiosTo: fallback?.id ?? null });
 });
@@ -843,6 +903,12 @@ app.post('/api/workspaces/:id/members', requireAdmin, (req, res) => {
   if (!meshDb().getWorkspace(id)) return res.status(404).json({ error: 'workspace not found' });
   if (!meshDb().getUserById(userId)) return res.status(404).json({ error: 'user not found' });
   const added = meshDb().addWorkspaceMember(id, userId);
+  if (added) {
+    logWorkspace(req, id, 'workspace.member.add', {
+      targetType: 'user',
+      targetId: String(userId),
+    });
+  }
   return res.json({ ok: true, alreadyMember: !added });
 });
 
@@ -861,6 +927,10 @@ app.delete('/api/workspaces/:id/members/:userId', requireAdmin, (req, res) => {
     return res.status(409).json({ error: 'Cannot remove the workspace owner — reassign ownership first' });
   }
   meshDb().removeWorkspaceMember(id, userId);
+  logWorkspace(req, id, 'workspace.member.remove', {
+    targetType: 'user',
+    targetId: String(userId),
+  });
   return res.json({ ok: true });
 });
 
@@ -871,8 +941,24 @@ app.post('/api/workspaces/:id/radios/:radioId', requireAdmin, (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'id must be an integer' });
   if (!meshDb().getWorkspace(id)) return res.status(404).json({ error: 'workspace not found' });
-  if (!meshDb().getRadio(req.params.radioId)) return res.status(404).json({ error: 'radio not found' });
+  const targetRadio = meshDb().getRadio(req.params.radioId);
+  if (!targetRadio) return res.status(404).json({ error: 'radio not found' });
+  const fromWsId = targetRadio.workspace_id;
   meshDb().setRadioWorkspace(req.params.radioId, id);
+  logWorkspace(req, id, 'workspace.radio.assign', {
+    targetType: 'radio',
+    targetId: req.params.radioId,
+    details: { fromWorkspaceId: fromWsId },
+  });
+  // Also log removal on the source workspace so its audit trail
+  // shows the departure. Silent when the radio was unassigned.
+  if (fromWsId !== null && fromWsId !== id) {
+    logWorkspace(req, fromWsId, 'workspace.radio.unassign', {
+      targetType: 'radio',
+      targetId: req.params.radioId,
+      details: { toWorkspaceId: id },
+    });
+  }
   return res.json({ ok: true });
 });
 
@@ -914,9 +1000,47 @@ app.post('/api/workspaces/:id/primary-radio', requireAdmin, (req, res) => {
       });
     }
   }
+  const previousPrimary = (ws as any).primary_radio_id ?? null;
   meshDb().setWorkspacePrimaryRadio(id, radioId);
   console.log(`[Workspaces] PRIMARY_RADIO workspace_id=${id} ("${ws.name}") set to "${radioId ?? '<cleared>'}" by user=${actor}`);
+  logWorkspace(req, id, radioId === null ? 'workspace.primary_radio.clear' : 'workspace.primary_radio.set', {
+    targetType: 'radio',
+    targetId: radioId,
+    details: { previousPrimary },
+  });
   return res.json({ ok: true, workspace: meshDb().getWorkspace(id) });
+});
+
+/**
+ * v3.0 multi-tenant cleanup — GET /api/workspaces/:id/audit-log
+ * Returns workspace mutation history in reverse-chronological order.
+ * Members + admins only (same visibility gate as GET /api/workspaces/:id).
+ *
+ * Query params:
+ *   limit   — default 200, cap 1000
+ *   action  — filter to one action string
+ *   since   — epoch-ms lower bound on created_at
+ */
+app.get('/api/workspaces/:id/audit-log', requireAuth, (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'id must be an integer' });
+  const ws = meshDb().getWorkspace(id);
+  if (!ws) return res.status(404).json({ error: 'workspace not found' });
+  const userId = req.user!.id;
+  if (req.user!.role !== 'admin' && !meshDb().isWorkspaceMember(id, userId)) {
+    return res.status(403).json({ error: 'Not a member of this workspace' });
+  }
+  const q = req.query;
+  try {
+    const rows = meshDb().listWorkspaceAuditLog(id, {
+      limit: typeof q.limit === 'string' ? parseInt(q.limit, 10) || undefined : undefined,
+      action: typeof q.action === 'string' && q.action ? q.action : undefined,
+      since: typeof q.since === 'string' ? parseInt(q.since, 10) || undefined : undefined,
+    });
+    return res.json({ entries: rows });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 /** GET /api/workspaces/:id — single workspace + members + assigned

@@ -286,6 +286,25 @@ export interface ActiveAlertsResponse {
   note?: string;
 }
 
+/**
+ * v3.0 multi-tenant cleanup — workspace audit log entry.
+ * One row per mutation on a workspace's state (create, rename,
+ * delete, member add/remove, radio assign/unassign, primary radio
+ * set/clear). Actor snapshot kept in-row so a rename or deletion of
+ * the acting user doesn't blank out historical entries.
+ */
+export interface WorkspaceAuditEntry {
+  id: number;
+  workspaceId: number;
+  actorUserId: number | null;
+  actorUsername: string;
+  action: string;
+  targetType: string | null;
+  targetId: string | null;
+  details: unknown;
+  createdAt: number;
+}
+
 export interface Waypoint {
   id: number;
   lat: number;

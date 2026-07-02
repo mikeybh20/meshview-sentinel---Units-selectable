@@ -126,13 +126,30 @@ follow-ups worth their own slice.
   demo mode: not a stored DB state, not a runtime configuration
   flag, just a one-shot evaluation path.
 
-### 6. Multi-tenant cleanup
+### 6. Multi-tenant cleanup — **audit log shipped**
 Quietly included as a credibility floor for open-source debut, not a
-headline feature:
-- Workspace isolation guarantees — tested with adversarial cases.
-- Per-workspace audit log.
+headline feature.
+
+**Shipped (this slice):**
+- **Per-workspace audit log.** New `workspace_audit_log` table +
+  DB helpers + audit hook wired into every /api/workspaces*
+  mutation endpoint (create / rename / owner change / delete /
+  member add-remove / radio assign-unassign / primary radio
+  set-clear). Delete logs to BOTH the departing and the receiving
+  workspace so cross-workspace forensics work. New endpoint
+  `GET /api/workspaces/:id/audit-log` (members + admins). UI panel
+  collapsed by default in Settings → Workspaces detail expansion,
+  with severity-tinted action badges + friendly human formatting
+  of before/after values instead of raw JSON.
+
+**Still open for follow-up slices:**
 - Workspace invite/share flow (QR code for one-time join links).
 - Role clarity — operator vs. member vs. observer permissions.
+- Adversarial isolation-test suite.
+
+Audit log first because it's the "trust but verify" mechanism for
+the isolation claim — additive, doesn't touch existing permission
+paths, immediately visible value.
 
 ### 7. External-transport adapter interface (designed, not built)
 Define the abstraction that a future HAM/APRS/Winlink bridge would

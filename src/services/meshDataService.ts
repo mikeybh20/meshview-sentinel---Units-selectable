@@ -5,7 +5,7 @@
  * interface identical to the simulator, so the app can switch between
  * real hardware and simulated data seamlessly.
  */
-import { Node, Message, RadioEvent, Channel, Waypoint, TraceResult, NeighborInfoSnapshot, StoreForwardRouter, LocalModuleConfigSnapshot, Group, StormReport, ChannelTrafficRow, ChannelTrafficTotal, FirmwareStatusResponse, ActiveAlertsResponse } from '../types';
+import { Node, Message, RadioEvent, Channel, Waypoint, TraceResult, NeighborInfoSnapshot, StoreForwardRouter, LocalModuleConfigSnapshot, Group, StormReport, ChannelTrafficRow, ChannelTrafficTotal, FirmwareStatusResponse, ActiveAlertsResponse, WorkspaceAuditEntry } from '../types';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
@@ -796,6 +796,27 @@ export class MeshDataService {
   async getWorkspaceDetail(id: number): Promise<{ workspace: any; members: any[]; radios: any[] } | null> {
     try {
       const res = await fetch(`${API_BASE}/api/workspaces/${id}`, { credentials: 'include' });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  }
+
+  /**
+   * v3.0 multi-tenant cleanup — audit log for a single workspace.
+   * Members + admins can read. Returns entries newest-first.
+   */
+  async workspaceAuditLog(id: number, opts: {
+    limit?: number;
+    action?: string;
+    since?: number;
+  } = {}): Promise<{ entries: WorkspaceAuditEntry[] } | null> {
+    try {
+      const p = new URLSearchParams();
+      if (opts.limit) p.set('limit', String(opts.limit));
+      if (opts.action) p.set('action', opts.action);
+      if (typeof opts.since === 'number') p.set('since', String(opts.since));
+      const qs = p.toString();
+      const res = await fetch(`${API_BASE}/api/workspaces/${id}/audit-log${qs ? '?' + qs : ''}`, { credentials: 'include' });
       if (!res.ok) return null;
       return await res.json();
     } catch { return null; }

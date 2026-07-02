@@ -531,6 +531,57 @@ export class MeshDatabase {
       );
       CREATE INDEX IF NOT EXISTS idx_ws_members_user ON workspace_members(user_id);
 
+      -- v3.0 multi-tenant cleanup: per-workspace audit log. Every
+      -- mutation to a workspace's state (create/delete/rename,
+      -- member add/remove, radio assign/unassign, primary radio
+      -- set/clear) writes a row here so an operator can answer
+      -- "who did what to my workspace, when?" — the trust-but-
+      -- verify mechanism for the isolation guarantees claim in
+      -- the ROADMAP-v3 multi-tenant inclusion.
+      --
+      -- Column shape:
+      --   workspace_id       — the workspace the action affected
+      --   actor_user_id      — nullable: unauthenticated actions
+      --                        (rare — most mutations require auth)
+      --                        get null so we can still audit them
+      --   actor_username     — snapshot: if the user is renamed or
+      --                        deleted later, the audit log stays
+      --                        readable without a JOIN
+      --   action             — verb string like 'workspace.create',
+      --                        'workspace.member.add', etc. Kept as
+      --                        TEXT (no enum) so new actions can be
+      --                        added without migration.
+      --   target_type/id     — the affected sub-object: 'user' + user_id
+      --                        for member operations, 'radio' + radio_id
+      --                        for radio ops, null for whole-workspace
+      --                        ops like create/delete.
+      --   details_json       — free-form JSON blob for the action-
+      --                        specific payload (before/after values,
+      --                        request body, etc.)
+      --   created_at         — epoch ms of the mutation
+      --
+      -- ON DELETE CASCADE means deleting a workspace also deletes
+      -- its audit log — deliberately, since the audit log is
+      -- workspace-owned. If an operator needs long-term forensics
+      -- across a delete, they should back up first via Settings →
+      -- Data → Full Backup before deleting.
+      CREATE TABLE IF NOT EXISTS workspace_audit_log (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        workspace_id   INTEGER NOT NULL,
+        actor_user_id  INTEGER,
+        actor_username TEXT NOT NULL,
+        action         TEXT NOT NULL,
+        target_type    TEXT,
+        target_id      TEXT,
+        details_json   TEXT,
+        created_at     INTEGER NOT NULL,
+        FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_ws_audit_ws_time
+        ON workspace_audit_log(workspace_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_ws_audit_actor
+        ON workspace_audit_log(actor_user_id, created_at DESC);
+
       -- v2.0 Beta 5 Labeled Devices: lightweight "managed e-ink labels"
       -- (Heltec Vision Master, etc.) used as physical signage — tap
       -- labels, station IDs, room signs. The device's long_name is the
@@ -3375,6 +3426,101 @@ export class MeshDatabase {
       SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ?
     `).get(workspaceId, userId);
     return !!row;
+  }
+
+  /**
+   * v3.0 multi-tenant cleanup — record a workspace-affecting action
+   * in the audit log. Called from every /api/workspaces* mutation
+   * endpoint so an operator can answer "who did what, when?"
+   *
+   * Best-effort. A DB hiccup writing the audit row must never abort
+   * the mutation itself — the mutation already committed. Caller-
+   * side wrapping in try/catch handles that.
+   *
+   * `details` accepts any JSON-serializable value; stored as a
+   * stringified column so schema stays fixed as actions evolve.
+   */
+  logWorkspaceAction(row: {
+    workspaceId: number;
+    actorUserId: number | null;
+    actorUsername: string;
+    action: string;
+    targetType?: string | null;
+    targetId?: string | null;
+    details?: unknown;
+    now?: number;
+  }): number {
+    const now = row.now ?? Date.now();
+    const detailsJson = row.details !== undefined
+      ? (() => { try { return JSON.stringify(row.details); } catch { return null; } })()
+      : null;
+    const r = this.db.prepare(`
+      INSERT INTO workspace_audit_log (
+        workspace_id, actor_user_id, actor_username,
+        action, target_type, target_id,
+        details_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      row.workspaceId,
+      row.actorUserId,
+      row.actorUsername || '<unauthenticated>',
+      row.action,
+      row.targetType ?? null,
+      row.targetId ?? null,
+      detailsJson,
+      now,
+    );
+    return Number((r as any).lastInsertRowid);
+  }
+
+  /** Read audit-log rows for one workspace, newest-first. Limit
+   *  capped at 1000 to keep any accidental unbounded fetch from
+   *  blowing the response. */
+  listWorkspaceAuditLog(workspaceId: number, opts: {
+    limit?: number;
+    action?: string;
+    actorUserId?: number;
+    since?: number;
+  } = {}): Array<{
+    id: number;
+    workspaceId: number;
+    actorUserId: number | null;
+    actorUsername: string;
+    action: string;
+    targetType: string | null;
+    targetId: string | null;
+    details: unknown;
+    createdAt: number;
+  }> {
+    const clauses: string[] = ['workspace_id = ?'];
+    const params: any[] = [workspaceId];
+    if (opts.action) { clauses.push('action = ?'); params.push(opts.action); }
+    if (typeof opts.actorUserId === 'number') { clauses.push('actor_user_id = ?'); params.push(opts.actorUserId); }
+    if (typeof opts.since === 'number') { clauses.push('created_at >= ?'); params.push(opts.since); }
+    const limit = Math.min(Math.max(1, opts.limit ?? 200), 1000);
+    const rows = this.db.prepare(
+      `SELECT id, workspace_id, actor_user_id, actor_username,
+              action, target_type, target_id, details_json, created_at
+       FROM workspace_audit_log
+       WHERE ${clauses.join(' AND ')}
+       ORDER BY created_at DESC, id DESC LIMIT ?`
+    ).all(...params, limit) as Array<{
+      id: number; workspace_id: number; actor_user_id: number | null;
+      actor_username: string; action: string;
+      target_type: string | null; target_id: string | null;
+      details_json: string | null; created_at: number;
+    }>;
+    return rows.map(r => ({
+      id: r.id,
+      workspaceId: r.workspace_id,
+      actorUserId: r.actor_user_id,
+      actorUsername: r.actor_username,
+      action: r.action,
+      targetType: r.target_type,
+      targetId: r.target_id,
+      details: r.details_json ? (() => { try { return JSON.parse(r.details_json!); } catch { return null; } })() : null,
+      createdAt: r.created_at,
+    }));
   }
 
   /** All workspace ids the user belongs to. Powers the "what can this

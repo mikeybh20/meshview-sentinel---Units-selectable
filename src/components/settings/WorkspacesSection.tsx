@@ -7,11 +7,12 @@
 import React from 'react';
 import {
   AlertCircle, Check, Loader2, Plus, Trash2, Star, Lock, KeyRound,
-  Users as UsersIcon, ChevronDown, RefreshCw,
+  Users as UsersIcon, ChevronDown, RefreshCw, History,
 } from 'lucide-react';
 import { useIsAdmin } from '../../hooks/useAuth';
 import { meshDataService } from '../../services/meshDataService';
 import { cn } from '../../lib/utils';
+import type { WorkspaceAuditEntry } from '../../types';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
@@ -428,6 +429,9 @@ function WorkspacesSection() {
                           </select>
                         </div>
                       )}
+
+                      {/* v3.0 Multi-tenant cleanup — audit log panel */}
+                      <WorkspaceAuditLogPanel workspaceId={ws.id} expanded={expanded} />
                     </div>
                   </div>
                 )}
@@ -444,6 +448,154 @@ function WorkspacesSection() {
       </p>
     </div>
   );
+}
+
+
+/**
+ * v3.0 multi-tenant cleanup — audit log for a single workspace.
+ * Renders the workspace's mutation history (create, rename, member
+ * add/remove, radio assign/unassign, primary radio changes) so an
+ * operator can answer "who did what, when?" as a trust-but-verify
+ * for the multi-tenant isolation guarantees.
+ *
+ * Lazy: only fetches when the parent workspace row is expanded.
+ * Auto-refreshes every 20s while visible so member/radio mutations
+ * elsewhere in this session appear without a manual refresh.
+ */
+function WorkspaceAuditLogPanel({
+  workspaceId,
+  expanded,
+}: {
+  workspaceId: number;
+  expanded: boolean;
+}) {
+  const [entries, setEntries] = React.useState<WorkspaceAuditEntry[] | null>(null);
+  const [loading, setLoading] = React.useState(false);
+  const [collapsed, setCollapsed] = React.useState(true);
+
+  const reload = React.useCallback(async () => {
+    if (!expanded || collapsed) return;
+    setLoading(true);
+    const r = await meshDataService.workspaceAuditLog(workspaceId, { limit: 200 });
+    setLoading(false);
+    setEntries(r?.entries ?? []);
+  }, [workspaceId, expanded, collapsed]);
+
+  React.useEffect(() => { reload(); }, [reload]);
+  React.useEffect(() => {
+    if (!expanded || collapsed) return;
+    const t = setInterval(reload, 20_000);
+    return () => clearInterval(t);
+  }, [reload, expanded, collapsed]);
+
+  if (!expanded) return null;
+
+  return (
+    <div className="pt-3 border-t border-brand-line/40">
+      <button
+        onClick={() => setCollapsed(c => !c)}
+        className="flex items-center gap-2 text-[10px] uppercase font-bold tracking-widest text-brand-muted hover:text-brand-ink transition-colors w-full"
+      >
+        <History size={11} />
+        Audit Log
+        <ChevronDown
+          size={11}
+          className={cn('transition-transform', collapsed ? '-rotate-90' : 'rotate-0')}
+        />
+        <span className="ml-auto text-brand-muted/60 normal-case tracking-normal font-normal">
+          {entries === null ? '' : `${entries.length} entr${entries.length === 1 ? 'y' : 'ies'}`}
+          {loading && <RefreshCw size={9} className="ml-1 animate-spin inline" />}
+        </span>
+      </button>
+
+      {!collapsed && (
+        <div className="mt-2 max-h-64 overflow-y-auto rounded border border-brand-line/60 bg-brand-bg/40">
+          {entries === null || entries.length === 0 ? (
+            <div className="text-[10px] text-brand-muted p-3 text-center">
+              {loading ? 'Loading…' : entries === null ? '—' : 'No audit entries yet.'}
+            </div>
+          ) : (
+            <table className="w-full text-[10px]">
+              <thead className="sticky top-0 bg-brand-bg/95 backdrop-blur border-b border-brand-line/60">
+                <tr>
+                  <th className="text-left px-2 py-1 font-bold uppercase tracking-widest text-brand-muted">When</th>
+                  <th className="text-left px-2 py-1 font-bold uppercase tracking-widest text-brand-muted">Actor</th>
+                  <th className="text-left px-2 py-1 font-bold uppercase tracking-widest text-brand-muted">Action</th>
+                  <th className="text-left px-2 py-1 font-bold uppercase tracking-widest text-brand-muted">Target / Details</th>
+                </tr>
+              </thead>
+              <tbody>
+                {entries.map(e => (
+                  <tr key={e.id} className="border-b border-brand-line/30 hover:bg-brand-line/20">
+                    <td className="px-2 py-1 mono-text text-brand-muted whitespace-nowrap">
+                      {new Date(e.createdAt).toLocaleString([], {
+                        month: 'numeric', day: 'numeric',
+                        hour: 'numeric', minute: '2-digit',
+                      })}
+                    </td>
+                    <td className="px-2 py-1 mono-text">
+                      {e.actorUsername}
+                    </td>
+                    <td className="px-2 py-1">
+                      <ActionBadge action={e.action} />
+                    </td>
+                    <td className="px-2 py-1 text-brand-muted">
+                      {formatEntryDetails(e)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Turn an action string like 'workspace.member.add' into a compact
+ *  badge with contextual color. */
+function ActionBadge({ action }: { action: string }) {
+  const tone = action.includes('.delete') || action.includes('.remove')
+    ? 'error'
+    : action.includes('.create') || action.includes('.add')
+    ? 'accent'
+    : action.includes('.rename') || action.includes('.change') || action.includes('.set') || action.includes('.assign')
+    ? 'warning'
+    : 'muted';
+  const cls =
+    tone === 'error'   ? 'bg-brand-error/15 text-brand-error border-brand-error/30'
+    : tone === 'accent'  ? 'bg-brand-accent/15 text-brand-accent border-brand-accent/30'
+    : tone === 'warning' ? 'bg-brand-warning/15 text-brand-warning border-brand-warning/30'
+    : 'bg-brand-line/40 text-brand-muted border-brand-line';
+  return (
+    <span className={cn(
+      'inline-block text-[9px] font-bold uppercase tracking-widest px-1.5 py-0.5 rounded border mono-text',
+      cls,
+    )}>
+      {action.replace(/^workspace\./, '')}
+    </span>
+  );
+}
+
+/** Compact human-readable rendering of the entry's target + details
+ *  columns. Avoids showing raw JSON in the table — that's tucked
+ *  into a title tooltip for anyone who wants the raw form. */
+function formatEntryDetails(e: WorkspaceAuditEntry): string {
+  const parts: string[] = [];
+  if (e.targetType && e.targetId) {
+    parts.push(`${e.targetType}=${e.targetId}`);
+  }
+  const d = e.details as Record<string, unknown> | null;
+  if (d && typeof d === 'object') {
+    if ('fromName' in d && 'toName' in d) parts.push(`"${d.fromName}" → "${d.toName}"`);
+    if ('name' in d && typeof d.name === 'string' && !('fromName' in d)) parts.push(`name="${d.name}"`);
+    if ('fromWorkspaceId' in d && d.fromWorkspaceId !== null) parts.push(`from ws#${d.fromWorkspaceId}`);
+    if ('toWorkspaceId' in d) parts.push(`to ws#${d.toWorkspaceId}`);
+    if ('migratedRadiosTo' in d && d.migratedRadiosTo !== null) parts.push(`radios → ws#${d.migratedRadiosTo}`);
+    if ('previousPrimary' in d && d.previousPrimary !== undefined) parts.push(`was="${d.previousPrimary ?? '<none>'}"`);
+  }
+  return parts.join(' · ') || '—';
 }
 
 
