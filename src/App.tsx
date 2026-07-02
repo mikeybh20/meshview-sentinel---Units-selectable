@@ -1326,7 +1326,7 @@ export default function App() {
                 exit={{ opacity: 0, scale: 0.98 }}
                 className="h-full overflow-hidden"
               >
-                <MeshOpsView />
+                <MeshOpsView nodes={nodes} neighborInfo={neighborInfo} />
               </motion.div>
             )}
 
