@@ -19,16 +19,25 @@
 
 ## Theme
 
-> **Field-ready EmComm, opened.**
+> **Field-ready EmComm, opened — with intelligence and services
+> the official apps don't offer.**
 >
 > Sentinel runs cleanly on a Raspberry Pi 4/5 or a laptop, deploys
 > reliably enough that an operator trusts it during a real storm,
 > hands a Frederick-area SKYWARN spotter a `:spot` command that
-> produces NWS-shaped Local Storm Reports, and ships under a license
-> that lets amateur groups install it free while commercial forks
-> owe royalty back to the co-authors.
+> produces NWS-shaped Local Storm Reports, gives the operator
+> mesh-ops visibility (traffic analytics, connectivity matrix,
+> health signals) the official Meshtastic apps don't surface,
+> anchors non-prepper subscribers with `:tide` / `:sun` / `:mdot`
+> content services beyond weather, and ships under a license that
+> lets amateur groups install it free while commercial forks owe
+> royalty back to the co-authors.
 
-One coherent story for a release, not a basket of bolt-ons.
+One coherent story for a release, not a basket of bolt-ons —
+though a wider one now that mesh-ops and subscriber services are
+in v3.0. If scope pressure hits, the stretch items in each
+inclusion (called out inline) are the release valves; the MVP
+subsets stay in.
 
 ---
 
@@ -147,6 +156,102 @@ real radio or use the playground.
 - **Co-author agreement** — between Michael Broadwater and Kit;
   70/30 split on net commercial license revenue; both parties
   retain joint copyright ownership.
+
+### 11. Mesh ops intelligence
+Operator-side visibility into what the mesh is actually doing —
+information the official Meshtastic apps don't surface, that a
+regional operator managing a Frederick-area mesh needs to keep the
+network healthy.
+
+- **Per-channel traffic analytics** — packet counts / airtime /
+  drop-rate breakdown by channel, per hour and per day. Answers
+  "which channels are actually being used?" and catches a channel
+  that a badly-configured node has flooded.
+- **Route quality scoring** — per-hop success rate scored across
+  observed traceroute + ACK history. Assigns each observed link a
+  0-100 quality score derived from delivery ratio, SNR spread, and
+  hop consistency over the last 24h. Surfaces which paths the
+  mesh actually depends on and which ones are marginal.
+- **"Who can hear whom" matrix** — grid view where rows and
+  columns are nodes and cells are colored by observed direct-hop
+  link presence (from NeighborInfo + hop-0 packet observations).
+  Instantly shows the mesh's actual connectivity graph and where
+  a new router node would break isolation between clusters.
+- **Antenna orientation suggestions** — per-link, computes whether
+  SNR asymmetry (A hears B strong, B hears A weak) points to
+  antenna gain / polarization issues at one end. Surfaces "node X
+  probably needs to rotate its antenna" as an actionable hint,
+  not just a stat.
+- **Firmware update reminders** — per-node tracked firmware
+  version vs. current stable release from
+  github.com/meshtastic/firmware. Flags nodes running >2 minor
+  versions behind with an operator-visible reminder.
+- **Configuration drift detection** — snapshot each node's LoRa /
+  Radio / Position / Power config on first contact + on each
+  ModuleConfig update, and flag when a node's TX power, region,
+  or hop limit is inconsistent with the mesh consensus. Prevents
+  a mis-flashed node from disrupting the mesh before it broadcasts
+  a packet the operator has to chase down.
+
+Data plane: new `mesh_ops` schema (channel_traffic, link_quality,
+node_config_snapshots, firmware_current_lookup). Dashboard: new
+"Mesh Ops" tab with three sub-panels (Analytics, Connectivity,
+Health) so this doesn't collide with the operational Radios tab.
+
+**Scope discipline:** the analytics + connectivity matrix are v3.0
+MVP; the antenna-orientation and config-drift heuristics are
+v3.0 stretch — they involve real signal processing and can slip
+to v3.0.x if scope pressure hits. Firmware reminder ships v3.0
+(mechanical).
+
+### 12. Subscriber services / BBS content
+Content services beyond weather so non-prepper subscribers have a
+reason to be on the mesh day-to-day. Anchor: "why am I on the mesh
+today?" Fits alongside the existing `:weather` / `:mail` subsystems
+— each service is a new BBS command with the same one-packet
+reply discipline.
+
+- **`:tide` — tide tables.** NOAA CO-OPS API. Defaults to nearest
+  station by operator's home ZIP, override with a station ID.
+  Compact one-packet reply: next high/low with time + height.
+  Coastal Maryland + Chesapeake Bay are the primary AOI.
+- **`:pota` — POTA (Parks On The Air) spot lookup.** Queries
+  api.pota.app for currently active park activations. Filters by
+  band / mode / distance-from-operator. Reply: "AA1AA @ K-1234
+  Cunningham Falls, 20m SSB, 15min ago." Helps licensed HAMs
+  chase activations without an internet-connected radio.
+- **`:sota` — SOTA (Summits On The Air) spot lookup.** Same shape
+  as `:pota` against api2.sota.org.uk.
+- **`:mdot` — MDOT (Maryland DoT) traffic.** Regional incidents
+  from chart.maryland.gov + trafficinfo.md.gov. Filters by county
+  (default: operator's home county). Reply: "I-70 EB @ MP 62 —
+  crash, right lane blocked, delay 15min."
+- **`:news` — light news digest.** RSS-aggregated compact
+  headlines from a small operator-configurable feed list (default:
+  NWS regional, USGS earthquakes, local news feeds). NOT a general
+  news reader — deliberately narrow.
+- **`:sun` — daily astronomy / sun-times.** Sunrise / sunset /
+  civil twilight / moon phase / ISS pass predictions for
+  operator's coordinates. Reply: "Sunrise 6:12, Sunset 20:34,
+  Moon 78% waxing gibbous, ISS pass 21:04 NW→SE."
+
+Each service:
+- Ships with a sensible default AOI (operator's home ZIP or
+  county) and a `<command> <override>` form for one-off queries.
+- Has a `<command> help` / `<command> ?` catalog same shape as
+  `:mail help` and `:spot help`.
+- Uses HTTP client with 30s timeout + graceful "service unavailable"
+  reply on upstream failure — no half-broken partial data.
+- All services are opt-in per subscriber (registration flow
+  parallels `:weather subscribe`) so a subscriber can pick which
+  digests they want pushed vs. pulled.
+
+**Scope discipline:** `:tide`, `:sun`, and `:mdot` are v3.0 MVP —
+they solve real Maryland-area daily-use cases and their upstream
+APIs are stable. `:pota` and `:sota` are v3.0 stretch — the API
+shape is well-known but scope discipline for spot-filtering can
+grow. `:news` is v3.0.x — the aggregation logic + per-subscriber
+feed selection UI is bigger than it looks.
 
 ---
 
