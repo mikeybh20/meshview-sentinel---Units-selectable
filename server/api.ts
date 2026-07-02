@@ -21,6 +21,7 @@ import { consoleCapture } from './consoleCapture.js';
 // dashboard's Console view.
 consoleCapture.install();
 import { WeatherAlertPoller } from './weatherAlertPoller.js';
+import { tideService } from './tideService.js';
 // v2.0 multi-radio. Importing for side effect: BridgeManager wires its
 // auto-registration listeners onto meshBridge at module load. The exported
 // singleton is also used by the /api/mesh/radios endpoint below.
@@ -47,6 +48,13 @@ bridgeManager.setBbsConfig(bbsConfig);
 // cycle so it picks up zip / enabled changes without restarting.
 const weatherPoller = new WeatherAlertPoller(bridgeManager, () => bbsConfig);
 weatherPoller.start();
+
+// v3.0 Subscriber Services: tide-prediction scheduler. Refreshes the
+// operator's default station's NOAA predictions at 00:00, 06:00, 12:00,
+// 18:00 server-local. See server/tideService.ts refresh-policy block.
+// Bootstrap fetch happens ~5s after this call so subscribers hitting
+// :tide immediately post-boot don't see an empty cache.
+tideService.startScheduler(() => bbsConfig.defaultTideStation);
 
 dotenv.config();
 
@@ -4599,6 +4607,7 @@ app.post('/api/mesh/bbs/node', requireAdmin, (req, res) => {
 app.post('/api/mesh/bbs/config', (req, res) => {
   try {
     const oldZip = bbsConfig.homeZipCode;
+    const oldTideStation = bbsConfig.defaultTideStation;
     bbsConfig = normalizeBbsConfig(req.body ?? {});
     saveBbsConfig(bbsConfig);
     // v2.0: fan the config out to every per-radio BbsService.
@@ -4608,6 +4617,17 @@ app.post('/api/mesh/bbs/config', (req, res) => {
     if (bbsConfig.homeZipCode && bbsConfig.homeZipCode !== oldZip) {
       weatherPoller.pollNow().catch(err =>
         console.warn('[BBSConfig] immediate weather poll failed:', err?.message)
+      );
+    }
+    // v3.0: default tide station changed (or just got set) → refresh
+    // the new station's predictions right away instead of waiting for
+    // the next scheduled 00:00/06:00/12:00/18:00 tick. Otherwise a
+    // subscriber DMing :tide in the window between the config change
+    // and the next tick would see stale data (or no data if it's the
+    // first time a station's been set).
+    if (bbsConfig.defaultTideStation && bbsConfig.defaultTideStation !== oldTideStation) {
+      tideService.refreshDefaultStationNow().catch(err =>
+        console.warn('[BBSConfig] immediate tide refresh failed:', err?.message)
       );
     }
     // Fan out to all SSE clients so other dashboard tabs re-render their

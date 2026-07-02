@@ -309,7 +309,15 @@ Operator configures a **default station** in Settings → BBS (\`defaultTideStat
 
 Full station index: [tidesandcurrents.noaa.gov/stations.html](https://tidesandcurrents.noaa.gov/stations.html).
 
-- Predictions cached 15 min per station server-side (NOAA computes these years in advance; the cache is defensive against burst queries during a fishing tournament, not because the data drifts).
+**Cache policy** (NOAA computes these predictions years in advance, so refreshing every 15 minutes would be wasteful):
+
+- **Default station:** refreshed on a fixed daily schedule at **00:00, 06:00, 12:00, 18:00** server-local time. If a scheduled fetch fails (upstream down, network glitch), retries every **20 min** until success — or until the next scheduled tick, whichever comes first (a scheduled tick supersedes a pending retry).
+- **Non-default station** (subscriber types \`:tide 8632200\` for some other station): fetched on demand, cached for **6h**. Aligns the on-demand cache with the scheduled cadence — a station queried at 10am gets re-fetched at ~4pm if queried again.
+- **Bootstrap:** ~5s after server start, the default station is fetched once so subscribers hitting \`:tide\` immediately post-boot see data instead of an empty cache.
+- **Config-change refresh:** setting a new default station in Settings triggers an immediate refresh instead of waiting for the next scheduled tick.
+
+Net result: at most 4 NOAA calls/day/station for the default (+ retries on failure), plus a handful for whatever ad-hoc stations subscribers ask about. Versus the ~96/day/station ceiling a naive 15-min TTL would allow.
+
 - Reply auto-truncates trailing events if the packet would exceed 200 chars.
 - On upstream failure the reply is a user-friendly "try again later" fallback, not a silent BBS.
 
