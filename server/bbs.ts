@@ -28,6 +28,7 @@ import { meshDb as meshDbFactory, type MeshDatabase } from './database.js';
 import type { MeshtasticSerialBridge, MeshNode } from './meshtasticSerial.js';
 import { type BbsConfig, defaultBbsConfig } from './bbsConfig.js';
 import { weatherService } from './weather.js';
+import { tideService } from './tideService.js';
 
 const meshDb: MeshDatabase = meshDbFactory();
 
@@ -116,7 +117,7 @@ function canonicalizeWeatherAlias(text: string, cfg: BbsConfig): string {
   const lower = text.toLowerCase();
   for (const alias of WEATHER_ALIASES) {
     if (alias === cfg.weatherTrigger) continue;
-    if (alias === cfg.mailTrigger || alias === cfg.cmdTrigger || alias === cfg.spotTrigger) continue;
+    if (alias === cfg.mailTrigger || alias === cfg.cmdTrigger || alias === cfg.spotTrigger || alias === cfg.tideTrigger) continue;
     if (lower === alias) return cfg.weatherTrigger;
     if (lower.startsWith(alias + ' ')) return cfg.weatherTrigger + text.slice(alias.length);
   }
@@ -269,7 +270,7 @@ export class BbsService {
     const localNodeId = (this.bridge as any).localNodeId as string | null;
     if (localNodeId && fromId === localNodeId) return false;
     if (this.sessions.has(fromId) || this.weatherSessions.has(fromId)) return false;
-    const triggers = [this.config.mailTrigger, this.config.weatherTrigger, this.config.spotTrigger, this.config.cmdTrigger];
+    const triggers = [this.config.mailTrigger, this.config.weatherTrigger, this.config.spotTrigger, this.config.tideTrigger, this.config.cmdTrigger];
     await this.reply(fromId, `BBS node. Cmds: ${triggers.join(' ')}`, channelIndex);
     return true;
   }
@@ -290,13 +291,14 @@ export class BbsService {
     if (t.startsWith(this.config.mailTrigger)) return true;
     if (t.startsWith(this.config.weatherTrigger)) return true;
     if (t.startsWith(this.config.spotTrigger)) return true;
+    if (t.startsWith(this.config.tideTrigger)) return true;
     // v2.0 Beta 5 BBS (alias): :wx and :weather are interchangeable —
     // both prefixes hit the weather flow regardless of which one the
     // operator has saved as the configured trigger. See
     // WEATHER_ALIASES + canonicalizeWeatherAlias().
     for (const alias of WEATHER_ALIASES) {
       if (alias === this.config.weatherTrigger) continue;
-      if (alias === this.config.mailTrigger || alias === this.config.cmdTrigger || alias === this.config.spotTrigger) continue;
+      if (alias === this.config.mailTrigger || alias === this.config.cmdTrigger || alias === this.config.spotTrigger || alias === this.config.tideTrigger) continue;
       if (t === alias || t.startsWith(alias + ' ')) return true;
     }
     if (t === this.config.cmdTrigger) return true;
@@ -334,6 +336,7 @@ export class BbsService {
     const weatherTrigger = this.config.weatherTrigger;
     const cmdTrigger = this.config.cmdTrigger;
     const spotTrigger = this.config.spotTrigger;
+    const tideTrigger = this.config.tideTrigger;
 
     // Cancellation always wins, regardless of current state.
     if (/^(x|cancel|exit|quit)$/i.test(trimmed)) {
@@ -479,6 +482,21 @@ export class BbsService {
       return this.sendSpotHelp(fromId, channelIndex);
     }
 
+    // v3.0 Subscriber Services: :tide — NOAA tide predictions. Single-
+    // exchange (no session state). ":tide" alone uses the operator's
+    // configured default station; ":tide 8574680" queries a specific
+    // NOAA CO-OPS station id.
+    if (lower === tideTrigger) {
+      return this.handleTide(fromId, null, channelIndex);
+    }
+    if (lower === `${tideTrigger} help` || lower === `${tideTrigger} ?`) {
+      return this.sendTideHelp(fromId, channelIndex);
+    }
+    if (lower.startsWith(`${tideTrigger} `)) {
+      const arg = trimmed.slice(tideTrigger.length + 1).trim();
+      return this.handleTide(fromId, arg, channelIndex);
+    }
+
     // Weather trigger (no args) — return the command menu. v2.0 Beta 4:
     // replaces the old "send a ZIP" prompt flow with a help message so
     // subscribers can discover what's actually available. The prompt path
@@ -537,7 +555,7 @@ export class BbsService {
    *  tiny regardless of how many subsystems we add. Subscribers chase the
    *  subsystem's own `help` for usage (e.g., `:wx help`). */
   private async handleCmdIndex(fromId: string, channelIndex: number): Promise<boolean> {
-    const triggers = [this.config.mailTrigger, this.config.weatherTrigger, this.config.spotTrigger, this.config.cmdTrigger];
+    const triggers = [this.config.mailTrigger, this.config.weatherTrigger, this.config.spotTrigger, this.config.tideTrigger, this.config.cmdTrigger];
     await this.reply(fromId, `Cmds: ${triggers.join(' ')}`, channelIndex);
     return true;
   }
@@ -919,6 +937,88 @@ export class BbsService {
 
     console.log(`[BBS] SPOT logged id=${id} reporter=${senderShortName} (${fromId}) event="${session.eventType}"${magStr} loc=${session.lat ?? 'null'},${session.lng ?? 'null'} remarks="${session.remarks ?? ''}"`);
     await this.reply(fromId, `SPOT logged #${id}. Thanks — stay safe.`, channelIndex);
+    return true;
+  }
+
+  // -------------------------------------------------------------------
+  // v3.0 Subscriber Services — :tide (NOAA CO-OPS predictions)
+  // -------------------------------------------------------------------
+
+  /**
+   * Single-exchange :tide handler. Resolves the target station in
+   * this precedence:
+   *
+   *   1. Explicit arg — `:tide 8574680`. Must be 7 digits.
+   *   2. Operator's configured default station (bbsConfig
+   *      `defaultTideStation`). Empty falls through to (3).
+   *   3. Error reply: subscriber told to specify a station id.
+   *
+   * On success replies with the ≤200-char tide summary from
+   * tideService.formatTideSummary(). On upstream failure replies with
+   * a user-friendly fallback so the subscriber isn't left staring at
+   * a silent BBS.
+   */
+  private async handleTide(
+    fromId: string,
+    arg: string | null,
+    channelIndex: number,
+  ): Promise<boolean> {
+    let stationId = '';
+    if (arg && arg.trim()) {
+      const cleaned = arg.trim();
+      if (!/^\d{7}$/.test(cleaned)) {
+        await this.reply(
+          fromId,
+          `Station id must be 7 digits (e.g. 8574680 Baltimore). ${this.config.tideTrigger} ? for help.`,
+          channelIndex,
+        );
+        return true;
+      }
+      stationId = cleaned;
+    } else {
+      stationId = this.config.defaultTideStation;
+      if (!stationId) {
+        await this.reply(
+          fromId,
+          `No default tide station configured. Try ${this.config.tideTrigger} <7-digit-station-id>. Common Chesapeake: 8574680 Baltimore, 8575512 Annapolis.`,
+          channelIndex,
+        );
+        return true;
+      }
+    }
+
+    try {
+      // Parallel fetch — predictions are the payload, metadata is
+      // best-effort for pretty labels. Slow metadata shouldn't gate
+      // the reply, so we race with a short timeout at the tideService
+      // layer (returns null on failure).
+      const [tides, meta] = await Promise.all([
+        tideService.getNextTides(stationId, 4),
+        tideService.getStationMeta(stationId),
+      ]);
+      if (tides.length === 0) {
+        await this.reply(fromId, `No upcoming tides returned for station ${stationId}. Try again later.`, channelIndex);
+        return true;
+      }
+      const msg = tideService.formatTideSummary(stationId, tides, meta);
+      await this.reply(fromId, msg, channelIndex);
+    } catch (err: any) {
+      console.warn(`[BBS] tide lookup for ${stationId} failed:`, err?.message);
+      await this.reply(fromId, `Tide lookup failed for ${stationId}. Try again later.`, channelIndex);
+    }
+    return true;
+  }
+
+  /** One-line command catalog for :tide. */
+  private async sendTideHelp(fromId: string, channelIndex: number): Promise<boolean> {
+    const t = this.config.tideTrigger;
+    const d = this.config.defaultTideStation;
+    const suffix = d ? ` | default: ${d}` : ` | default: <not set>`;
+    const msg =
+      `${t} = next tides at default station | ` +
+      `${t} <7-digit> = specific station | ` +
+      `${t} ? = help${suffix}`;
+    await this.reply(fromId, msg, channelIndex);
     return true;
   }
 

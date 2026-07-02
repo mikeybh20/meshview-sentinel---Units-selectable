@@ -42,6 +42,23 @@ export interface BbsConfig {
    *  Local Storm Report row (see storm_reports table). Must start with
    *  `:`. Default ":spot". */
   spotTrigger: string;
+  /** v3.0 Subscriber Services — trigger keyword for the tide-prediction
+   *  lookup. DMing this returns the next few high/low tides for the
+   *  operator's configured default station, or a specified station:
+   *    :tide            → next tides for default station
+   *    :tide 8574680    → next tides for the specified NOAA station id
+   *    :tide help / ?   → command catalog
+   *  Empty defaultTideStation disables the no-arg form (subscribers
+   *  can still query a station explicitly). Must start with `:`.
+   *  Default ":tide". */
+  tideTrigger: string;
+  /** v3.0 Subscriber Services — NOAA CO-OPS station id used when a
+   *  subscriber DMs `:tide` with no argument. Seven digits (empty
+   *  disables the default-station form). Chesapeake/Maryland
+   *  operators typically pick one of: 8574680 Baltimore, 8575512
+   *  Annapolis, 8577330 Solomons Island, 8638863 Chesapeake Bay
+   *  Bridge Tunnel, 8632200 Kiptopeke VA. */
+  defaultTideStation: string;
   /** Hard cap on mail body length, in chars. Meshtastic packet payload tops
    *  out at ~228 bytes after framing; 200 leaves headroom for protocol overhead. */
   bodyMaxChars: number;
@@ -81,6 +98,8 @@ const DEFAULTS: BbsConfig = {
   weatherTrigger: ':wx',
   cmdTrigger: ':cmd',
   spotTrigger: ':spot',
+  tideTrigger: ':tide',
+  defaultTideStation: '',
   bodyMaxChars: 200,
   retentionDays: 30,
   replyPaceMs: 2_000,
@@ -108,6 +127,12 @@ export function normalizeBbsConfig(partial: Partial<BbsConfig>): BbsConfig {
   merged.weatherTrigger = sanitizeTrigger(merged.weatherTrigger, DEFAULTS.weatherTrigger);
   merged.cmdTrigger = sanitizeTrigger(merged.cmdTrigger, DEFAULTS.cmdTrigger);
   merged.spotTrigger = sanitizeTrigger(merged.spotTrigger, DEFAULTS.spotTrigger);
+  merged.tideTrigger = sanitizeTrigger(merged.tideTrigger, DEFAULTS.tideTrigger);
+  // Empty is valid (disables the no-arg default-station form); otherwise
+  // must be 7 digits. Bad input falls back to empty rather than to a
+  // default station, so we don't accidentally show Baltimore tides to
+  // an operator who typo'd a Californian station id.
+  merged.defaultTideStation = /^\d{7}$/.test(String(merged.defaultTideStation ?? '')) ? String(merged.defaultTideStation) : '';
 
   // Prevent identical triggers (would route everything to whichever check
   // runs first). Collisions snap the colliding trigger back to its default.
@@ -123,6 +148,14 @@ export function normalizeBbsConfig(partial: Partial<BbsConfig>): BbsConfig {
     merged.spotTrigger === merged.cmdTrigger
   ) {
     merged.spotTrigger = DEFAULTS.spotTrigger;
+  }
+  if (
+    merged.tideTrigger === merged.mailTrigger ||
+    merged.tideTrigger === merged.weatherTrigger ||
+    merged.tideTrigger === merged.cmdTrigger ||
+    merged.tideTrigger === merged.spotTrigger
+  ) {
+    merged.tideTrigger = DEFAULTS.tideTrigger;
   }
 
   merged.enabled = !!merged.enabled;
