@@ -92,14 +92,27 @@ in v3.0, but **ship it disabled** behind a feature flag
 the operator to enter a verified spotter ID and complete a one-time
 eligibility check. Actual flag-flip + cert workflow ships in v3.1.
 
-### 4. NWS feed depth
-The existing weather alert poller covers issued alerts. v3.0 adds:
-- Active watches/warnings rendered as map polygons (not just bbox
-  approximations).
+### 4. NWS feed depth — **MVP shipped**
+The existing weather alert poller covers issued alerts. v3.0 expands
+the feed's presentation depth on the map:
+
+- **Active watches/warnings rendered as map polygons.** GeoJSON
+  geometry pulled from NWS alerts/active, projected via pigeon-maps
+  latLngToPixel into severity-tinted SVG overlays under node
+  markers. Extreme/red · Severe/orange · Moderate/amber ·
+  Minor/sky-blue. Auto-refresh every 5 min. Alerts without
+  polygon geometry (UGC-zone-only) return `geometry: null` and
+  are skipped by the overlay. **Shipped.**
+
+Stretch items still open (v3.0.x / v3.1):
 - Mesoscale discussions surfaced as a "context" pane on the Storm
   Reports tab.
 - Radar overlay from Iowa Environmental Mesonet WMS.
 - Hurricane track overlays during named-storm activity.
+
+MVP scope was the polygon rendering — the highest-value visible
+piece. Radar + mesoscale + hurricane tracks are each substantial
+follow-ups worth their own slice.
 
 ### 5. Field-deployment polish
 - **Offline-first map tiles** — pre-cache an AOI (area of interest) so

@@ -5,7 +5,7 @@
  * interface identical to the simulator, so the app can switch between
  * real hardware and simulated data seamlessly.
  */
-import { Node, Message, RadioEvent, Channel, Waypoint, TraceResult, NeighborInfoSnapshot, StoreForwardRouter, LocalModuleConfigSnapshot, Group, StormReport, ChannelTrafficRow, ChannelTrafficTotal, FirmwareStatusResponse } from '../types';
+import { Node, Message, RadioEvent, Channel, Waypoint, TraceResult, NeighborInfoSnapshot, StoreForwardRouter, LocalModuleConfigSnapshot, Group, StormReport, ChannelTrafficRow, ChannelTrafficTotal, FirmwareStatusResponse, ActiveAlertsResponse } from '../types';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
@@ -524,6 +524,20 @@ export class MeshDataService {
       if (!res.ok) return null;
       const body = await res.json();
       return Array.isArray(body?.rows) ? body.rows as ChannelTrafficRow[] : null;
+    } catch { return null; }
+  }
+
+  /**
+   * v3.0 NWS feed depth — fetch active NWS weather alerts with
+   * polygon geometry for the operator's home ZIP (or a specified
+   * override).
+   */
+  async activeWeatherAlerts(zip?: string | null): Promise<ActiveAlertsResponse | null> {
+    try {
+      const qs = zip ? `?zip=${encodeURIComponent(zip)}` : '';
+      const res = await fetch(`${API_BASE}/api/mesh/weather/active-alerts${qs}`);
+      if (!res.ok) return null;
+      return await res.json();
     } catch { return null; }
   }
 

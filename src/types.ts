@@ -260,6 +260,32 @@ export interface FirmwareStatusResponse {
   radios: FirmwareRadioStatus[];
 }
 
+/**
+ * v3.0 NWS feed depth — active weather alert with optional polygon
+ * geometry. Rendered on the map as a translucent severity-tinted
+ * overlay when geometry is present; skipped otherwise.
+ */
+export type NwsAlertGeometry =
+  | { type: 'Polygon'; coordinates: number[][][] }        // rings[]
+  | { type: 'MultiPolygon'; coordinates: number[][][][] }; // polygons[rings[]]
+
+export interface NwsAlertWithGeometry {
+  id: string;
+  event: string;
+  severity: string;
+  headline: string;
+  effective: string;
+  expires: string;
+  geometry: NwsAlertGeometry | null;
+}
+
+export interface ActiveAlertsResponse {
+  alerts: NwsAlertWithGeometry[];
+  zip: string | null;
+  fetchedAt?: number;
+  note?: string;
+}
+
 export interface Waypoint {
   id: number;
   lat: number;

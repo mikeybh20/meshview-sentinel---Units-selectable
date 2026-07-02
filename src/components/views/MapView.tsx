@@ -4,6 +4,7 @@ import { Map, ZoomControl, Overlay } from "pigeon-maps";
 
 import { Node, Message, Group, UnitSystem, Waypoint, TraceResult, NeighborInfoSnapshot, StoreForwardRouter } from '../../types';
 import { MeshLinks } from '../ui/MeshLinks';
+import { WeatherAlertOverlay } from '../ui/WeatherAlertOverlay';
 import { TraceLinks } from '../ui/TraceLinks';
 // WaypointEditorModal pulls in `emoji-picker-react` (~140 KB). We lazy-load
 // the modal so that bundle cost is paid only when the operator actually drops
@@ -966,6 +967,12 @@ export function MapView({
           }}
         >
           <ZoomControl />
+
+          {/* v3.0 NWS feed depth — active weather-alert polygons
+              rendered UNDER the node markers so severity-tinted
+              regions provide backdrop context without hiding
+              the mesh state on top. */}
+          <WeatherAlertOverlay />
 
           {/* Signal Layer (Actual Link Visualization) */}
           <MeshLinks nodes={nodes} />

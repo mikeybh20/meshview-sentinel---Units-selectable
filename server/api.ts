@@ -21,6 +21,7 @@ import { consoleCapture } from './consoleCapture.js';
 // dashboard's Console view.
 consoleCapture.install();
 import { WeatherAlertPoller } from './weatherAlertPoller.js';
+import { weatherService } from './weather.js';
 import { tideService } from './tideService.js';
 import { firmwareService, parseVersion, classifyBehind, type BehindClassification } from './firmwareService.js';
 // v2.0 multi-radio. Importing for side effect: BridgeManager wires its
@@ -4658,6 +4659,32 @@ app.post('/api/mesh/bbs/weather/test-forecast', async (_req, res) => {
   const r = await weatherPoller.sendDailyForecastNow();
   if (!r.ok) return res.status(400).json({ error: (r as { ok: false; error: string }).error });
   return res.json(r);
+});
+
+/** v3.0 NWS feed depth — GET /api/mesh/weather/active-alerts
+ *  Returns currently-active NWS alerts for the operator's home ZIP
+ *  (or a `?zip=` override) with GeoJSON polygon geometry when NWS
+ *  provides one. The client renders these as translucent overlays
+ *  on the map so an operator can see WHERE the alert applies, not
+ *  just that one exists. Alerts without polygons (e.g. UGC-zone-
+ *  only marine watches) are returned with geometry=null; the
+ *  overlay skips those. */
+app.get('/api/mesh/weather/active-alerts', async (req, res) => {
+  const zipOverride = typeof req.query.zip === 'string' && /^\d{5}$/.test(req.query.zip) ? req.query.zip : null;
+  const zip = zipOverride ?? bbsConfig.homeZipCode;
+  if (!zip) {
+    return res.json({ alerts: [], zip: null, note: 'No home ZIP configured and no ?zip= override.' });
+  }
+  try {
+    const alerts = await weatherService.getActiveAlerts(zip);
+    return res.json({
+      alerts,
+      zip,
+      fetchedAt: Date.now(),
+    });
+  } catch (err: any) {
+    return res.status(502).json({ error: err?.message || 'NWS fetch failed', zip });
+  }
 });
 
 /** GET /api/mesh/bbs/inbox?nodeId=<hex>&radio_id=<short>  — defaults to local node + all radios */

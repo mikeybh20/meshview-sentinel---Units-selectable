@@ -48,7 +48,24 @@ export interface NwsAlert {
   headline: string;      // Full headline (long)
   effective: string;     // ISO timestamp
   expires: string;       // ISO timestamp
+  /** v3.0: GeoJSON geometry of the alert area, when NWS provides one.
+   *  Alerts scoped by UGC zone (many marine / winter watches) come
+   *  back without geometry — we surface those with `geometry: null`
+   *  so the map overlay knows to skip them. Type is 'Polygon' or
+   *  'MultiPolygon' per NWS's schema.
+   *
+   *  Coordinates are GeoJSON [lng, lat] pairs; the client polygon
+   *  overlay flips them to [lat, lng] for map rendering. */
+  geometry: NwsAlertGeometry | null;
 }
+
+/** GeoJSON-shaped subset of the NWS alert geometry. NWS uses standard
+ *  GeoJSON with [lng, lat] axis order and can return either a single
+ *  Polygon (one outer ring, optional inner rings) or a MultiPolygon
+ *  (multiple disjoint polygons — a rare case for weather alerts). */
+export type NwsAlertGeometry =
+  | { type: 'Polygon'; coordinates: number[][][] }        // rings[]
+  | { type: 'MultiPolygon'; coordinates: number[][][][] }; // polygons[rings[]]
 
 class WeatherService {
   private zipCache = new Map<string, ZipLocation>();
@@ -201,6 +218,7 @@ class WeatherService {
     const data = await res.json() as {
       features?: Array<{
         id: string;
+        geometry?: NwsAlertGeometry | null;
         properties?: {
           id?: string;
           event?: string;
@@ -218,6 +236,13 @@ class WeatherService {
       headline: f.properties?.headline || '',
       effective: f.properties?.effective || '',
       expires: f.properties?.expires || '',
+      // v3.0: capture the polygon so the map overlay can render it.
+      // Guard against malformed / non-polygon geometry types
+      // (NWS occasionally returns Point for zone-only alerts we
+      // shouldn't try to render as a polygon).
+      geometry: (f.geometry && (f.geometry.type === 'Polygon' || f.geometry.type === 'MultiPolygon'))
+        ? f.geometry
+        : null,
     }));
   }
 
