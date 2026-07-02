@@ -321,6 +321,41 @@ Net result: at most 4 NOAA calls/day/station for the default (+ retries on failu
 - Reply auto-truncates trailing events if the packet would exceed 200 chars.
 - On upstream failure the reply is a user-friendly "try again later" fallback, not a silent BBS.
 
+### Sun & Moon Almanac (\`:sun\`) — **v3.0**
+
+Offline sun/moon calculations — sunrise, sunset, civil twilight, moon phase, moon illumination, moon rise/set. No internet needed for the math; a ZIP lookup on first use hits zippopotam.us (cached process-lifetime).
+
+Set the default location in Settings → BBS → **Subscriber Services** as a 5-digit US ZIP. Subscribers can also send explicit overrides.
+
+\`\`\`text
+DM ":sun"                    → "Sun @ Frederick MD: rise 5:46AM set 8:40PM (14.9h). Civil twi 5:14AM/9:12PM. Moon 96% wan gib, rise 9:45PM set 6:12AM."
+DM ":sun 21701"              → same, for a specific ZIP
+DM ":sun 39.42,-77.41"       → same, for explicit coords
+DM ":sun ?"                  → command catalog + current default ZIP
+\`\`\`
+
+- Compute uses [SunCalc](https://github.com/mourner/suncalc) — standard astronomical formulas (Meeus), accurate to seconds for civil use.
+- Times shown are in the **server's local timezone** (set via \`TZ\` in docker-compose). For an operator in Maryland this matches subscriber expectations for local queries; cross-timezone queries show the event's time in the server's zone which is a reasonable "when will this happen from your perspective" reading.
+- No network calls in the happy path — subscribers get answers even when the operator's WAN is down (field-deployment friendly).
+
+### Maryland Traffic — CHART (\`:mdot\`) — **v3.0**
+
+Regional traffic incidents from Maryland's CHART (Coordinated Highways Action Response Team) system. Live incidents, updated by MDOT's operations centers.
+
+Set the default county in Settings → BBS → **Subscriber Services** (dropdown of all 24 MD jurisdictions). Subscribers can also send overrides.
+
+\`\`\`text
+DM ":mdot"                   → "MDOT Frederick (3): US 15 NB @ Mountville — Signal Green Arrow Out; I-70 EB @ MP 62 crash; MD 85 @ Buckeystown lane closure"
+DM ":mdot Baltimore"         → filter to a specific county
+DM ":mdot all"               → statewide top-4 newest incidents
+DM ":mdot ?"                 → command catalog + current default county
+\`\`\`
+
+- Source: [CHART](https://chart.maryland.gov) — public JSON export, free, no auth required.
+- 5-minute server-side cache — subscribers hitting \`:mdot\` in a burst during rush hour all see the same cached snapshot.
+- CHART descriptions get compacted server-side (route + intersection + mile marker survive; verbose category prefixes and status bracketing are stripped) so 3-4 incidents fit in a 200-char packet.
+- Empty default county returns statewide top-N — useful for operators serving subscribers scattered across the state.
+
 ### Weather (\`:weather\` or \`:wx\`)
 
 On-demand US weather lookup against the National Weather Service + zippopotam.us. Both \`:weather\` and \`:wx\` are accepted everywhere — built-in aliases for each other regardless of which one the operator has saved as the configured Weather trigger in Settings → BBS. Returns ≤200-char compact summary:

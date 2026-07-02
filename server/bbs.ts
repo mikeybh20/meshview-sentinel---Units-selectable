@@ -26,9 +26,11 @@
 
 import { meshDb as meshDbFactory, type MeshDatabase } from './database.js';
 import type { MeshtasticSerialBridge, MeshNode } from './meshtasticSerial.js';
-import { type BbsConfig, defaultBbsConfig } from './bbsConfig.js';
+import { type BbsConfig, defaultBbsConfig, MD_COUNTIES } from './bbsConfig.js';
 import { weatherService } from './weather.js';
 import { tideService } from './tideService.js';
+import { sunService } from './sunService.js';
+import { mdotService } from './mdotService.js';
 
 const meshDb: MeshDatabase = meshDbFactory();
 
@@ -117,7 +119,7 @@ function canonicalizeWeatherAlias(text: string, cfg: BbsConfig): string {
   const lower = text.toLowerCase();
   for (const alias of WEATHER_ALIASES) {
     if (alias === cfg.weatherTrigger) continue;
-    if (alias === cfg.mailTrigger || alias === cfg.cmdTrigger || alias === cfg.spotTrigger || alias === cfg.tideTrigger) continue;
+    if (alias === cfg.mailTrigger || alias === cfg.cmdTrigger || alias === cfg.spotTrigger || alias === cfg.tideTrigger || alias === cfg.sunTrigger || alias === cfg.mdotTrigger) continue;
     if (lower === alias) return cfg.weatherTrigger;
     if (lower.startsWith(alias + ' ')) return cfg.weatherTrigger + text.slice(alias.length);
   }
@@ -270,7 +272,7 @@ export class BbsService {
     const localNodeId = (this.bridge as any).localNodeId as string | null;
     if (localNodeId && fromId === localNodeId) return false;
     if (this.sessions.has(fromId) || this.weatherSessions.has(fromId)) return false;
-    const triggers = [this.config.mailTrigger, this.config.weatherTrigger, this.config.spotTrigger, this.config.tideTrigger, this.config.cmdTrigger];
+    const triggers = [this.config.mailTrigger, this.config.weatherTrigger, this.config.spotTrigger, this.config.tideTrigger, this.config.sunTrigger, this.config.mdotTrigger, this.config.cmdTrigger];
     await this.reply(fromId, `BBS node. Cmds: ${triggers.join(' ')}`, channelIndex);
     return true;
   }
@@ -292,13 +294,15 @@ export class BbsService {
     if (t.startsWith(this.config.weatherTrigger)) return true;
     if (t.startsWith(this.config.spotTrigger)) return true;
     if (t.startsWith(this.config.tideTrigger)) return true;
+    if (t.startsWith(this.config.sunTrigger)) return true;
+    if (t.startsWith(this.config.mdotTrigger)) return true;
     // v2.0 Beta 5 BBS (alias): :wx and :weather are interchangeable —
     // both prefixes hit the weather flow regardless of which one the
     // operator has saved as the configured trigger. See
     // WEATHER_ALIASES + canonicalizeWeatherAlias().
     for (const alias of WEATHER_ALIASES) {
       if (alias === this.config.weatherTrigger) continue;
-      if (alias === this.config.mailTrigger || alias === this.config.cmdTrigger || alias === this.config.spotTrigger || alias === this.config.tideTrigger) continue;
+      if (alias === this.config.mailTrigger || alias === this.config.cmdTrigger || alias === this.config.spotTrigger || alias === this.config.tideTrigger || alias === this.config.sunTrigger || alias === this.config.mdotTrigger) continue;
       if (t === alias || t.startsWith(alias + ' ')) return true;
     }
     if (t === this.config.cmdTrigger) return true;
@@ -337,6 +341,8 @@ export class BbsService {
     const cmdTrigger = this.config.cmdTrigger;
     const spotTrigger = this.config.spotTrigger;
     const tideTrigger = this.config.tideTrigger;
+    const sunTrigger = this.config.sunTrigger;
+    const mdotTrigger = this.config.mdotTrigger;
 
     // Cancellation always wins, regardless of current state.
     if (/^(x|cancel|exit|quit)$/i.test(trimmed)) {
@@ -497,6 +503,37 @@ export class BbsService {
       return this.handleTide(fromId, arg, channelIndex);
     }
 
+    // v3.0 Subscriber Services: :sun — offline sun/moon almanac.
+    // No-arg form uses operator's sunLocationZip; ":sun 21701" and
+    // ":sun 39.42,-77.41" are one-off overrides.
+    if (lower === sunTrigger) {
+      return this.handleSun(fromId, null, channelIndex);
+    }
+    if (lower === `${sunTrigger} help` || lower === `${sunTrigger} ?`) {
+      return this.sendSunHelp(fromId, channelIndex);
+    }
+    if (lower.startsWith(`${sunTrigger} `)) {
+      const arg = trimmed.slice(sunTrigger.length + 1).trim();
+      return this.handleSun(fromId, arg, channelIndex);
+    }
+
+    // v3.0 Subscriber Services: :mdot — Maryland CHART traffic
+    // incidents. No-arg form uses operator's mdotDefaultCounty;
+    // ":mdot Frederick" filters to a specific county; ":mdot all"
+    // returns statewide top-N.
+    if (lower === mdotTrigger) {
+      return this.handleMdot(fromId, null, channelIndex);
+    }
+    if (lower === `${mdotTrigger} help` || lower === `${mdotTrigger} ?`) {
+      return this.sendMdotHelp(fromId, channelIndex);
+    }
+    if (lower.startsWith(`${mdotTrigger} `)) {
+      // Preserve case on the county arg — CHART uses proper case and
+      // the sanitizer will match case-insensitively anyway.
+      const arg = trimmed.slice(mdotTrigger.length + 1).trim();
+      return this.handleMdot(fromId, arg, channelIndex);
+    }
+
     // Weather trigger (no args) — return the command menu. v2.0 Beta 4:
     // replaces the old "send a ZIP" prompt flow with a help message so
     // subscribers can discover what's actually available. The prompt path
@@ -555,7 +592,7 @@ export class BbsService {
    *  tiny regardless of how many subsystems we add. Subscribers chase the
    *  subsystem's own `help` for usage (e.g., `:wx help`). */
   private async handleCmdIndex(fromId: string, channelIndex: number): Promise<boolean> {
-    const triggers = [this.config.mailTrigger, this.config.weatherTrigger, this.config.spotTrigger, this.config.tideTrigger, this.config.cmdTrigger];
+    const triggers = [this.config.mailTrigger, this.config.weatherTrigger, this.config.spotTrigger, this.config.tideTrigger, this.config.sunTrigger, this.config.mdotTrigger, this.config.cmdTrigger];
     await this.reply(fromId, `Cmds: ${triggers.join(' ')}`, channelIndex);
     return true;
   }
@@ -1017,6 +1054,125 @@ export class BbsService {
     const msg =
       `${t} = next tides at default station | ` +
       `${t} <7-digit> = specific station | ` +
+      `${t} ? = help${suffix}`;
+    await this.reply(fromId, msg, channelIndex);
+    return true;
+  }
+
+  // -------------------------------------------------------------------
+  // v3.0 Subscriber Services — :sun (offline sun/moon almanac)
+  // -------------------------------------------------------------------
+
+  /**
+   * Single-exchange :sun handler. Resolves the location in this
+   * precedence:
+   *
+   *   1. Explicit arg — a 5-digit US ZIP or "lat,lng" pair
+   *   2. Operator's configured sunLocationZip
+   *   3. Error reply with the acceptable forms
+   *
+   * Then computes the almanac offline via SunCalc and replies in one
+   * packet. No upstream calls in the happy path unless the location
+   * is a ZIP that hasn't been resolved yet (zippopotam.us lookup —
+   * cached process-lifetime by weatherService).
+   */
+  private async handleSun(
+    fromId: string,
+    arg: string | null,
+    channelIndex: number,
+  ): Promise<boolean> {
+    try {
+      const loc = await sunService.resolveLocation(arg, this.config.sunLocationZip);
+      const alm = sunService.computeAlmanac(loc.lat, loc.lng, loc.label);
+      const msg = sunService.formatSunSummary(alm);
+      await this.reply(fromId, msg, channelIndex);
+    } catch (err: any) {
+      const message = err?.message || 'Sun lookup failed';
+      // resolveLocation throws with user-safe messages ("No default
+      // location set…", "ZIP must be 5 digits…"). Anything else is a
+      // deeper failure — surface a generic fallback.
+      const safe = /No default location|ZIP must be|Coordinates out|not found/i.test(message)
+        ? message
+        : `Sun lookup failed. Try ${this.config.sunTrigger} <5-digit-zip>.`;
+      await this.reply(fromId, safe, channelIndex);
+    }
+    return true;
+  }
+
+  /** One-line command catalog for :sun. */
+  private async sendSunHelp(fromId: string, channelIndex: number): Promise<boolean> {
+    const t = this.config.sunTrigger;
+    const d = this.config.sunLocationZip;
+    const suffix = d ? ` | default ZIP: ${d}` : ` | default: <not set>`;
+    const msg =
+      `${t} = today's sun/moon at default | ` +
+      `${t} <zip> = specific ZIP | ` +
+      `${t} <lat,lng> = coords | ` +
+      `${t} ? = help${suffix}`;
+    await this.reply(fromId, msg, channelIndex);
+    return true;
+  }
+
+  // -------------------------------------------------------------------
+  // v3.0 Subscriber Services — :mdot (Maryland CHART traffic incidents)
+  // -------------------------------------------------------------------
+
+  /**
+   * Single-exchange :mdot handler. Argument precedence:
+   *
+   *   1. Explicit arg — a Maryland county name (case-insensitive
+   *      exact match against MD_COUNTIES) OR literal "all" for
+   *      statewide top-N
+   *   2. Operator's configured mdotDefaultCounty
+   *   3. Statewide top-N (fallback when no default is set)
+   */
+  private async handleMdot(
+    fromId: string,
+    arg: string | null,
+    channelIndex: number,
+  ): Promise<boolean> {
+    let county = '';
+    if (arg && arg.trim()) {
+      const cleaned = arg.trim();
+      if (/^all$/i.test(cleaned)) {
+        county = ''; // statewide
+      } else {
+        // Case-insensitive exact match against the canonical county list.
+        const match = MD_COUNTIES.find(c => c.toLowerCase() === cleaned.toLowerCase());
+        if (!match) {
+          await this.reply(
+            fromId,
+            `Unknown MD county "${cleaned}". Try Frederick, Baltimore, Montgomery, etc. Or "all" for statewide. ${this.config.mdotTrigger} ? for help.`,
+            channelIndex,
+          );
+          return true;
+        }
+        county = match;
+      }
+    } else {
+      county = this.config.mdotDefaultCounty; // may be '' → statewide fallback
+    }
+
+    try {
+      const incidents = await mdotService.listByCounty(county, 4);
+      const msg = mdotService.formatIncidentSummary(county, incidents);
+      await this.reply(fromId, msg, channelIndex);
+    } catch (err: any) {
+      console.warn(`[BBS] mdot lookup for "${county || 'statewide'}" failed:`, err?.message);
+      await this.reply(fromId, `MDOT lookup failed. Try again later.`, channelIndex);
+    }
+    return true;
+  }
+
+  /** One-line command catalog for :mdot. */
+  private async sendMdotHelp(fromId: string, channelIndex: number): Promise<boolean> {
+    const t = this.config.mdotTrigger;
+    const d = this.config.mdotDefaultCounty;
+    const suffix = d ? ` | default: ${d}` : ` | default: statewide`;
+    const msg =
+      `${t} = active MD traffic incidents | ` +
+      `${t} <county> = filter by county | ` +
+      `${t} all = statewide | ` +
       `${t} ? = help${suffix}`;
     await this.reply(fromId, msg, channelIndex);
     return true;

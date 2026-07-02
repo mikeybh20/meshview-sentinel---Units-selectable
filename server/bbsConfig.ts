@@ -19,6 +19,27 @@ const CONFIG_PATH = process.env.MESHVIEW_DATA_DIR
   ? join(process.env.MESHVIEW_DATA_DIR, 'bbs-config.json')
   : join(__dirname, '..', 'data', 'bbs-config.json');
 
+/**
+ * v3.0 Subscriber Services — canonical list of Maryland county names
+ * as they appear in CHART's `county` field. Kept exactly as CHART
+ * returns them so a case-insensitive comparison downstream (in
+ * mdotService.listByCounty) works reliably. Ordered alphabetically to
+ * match how the settings-UI dropdown will present them.
+ *
+ * MD has 23 counties + Baltimore City (which CHART treats as its own
+ * county-level jurisdiction). Some other CHART records use "Statewide"
+ * for cross-county events — not included here since it's not a
+ * subscriber-selectable filter target.
+ */
+export const MD_COUNTIES: readonly string[] = [
+  'Allegany', 'Anne Arundel', 'Baltimore', 'Baltimore City',
+  'Calvert', 'Caroline', 'Carroll', 'Cecil', 'Charles',
+  'Dorchester', 'Frederick', 'Garrett', 'Harford', 'Howard',
+  'Kent', 'Montgomery', "Prince George's", "Queen Anne's",
+  'Somerset', "St. Mary's", 'Talbot', 'Washington',
+  'Wicomico', 'Worcester',
+] as const;
+
 export interface BbsConfig {
   /** Master switch. When false, ALL BBS triggers are ignored and the state
    *  machine never engages. DMs to the local node flow through to the normal
@@ -59,6 +80,32 @@ export interface BbsConfig {
    *  Annapolis, 8577330 Solomons Island, 8638863 Chesapeake Bay
    *  Bridge Tunnel, 8632200 Kiptopeke VA. */
   defaultTideStation: string;
+  /** v3.0 Subscriber Services — trigger for the sun/moon almanac
+   *  command. `:sun` with no arg uses sunLocationZip; `:sun 21701`
+   *  and `:sun 39.42,-77.41` are one-off overrides. Must start with
+   *  `:`. Default ":sun". */
+  sunTrigger: string;
+  /** v3.0 Subscriber Services — 5-digit US ZIP used as the default
+   *  location for `:sun` when a subscriber sends the command with no
+   *  argument. Empty disables the no-arg form (subscribers can still
+   *  send ":sun <zip>" or ":sun lat,lng"). Typically the operator's
+   *  home ZIP (same as homeZipCode) but kept separate so a coastal-
+   *  operator can point weather alerts at one location and sun-
+   *  almanac at another if they want. */
+  sunLocationZip: string;
+  /** v3.0 Subscriber Services — trigger for Maryland-DOT traffic
+   *  incident lookup. `:mdot` with no arg uses mdotDefaultCounty;
+   *  `:mdot Frederick` filters to a specific county; `:mdot all`
+   *  returns statewide top-N. Must start with `:`. Default ":mdot". */
+  mdotTrigger: string;
+  /** v3.0 Subscriber Services — Maryland county name used to filter
+   *  `:mdot` when a subscriber sends the command with no argument.
+   *  CHART uses proper-case county names without the "County" suffix
+   *  ("Frederick", "Baltimore", "Montgomery"). Empty disables the
+   *  no-arg default-county filter and returns statewide top-N. Only
+   *  MD's 24 counties + Baltimore City are valid values; anything else
+   *  gets swapped to empty at load. */
+  mdotDefaultCounty: string;
   /** Hard cap on mail body length, in chars. Meshtastic packet payload tops
    *  out at ~228 bytes after framing; 200 leaves headroom for protocol overhead. */
   bodyMaxChars: number;
@@ -100,6 +147,10 @@ const DEFAULTS: BbsConfig = {
   spotTrigger: ':spot',
   tideTrigger: ':tide',
   defaultTideStation: '',
+  sunTrigger: ':sun',
+  sunLocationZip: '',
+  mdotTrigger: ':mdot',
+  mdotDefaultCounty: '',
   bodyMaxChars: 200,
   retentionDays: 30,
   replyPaceMs: 2_000,
@@ -133,6 +184,18 @@ export function normalizeBbsConfig(partial: Partial<BbsConfig>): BbsConfig {
   // default station, so we don't accidentally show Baltimore tides to
   // an operator who typo'd a Californian station id.
   merged.defaultTideStation = /^\d{7}$/.test(String(merged.defaultTideStation ?? '')) ? String(merged.defaultTideStation) : '';
+  merged.sunTrigger = sanitizeTrigger(merged.sunTrigger, DEFAULTS.sunTrigger);
+  // Same policy as defaultTideStation: empty (disabled) or exactly-
+  // 5-digit ZIP; typos fall back to empty rather than silently pointing
+  // subscribers at the wrong city.
+  merged.sunLocationZip = /^\d{5}$/.test(String(merged.sunLocationZip ?? '')) ? String(merged.sunLocationZip) : '';
+  merged.mdotTrigger = sanitizeTrigger(merged.mdotTrigger, DEFAULTS.mdotTrigger);
+  // MD's 24 counties + Baltimore City (which CHART treats as its own
+  // county-level jurisdiction). Kept in proper case exactly as CHART
+  // returns them, so a case-insensitive comparison downstream doesn't
+  // have to normalize each row.
+  const rawCounty = String(merged.mdotDefaultCounty ?? '').trim();
+  merged.mdotDefaultCounty = MD_COUNTIES.find(c => c.toLowerCase() === rawCounty.toLowerCase()) ?? '';
 
   // Prevent identical triggers (would route everything to whichever check
   // runs first). Collisions snap the colliding trigger back to its default.
@@ -156,6 +219,25 @@ export function normalizeBbsConfig(partial: Partial<BbsConfig>): BbsConfig {
     merged.tideTrigger === merged.spotTrigger
   ) {
     merged.tideTrigger = DEFAULTS.tideTrigger;
+  }
+  if (
+    merged.sunTrigger === merged.mailTrigger ||
+    merged.sunTrigger === merged.weatherTrigger ||
+    merged.sunTrigger === merged.cmdTrigger ||
+    merged.sunTrigger === merged.spotTrigger ||
+    merged.sunTrigger === merged.tideTrigger
+  ) {
+    merged.sunTrigger = DEFAULTS.sunTrigger;
+  }
+  if (
+    merged.mdotTrigger === merged.mailTrigger ||
+    merged.mdotTrigger === merged.weatherTrigger ||
+    merged.mdotTrigger === merged.cmdTrigger ||
+    merged.mdotTrigger === merged.spotTrigger ||
+    merged.mdotTrigger === merged.tideTrigger ||
+    merged.mdotTrigger === merged.sunTrigger
+  ) {
+    merged.mdotTrigger = DEFAULTS.mdotTrigger;
   }
 
   merged.enabled = !!merged.enabled;

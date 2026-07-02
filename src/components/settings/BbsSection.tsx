@@ -35,6 +35,17 @@ interface BbsConfigShape {
   homeZipCode: string;
   /** Array of "HH:MM" push times. Empty disables daily push (NWS alerts still fire). */
   dailyForecastTimes: string[];
+  // v3.0 Subscriber Services triggers + defaults. Each of the three
+  // services (tides, sun/moon almanac, MD traffic) has an independent
+  // trigger keyword and default-argument field so operators can
+  // enable/disable / retarget each one without touching the others.
+  spotTrigger: string;
+  tideTrigger: string;
+  defaultTideStation: string;
+  sunTrigger: string;
+  sunLocationZip: string;
+  mdotTrigger: string;
+  mdotDefaultCounty: string;
 }
 
 function BbsServiceNodePicker() {
@@ -121,6 +132,17 @@ interface BbsConfigShape {
   homeZipCode: string;
   /** Array of "HH:MM" push times. Empty disables daily push (NWS alerts still fire). */
   dailyForecastTimes: string[];
+  // v3.0 Subscriber Services triggers + defaults. Each of the three
+  // services (tides, sun/moon almanac, MD traffic) has an independent
+  // trigger keyword and default-argument field so operators can
+  // enable/disable / retarget each one without touching the others.
+  spotTrigger: string;
+  tideTrigger: string;
+  defaultTideStation: string;
+  sunTrigger: string;
+  sunLocationZip: string;
+  mdotTrigger: string;
+  mdotDefaultCounty: string;
 }
 
 type AIProvider = 'anthropic' | 'gemini' | 'ollama';
@@ -473,6 +495,13 @@ function BbsSection() {
 
       <WeatherSubscribers />
 
+      {/* v3.0 Subscriber Services — content commands beyond weather.
+          Each row: trigger keyword + default argument (station id /
+          ZIP / county). Blank default = subscribers can still query
+          the service by supplying an argument, but the no-arg form
+          is disabled with an operator-friendly error message. */}
+      <SubscriberServicesBlock cfg={cfg} update={update} />
+
       {error && (
         <div className="px-3 py-2 rounded border border-brand-error/30 bg-brand-error/10 text-xs text-brand-error flex items-start gap-2">
           <AlertCircle size={12} className="mt-0.5 shrink-0" />
@@ -507,6 +536,166 @@ interface WeatherSubscriber {
   /** v2.0 multi-radio: which radio received this subscription. NULL for
    *  legacy 1.x rows that pre-date the multi-radio split. */
   radioId: string | null;
+}
+
+/**
+ * v3.0 Subscriber Services — settings block exposing trigger keyword
+ * + default argument for each of the three content commands:
+ *
+ *   :tide   → tide predictions (NOAA CO-OPS)
+ *   :sun    → sun/moon almanac (offline via SunCalc)
+ *   :mdot   → Maryland CHART traffic incidents
+ *
+ * Each service has:
+ *   - A trigger text input (e.g. ":tide" — must start with colon)
+ *   - A default-argument input (station id / ZIP / county). Empty
+ *     disables the no-arg form; subscribers can still supply an
+ *     argument explicitly.
+ *
+ * Default-argument fields validate loosely at the client (right
+ * format hint) and strictly at the server (sanitizer rejects bad
+ * values back to empty rather than saving a broken default that
+ * would silently mislead subscribers).
+ */
+// v3.0: Maryland county names as CHART returns them, duplicated
+// client-side to feed the county dropdown. Keep in sync with
+// server/bbsConfig.ts MD_COUNTIES — drift is unlikely (24 counties
+// don't change often) so a shared module would be over-engineering.
+const MD_COUNTY_OPTIONS: readonly string[] = [
+  'Allegany', 'Anne Arundel', 'Baltimore', 'Baltimore City',
+  'Calvert', 'Caroline', 'Carroll', 'Cecil', 'Charles',
+  'Dorchester', 'Frederick', 'Garrett', 'Harford', 'Howard',
+  'Kent', 'Montgomery', "Prince George's", "Queen Anne's",
+  'Somerset', "St. Mary's", 'Talbot', 'Washington',
+  'Wicomico', 'Worcester',
+];
+
+function SubscriberServicesBlock({
+  cfg,
+  update,
+}: {
+  cfg: BbsConfigShape;
+  update: <K extends keyof BbsConfigShape>(key: K, value: BbsConfigShape[K]) => void;
+}) {
+  // Loose validation hints — server sanitizer is authoritative.
+  const tideStationErr = cfg.defaultTideStation && !/^\d{7}$/.test(cfg.defaultTideStation)
+    ? '7-digit NOAA CO-OPS station id (e.g. 8574680)'
+    : null;
+  const sunZipErr = cfg.sunLocationZip && !/^\d{5}$/.test(cfg.sunLocationZip)
+    ? '5-digit US ZIP'
+    : null;
+
+  return (
+    <div className="space-y-4 pt-4 border-t border-brand-line/60">
+      <SectionHeader
+        title="Subscriber Services (v3.0)"
+        subtitle="Content commands beyond weather — subscribers DM these to the BBS for tide predictions, sun/moon times, and MD traffic."
+      />
+
+      {/* Row: :tide */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pb-3 border-b border-brand-line/40">
+        <div className="space-y-1">
+          <label className="text-[10px] uppercase font-bold tracking-widest text-brand-muted">Tide trigger</label>
+          <input
+            type="text"
+            value={cfg.tideTrigger}
+            onChange={e => update('tideTrigger', e.target.value.toLowerCase())}
+            placeholder=":tide"
+            className="w-full bg-brand-line/50 border border-brand-line rounded px-2 py-1.5 text-sm mono-text focus:outline-none focus:border-brand-accent"
+          />
+          <p className="text-[10px] text-brand-muted leading-snug">
+            NOAA tide predictions. Subscribers DM this trigger to get the next few high/low events.
+          </p>
+        </div>
+        <div className="space-y-1">
+          <label className="text-[10px] uppercase font-bold tracking-widest text-brand-muted">Default tide station</label>
+          <input
+            type="text"
+            value={cfg.defaultTideStation}
+            onChange={e => update('defaultTideStation', e.target.value.replace(/\D/g, '').slice(0, 7))}
+            placeholder="8574680"
+            inputMode="numeric"
+            className={cn(
+              "w-full bg-brand-line/50 border rounded px-2 py-1.5 text-sm mono-text focus:outline-none",
+              tideStationErr ? "border-brand-error" : "border-brand-line focus:border-brand-accent",
+            )}
+          />
+          {tideStationErr && <div className="text-[10px] text-brand-error">{tideStationErr}</div>}
+          <p className="text-[10px] text-brand-muted leading-snug">
+            7-digit NOAA CO-OPS station id. Chesapeake examples: <span className="mono-text">8574680</span> Baltimore, <span className="mono-text">8575512</span> Annapolis, <span className="mono-text">8577330</span> Solomons Island. Refreshed at 00:00, 06:00, 12:00, 18:00 server-local. Empty disables the no-arg form.
+          </p>
+        </div>
+      </div>
+
+      {/* Row: :sun */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pb-3 border-b border-brand-line/40">
+        <div className="space-y-1">
+          <label className="text-[10px] uppercase font-bold tracking-widest text-brand-muted">Sun trigger</label>
+          <input
+            type="text"
+            value={cfg.sunTrigger}
+            onChange={e => update('sunTrigger', e.target.value.toLowerCase())}
+            placeholder=":sun"
+            className="w-full bg-brand-line/50 border border-brand-line rounded px-2 py-1.5 text-sm mono-text focus:outline-none focus:border-brand-accent"
+          />
+          <p className="text-[10px] text-brand-muted leading-snug">
+            Offline sun/moon almanac — sunrise, sunset, twilight, moon phase. No internet needed.
+          </p>
+        </div>
+        <div className="space-y-1">
+          <label className="text-[10px] uppercase font-bold tracking-widest text-brand-muted">Default sun ZIP</label>
+          <input
+            type="text"
+            value={cfg.sunLocationZip}
+            onChange={e => update('sunLocationZip', e.target.value.replace(/\D/g, '').slice(0, 5))}
+            placeholder="21701"
+            inputMode="numeric"
+            className={cn(
+              "w-full bg-brand-line/50 border rounded px-2 py-1.5 text-sm mono-text focus:outline-none",
+              sunZipErr ? "border-brand-error" : "border-brand-line focus:border-brand-accent",
+            )}
+          />
+          {sunZipErr && <div className="text-[10px] text-brand-error">{sunZipErr}</div>}
+          <p className="text-[10px] text-brand-muted leading-snug">
+            5-digit US ZIP for the no-arg <code className="text-brand-accent">:sun</code> form. Subscribers can also send <code className="text-brand-accent">:sun 90210</code> or <code className="text-brand-accent">:sun 39.42,-77.41</code> to override. Empty disables the no-arg form.
+          </p>
+        </div>
+      </div>
+
+      {/* Row: :mdot */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div className="space-y-1">
+          <label className="text-[10px] uppercase font-bold tracking-widest text-brand-muted">MDOT trigger</label>
+          <input
+            type="text"
+            value={cfg.mdotTrigger}
+            onChange={e => update('mdotTrigger', e.target.value.toLowerCase())}
+            placeholder=":mdot"
+            className="w-full bg-brand-line/50 border border-brand-line rounded px-2 py-1.5 text-sm mono-text focus:outline-none focus:border-brand-accent"
+          />
+          <p className="text-[10px] text-brand-muted leading-snug">
+            Maryland CHART traffic incident lookup. 5-minute server-side cache; API is free + no auth.
+          </p>
+        </div>
+        <div className="space-y-1">
+          <label className="text-[10px] uppercase font-bold tracking-widest text-brand-muted">Default MDOT county</label>
+          <select
+            value={cfg.mdotDefaultCounty}
+            onChange={e => update('mdotDefaultCounty', e.target.value)}
+            className="w-full bg-brand-line/50 border border-brand-line rounded px-2 py-1.5 text-sm mono-text focus:outline-none focus:border-brand-accent"
+          >
+            <option value="">— Statewide (no filter) —</option>
+            {MD_COUNTY_OPTIONS.map(c => (
+              <option key={c} value={c}>{c}</option>
+            ))}
+          </select>
+          <p className="text-[10px] text-brand-muted leading-snug">
+            Filters incidents to one Maryland county for the no-arg <code className="text-brand-accent">:mdot</code> form. Subscribers can send <code className="text-brand-accent">:mdot Baltimore</code> or <code className="text-brand-accent">:mdot all</code> to override.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 /**
