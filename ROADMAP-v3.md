@@ -43,16 +43,29 @@ subsets stay in.
 
 ## v3.0 Inclusions
 
-### 1. Raspberry Pi 4/5 first-class target
-The GPU sidecar already auto-tiers to a CPU profile, but Pi support
-has never been validated end-to-end. v3.0 makes Pi a tested deployment
-path, with documentation calling out which features degrade gracefully
-(coverage heatmap interpolation, cluster computation) and which are
-unaffected.
+### 1. Raspberry Pi 4/5 first-class target — **postponed**
+Postponed out of v3.0 by operator direction on 2026-07-02 —
+maintainer doesn't have Pi 4/5 hardware to validate against and
+shipping "Pi support" without end-to-end testing on real hardware
+would violate the "don't be the official app" quality posture.
 
-**Why this matters:** most preppers and SKYWARN volunteers have a
-Pi sitting in a drawer; they don't have a Jetson. A Jetson-only
-target is an adoption ceiling on day one of open-source release.
+The GPU sidecar already auto-tiers to a CPU profile in code, so
+Pi 4/5 deployments will *probably* work — but "probably works"
+isn't the bar. When Pi hardware is available (personal, community
+loaner, or contributor with hardware in hand), this becomes a
+follow-up:
+- Verify the CPU-tier sidecar actually delivers usable performance
+  on a 4GB Pi 4 (coverage heatmap interpolation and cluster
+  computation are the risk features)
+- Document which features degrade gracefully vs. which don't
+- Add a Pi-specific settings section paralleling the Jetson one
+
+**Why this matters (retained for the eventual pickup):** most
+preppers and SKYWARN volunteers have a Pi sitting in a drawer;
+they don't have a Jetson. A Jetson-only target is an adoption
+ceiling on open-source release day. But an unverified "Pi
+support" claim is worse than a documented "Jetson-first, Pi
+untested" state.
 
 ### 2. SKYWARN spotter workflow — **shipped**
 A new BBS command `:spot` for submitting Local Storm Reports via DM
@@ -300,6 +313,11 @@ feed selection UI is bigger than it looks.
 
 These are valuable but explicitly out of v3.0 scope:
 
+- **Raspberry Pi 4/5 first-class target** — postponed 2026-07-02.
+  Maintainer lacks Pi hardware for end-to-end validation. Original
+  inclusion #1 kept in the roadmap above with the postponement
+  rationale so the plan-of-record is honest. Re-pickup when Pi
+  hardware is available (personal, community loaner, or contributor).
 - **HAM bridge actual implementation** (APRS, AX.25, Winlink-over-VARA,
   CAT control). The adapter interface ships in v3.0; the first
   concrete adapter ships in v3.1 or later.
