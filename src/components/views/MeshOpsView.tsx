@@ -21,12 +21,12 @@
  * per-packet queries).
  */
 import React from 'react';
-import { Activity, RefreshCw, Signal, BarChart3 } from 'lucide-react';
+import { Activity, RefreshCw, Signal, BarChart3, HardDrive, ExternalLink, CheckCircle2, AlertTriangle } from 'lucide-react';
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
   Legend, CartesianGrid,
 } from 'recharts';
-import { ChannelTrafficRow, ChannelTrafficTotal, Node, NeighborInfoSnapshot } from '../../types';
+import { ChannelTrafficRow, ChannelTrafficTotal, Node, NeighborInfoSnapshot, FirmwareStatusResponse, FirmwareBehindClass } from '../../types';
 import { cn } from '../../lib/utils';
 import { meshDataService } from '../../services/meshDataService';
 import { useRadios } from '../../hooks/useRadios';
@@ -36,7 +36,7 @@ interface MeshOpsViewProps {
   neighborInfo: NeighborInfoSnapshot[];
 }
 
-type OpsSubTab = 'analytics' | 'connectivity';
+type OpsSubTab = 'analytics' | 'connectivity' | 'health';
 
 type TimeRange = '1h' | '6h' | '24h' | '7d';
 
@@ -148,12 +148,19 @@ export function MeshOpsView({ nodes, neighborInfo }: MeshOpsViewProps) {
           icon={<Signal size={14} />}
           label="Connectivity"
         />
+        <SubTabButton
+          active={subTab === 'health'}
+          onClick={() => setSubTab('health')}
+          icon={<HardDrive size={14} />}
+          label="Health"
+        />
       </div>
       <div className="flex-1 overflow-hidden">
         {subTab === 'analytics' && <MeshOpsAnalyticsPanel />}
         {subTab === 'connectivity' && (
           <MeshOpsConnectivityPanel nodes={nodes} neighborInfo={neighborInfo} />
         )}
+        {subTab === 'health' && <MeshOpsHealthPanel />}
       </div>
     </div>
   );
@@ -632,6 +639,217 @@ function LegendSwatch({ color, label }: { color: string; label: string }) {
       {label}
     </span>
   );
+}
+
+/**
+ * Firmware & Health panel — per-radio firmware version vs. the
+ * latest published meshtastic/firmware release.
+ *
+ * Scope discipline: shows the operator's OWN connected/configured
+ * radios only. Per-mesh-member firmware tracking would require
+ * remote nodes to advertise their firmware version in NodeInfo
+ * (which most don't), so it's a future follow-up. The MVP question
+ * this panel answers is: "Is my hardware up-to-date, and how far
+ * behind if not?"
+ *
+ * Backing endpoint: /api/mesh/ops/firmware-status (server polls
+ * github.com/meshtastic/firmware/releases/latest every 12h).
+ */
+function MeshOpsHealthPanel() {
+  const [status, setStatus] = React.useState<FirmwareStatusResponse | null>(null);
+  const [loading, setLoading] = React.useState(false);
+
+  const reload = React.useCallback(async () => {
+    setLoading(true);
+    const r = await meshDataService.firmwareStatus();
+    setStatus(r);
+    setLoading(false);
+  }, []);
+
+  React.useEffect(() => { reload(); }, [reload]);
+
+  // Auto-refresh every 10 min while the tab is open. Server polls
+  // GitHub every 12h so faster refresh doesn't buy anything; the
+  // 10-min cadence catches an operator flashing a radio to a newer
+  // firmware and re-opening this panel.
+  React.useEffect(() => {
+    const t = setInterval(reload, 10 * 60_000);
+    return () => clearInterval(t);
+  }, [reload]);
+
+  const latest = status?.latest;
+  const radios = status?.radios ?? [];
+
+  // Count summary — how many radios need attention?
+  const summary = radios.reduce(
+    (acc, r) => {
+      acc[r.behind] = (acc[r.behind] ?? 0) + 1;
+      return acc;
+    },
+    {} as Record<FirmwareBehindClass, number>,
+  );
+
+  return (
+    <div className="h-full flex flex-col p-6 gap-4 overflow-hidden">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <HardDrive size={20} className="text-brand-accent" />
+          <div>
+            <h2 className="text-base font-bold uppercase tracking-tight">Mesh Ops · Firmware & Health</h2>
+            <p className="text-[10px] text-brand-muted mt-0.5">
+              Configured radios vs. latest meshtastic/firmware release
+              {radios.length > 0 && (
+                <span>
+                  {' · '}
+                  {summary.current ?? 0} current
+                  {(summary.patch ?? 0) > 0 && <span className="text-brand-warning"> · {summary.patch} patch behind</span>}
+                  {(summary.minor ?? 0) > 0 && <span className="text-brand-warning"> · {summary.minor} minor behind</span>}
+                  {(summary.major ?? 0) > 0 && <span className="text-brand-error"> · {summary.major} major behind</span>}
+                </span>
+              )}
+            </p>
+          </div>
+        </div>
+        <button
+          onClick={reload}
+          disabled={loading}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded border border-brand-line hover:bg-brand-line/40 disabled:opacity-50 transition-colors"
+          title="Refresh"
+        >
+          <RefreshCw size={11} className={loading ? 'animate-spin' : ''} />
+          REFRESH
+        </button>
+      </div>
+
+      {/* Latest-release tile */}
+      <div className="technical-panel p-3">
+        <div className="text-[10px] uppercase font-bold tracking-widest text-brand-muted">
+          Latest Meshtastic firmware release
+        </div>
+        {latest ? (
+          <div className="flex items-center gap-3 mt-1">
+            <div>
+              <div className="text-xl font-bold mono-text">{latest.tagName}</div>
+              <div className="text-[10px] text-brand-muted mt-0.5">
+                {latest.name} · published {new Date(latest.publishedAt).toLocaleDateString()}
+              </div>
+            </div>
+            <a
+              href={latest.htmlUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="ml-auto text-[10px] uppercase font-bold tracking-widest px-3 py-1.5 rounded border border-brand-accent/40 text-brand-accent hover:bg-brand-accent/10 flex items-center gap-1.5"
+            >
+              Release notes
+              <ExternalLink size={10} />
+            </a>
+          </div>
+        ) : (
+          <div className="text-xs text-brand-muted mt-1 italic">
+            Not yet fetched — the server polls GitHub every 12h. First fetch happens ~15s after boot.
+          </div>
+        )}
+      </div>
+
+      {/* Per-radio table */}
+      <div className="flex-1 technical-panel overflow-auto">
+        <table className="w-full text-xs">
+          <thead className="sticky top-0 bg-brand-bg">
+            <tr className="border-b border-brand-line">
+              <th className="text-left px-3 py-2 text-[10px] uppercase font-bold tracking-widest text-brand-muted">Radio</th>
+              <th className="text-left px-3 py-2 text-[10px] uppercase font-bold tracking-widest text-brand-muted">Installed</th>
+              <th className="text-left px-3 py-2 text-[10px] uppercase font-bold tracking-widest text-brand-muted">Status</th>
+              <th className="text-left px-3 py-2 text-[10px] uppercase font-bold tracking-widest text-brand-muted">Connection</th>
+            </tr>
+          </thead>
+          <tbody>
+            {radios.map(r => (
+              <tr key={r.radioId} className="border-b border-brand-line/40 hover:bg-brand-line/30">
+                <td className="px-3 py-2">
+                  <div className="mono-text font-bold text-xs">{r.radioId}</div>
+                  <div className="text-[10px] text-brand-muted">{r.longName}</div>
+                </td>
+                <td className="px-3 py-2 mono-text">
+                  {r.installedVersion || <span className="text-brand-muted italic">unknown</span>}
+                </td>
+                <td className="px-3 py-2">
+                  <BehindBadge behind={r.behind} />
+                </td>
+                <td className="px-3 py-2">
+                  <span className={cn(
+                    'inline-block w-2 h-2 rounded-full',
+                    r.connected ? 'bg-brand-accent' : 'bg-brand-muted/40',
+                  )} />
+                  <span className="ml-2 text-[10px] uppercase tracking-widest text-brand-muted">
+                    {r.connected ? 'live' : 'offline'}
+                  </span>
+                </td>
+              </tr>
+            ))}
+            {radios.length === 0 && !loading && (
+              <tr>
+                <td colSpan={4} className="px-3 py-8 text-center text-brand-muted text-xs">
+                  No radios configured. Add one in Settings → Radios.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="text-[10px] text-brand-muted leading-snug border-t border-brand-line pt-2">
+        <strong>Scope:</strong> shows only the radios Sentinel is configured to talk to — the
+        firmware you control. Per-mesh-member firmware tracking (other operators' nodes) is a
+        future addition; most Meshtastic nodes don't advertise their firmware version in
+        NodeInfo packets.
+      </div>
+    </div>
+  );
+}
+
+function BehindBadge({ behind }: { behind: FirmwareBehindClass }) {
+  switch (behind) {
+    case 'current':
+      return (
+        <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded bg-brand-accent/15 text-brand-accent border border-brand-accent/30">
+          <CheckCircle2 size={10} />
+          Up to date
+        </span>
+      );
+    case 'patch':
+      return (
+        <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded bg-brand-warning/15 text-brand-warning border border-brand-warning/30">
+          Patch behind
+        </span>
+      );
+    case 'minor':
+      return (
+        <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded bg-brand-warning/15 text-brand-warning border border-brand-warning/30">
+          <AlertTriangle size={10} />
+          Minor behind
+        </span>
+      );
+    case 'major':
+      return (
+        <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded bg-brand-error/15 text-brand-error border border-brand-error/30">
+          <AlertTriangle size={10} />
+          Major behind
+        </span>
+      );
+    case 'newer':
+      return (
+        <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded bg-brand-info/15 text-brand-info border border-brand-info/30">
+          Pre-release / dev
+        </span>
+      );
+    case 'unknown':
+    default:
+      return (
+        <span className="inline-flex items-center gap-1 text-[10px] uppercase tracking-widest px-2 py-0.5 rounded bg-brand-line/40 text-brand-muted border border-brand-line">
+          Unknown
+        </span>
+      );
+  }
 }
 
 function SummaryTile({ label, value, sub }: { label: string; value: string; sub?: string }) {

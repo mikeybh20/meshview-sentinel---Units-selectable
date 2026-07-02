@@ -234,6 +234,32 @@ export interface ChannelTrafficTotal {
   portTele: number;
 }
 
+/** v3.0 Mesh Ops Firmware status — one radio's install-vs-latest delta. */
+export type FirmwareBehindClass = 'unknown' | 'newer' | 'current' | 'patch' | 'minor' | 'major';
+
+export interface FirmwareRadioStatus {
+  radioId: string;
+  longName: string;
+  installedVersion: string | null;
+  installedParsed: { major: number; minor: number; patch: number; build?: string; raw: string } | null;
+  behind: FirmwareBehindClass;
+  connected: boolean;
+}
+
+export interface FirmwareLatestRelease {
+  tagName: string;
+  name: string;
+  publishedAt: string;
+  htmlUrl: string;
+  parsed: { major: number; minor: number; patch: number; build?: string; raw: string };
+  fetchedAt: number;
+}
+
+export interface FirmwareStatusResponse {
+  latest: FirmwareLatestRelease | null;
+  radios: FirmwareRadioStatus[];
+}
+
 export interface Waypoint {
   id: number;
   lat: number;

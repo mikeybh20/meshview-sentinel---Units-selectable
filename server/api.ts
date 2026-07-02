@@ -22,6 +22,7 @@ import { consoleCapture } from './consoleCapture.js';
 consoleCapture.install();
 import { WeatherAlertPoller } from './weatherAlertPoller.js';
 import { tideService } from './tideService.js';
+import { firmwareService, parseVersion, classifyBehind, type BehindClassification } from './firmwareService.js';
 // v2.0 multi-radio. Importing for side effect: BridgeManager wires its
 // auto-registration listeners onto meshBridge at module load. The exported
 // singleton is also used by the /api/mesh/radios endpoint below.
@@ -55,6 +56,13 @@ weatherPoller.start();
 // Bootstrap fetch happens ~5s after this call so subscribers hitting
 // :tide immediately post-boot don't see an empty cache.
 tideService.startScheduler(() => bbsConfig.defaultTideStation);
+
+// v3.0 Mesh Ops: firmware update-reminder poller. Fetches the latest
+// meshtastic/firmware release from GitHub every 12h so the Health
+// panel can compare each connected radio's firmware version and
+// flag anything more than a few versions behind. Bootstrap fetch
+// happens ~15s after this call.
+firmwareService.start();
 
 dotenv.config();
 
@@ -5238,6 +5246,54 @@ app.get('/api/mesh/ops/channel-traffic/totals', (req, res) => {
   };
   try {
     return res.json({ totals: meshDb().channelTrafficTotals(opts) });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/** GET /api/mesh/ops/firmware-status — per-radio firmware version vs.
+ *  the latest published meshtastic/firmware release. Returns:
+ *    latest    — the current release (tag, name, publishedAt, htmlUrl)
+ *                or null if we haven't fetched successfully yet
+ *    radios[]  — one entry per configured radio:
+ *      radioId, longName, installedVersion, behind, connected */
+app.get('/api/mesh/ops/firmware-status', (_req, res) => {
+  try {
+    const latest = firmwareService.getLatest();
+    const db = meshDb();
+    const rows = db.listRadios();
+    const conn = bridgeManager.connectionStates();
+    const radios = rows.map(r => {
+      // Prefer the live firmware version from the connected bridge —
+      // it's read directly from DeviceMetadata. Fall back to the DB
+      // row's cached firmware_version for radios that aren't currently
+      // connected (last-known state).
+      const liveFw = conn[r.radio_id]?.firmwareVersion || null;
+      const installedRaw = liveFw || (r as any).firmware_version || null;
+      const installed = parseVersion(installedRaw);
+      const behind: BehindClassification = latest?.parsed
+        ? classifyBehind(installed, latest.parsed)
+        : 'unknown';
+      return {
+        radioId: r.radio_id,
+        longName: r.long_name || r.radio_id,
+        installedVersion: installedRaw,
+        installedParsed: installed,
+        behind,
+        connected: !!conn[r.radio_id]?.connected,
+      };
+    });
+    return res.json({
+      latest: latest ? {
+        tagName: latest.tagName,
+        name: latest.name,
+        publishedAt: latest.publishedAt,
+        htmlUrl: latest.htmlUrl,
+        parsed: latest.parsed,
+        fetchedAt: latest.fetchedAt,
+      } : null,
+      radios,
+    });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
   }

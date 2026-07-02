@@ -5,7 +5,7 @@
  * interface identical to the simulator, so the app can switch between
  * real hardware and simulated data seamlessly.
  */
-import { Node, Message, RadioEvent, Channel, Waypoint, TraceResult, NeighborInfoSnapshot, StoreForwardRouter, LocalModuleConfigSnapshot, Group, StormReport, ChannelTrafficRow, ChannelTrafficTotal } from '../types';
+import { Node, Message, RadioEvent, Channel, Waypoint, TraceResult, NeighborInfoSnapshot, StoreForwardRouter, LocalModuleConfigSnapshot, Group, StormReport, ChannelTrafficRow, ChannelTrafficTotal, FirmwareStatusResponse } from '../types';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
@@ -524,6 +524,16 @@ export class MeshDataService {
       if (!res.ok) return null;
       const body = await res.json();
       return Array.isArray(body?.rows) ? body.rows as ChannelTrafficRow[] : null;
+    } catch { return null; }
+  }
+
+  /** Per-radio firmware status — installed version vs. the latest
+   *  published meshtastic/firmware release. */
+  async firmwareStatus(): Promise<FirmwareStatusResponse | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/mesh/ops/firmware-status`);
+      if (!res.ok) return null;
+      return await res.json();
     } catch { return null; }
   }
 
